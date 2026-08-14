@@ -1,0 +1,267 @@
+// Package chat 编排持久化会话、Agent Runtime 与对外流式事件。
+package chat
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/cloudwego/eino/schema"
+
+	"github.com/zhiruo/zora/internal/agentruntime"
+	"github.com/zhiruo/zora/internal/domain"
+	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/store"
+)
+
+const defaultConversationTitle = "新对话"
+
+// StreamEvent 是应用层事件，不直接暴露 Eino 的内部类型。
+type StreamEvent struct {
+	Type       string          `json:"type"`
+	RunID      string          `json:"run_id,omitempty"`
+	AgentName  string          `json:"agent_name,omitempty"`
+	Content    string          `json:"content,omitempty"`
+	ToolName   string          `json:"tool_name,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Arguments  string          `json:"arguments,omitempty"`
+	Message    *domain.Message `json:"message,omitempty"`
+}
+
+// Service 是会话用例边界，负责执行顺序、状态落库和同会话并发控制。
+type Service struct {
+	store   store.Store
+	runtime *agentruntime.Runtime
+	locksMu sync.Mutex
+	locks   map[string]*sync.Mutex
+}
+
+func NewService(store store.Store, runtime *agentruntime.Runtime) *Service {
+	return &Service{store: store, runtime: runtime, locks: make(map[string]*sync.Mutex)}
+}
+
+func (s *Service) Model() string    { return s.runtime.Model() }
+func (s *Service) Provider() string { return s.runtime.Provider() }
+
+func (s *Service) CreateConversation(ctx context.Context, title string) (domain.Conversation, error) {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = defaultConversationTitle
+	}
+	if utf8.RuneCountInString(title) > 80 {
+		return domain.Conversation{}, fmt.Errorf("title must be at most 80 characters")
+	}
+	now := time.Now().UTC()
+	conversation := domain.Conversation{
+		ID: id.New("conv"), Title: title, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.store.CreateConversation(ctx, conversation); err != nil {
+		return domain.Conversation{}, err
+	}
+	return conversation, nil
+}
+
+func (s *Service) GetConversation(ctx context.Context, conversationID string) (domain.Conversation, error) {
+	return s.store.GetConversation(ctx, conversationID)
+}
+
+func (s *Service) ListConversations(ctx context.Context) ([]domain.Conversation, error) {
+	return s.store.ListConversations(ctx, 100)
+}
+
+func (s *Service) RenameConversation(ctx context.Context, conversationID, title string) error {
+	title = strings.TrimSpace(title)
+	if title == "" || utf8.RuneCountInString(title) > 80 {
+		return fmt.Errorf("title must contain 1 to 80 characters")
+	}
+	return s.store.RenameConversation(ctx, conversationID, title)
+}
+
+func (s *Service) DeleteConversation(ctx context.Context, conversationID string) error {
+	return s.store.DeleteConversation(ctx, conversationID)
+}
+
+func (s *Service) ListMessages(ctx context.Context, conversationID string) ([]domain.Message, error) {
+	if _, err := s.store.GetConversation(ctx, conversationID); err != nil {
+		return nil, err
+	}
+	return s.store.ListMessages(ctx, conversationID, 200)
+}
+
+func (s *Service) ListRunEvents(ctx context.Context, runID string) ([]domain.RunEvent, error) {
+	return s.store.ListRunEvents(ctx, runID)
+}
+
+// Send 按“保存用户消息 -> 创建 Run -> 执行 Agent -> 保存回答”的顺序完成一次请求。
+func (s *Service) Send(ctx context.Context, conversationID, content string, emit func(StreamEvent) error) error {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return fmt.Errorf("message content is required")
+	}
+	if utf8.RuneCountInString(content) > 20_000 {
+		return fmt.Errorf("message content exceeds 20000 characters")
+	}
+
+	// 同一会话串行执行，避免两个请求读取相同历史后交错写入回答。
+	// 不同会话使用不同的锁，仍然可以并发运行。
+	unlock := s.lockConversation(conversationID)
+	defer unlock()
+
+	conversation, err := s.store.GetConversation(ctx, conversationID)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	userMessage, err := s.store.AddMessage(ctx, domain.Message{
+		ID: id.New("msg"), ConversationID: conversationID,
+		Role: domain.RoleUser, Content: content, CreatedAt: now,
+	})
+	if err != nil {
+		return err
+	}
+	if conversation.Title == defaultConversationTitle && conversation.MessageCount == 0 {
+		// 只在首条消息后自动命名；用户主动修改过的标题不会被覆盖。
+		_ = s.store.RenameConversation(ctx, conversationID, titleFromMessage(content))
+	}
+
+	// AgentRun 是一次请求的审计主记录，后续工具和模型事件都关联到该 ID。
+	run := domain.AgentRun{
+		ID: id.New("run"), ConversationID: conversationID,
+		UserMessageID: userMessage.ID, Status: domain.RunRunning,
+		Model: s.runtime.Model(), StartedAt: now,
+	}
+	if err := s.store.CreateRun(ctx, run); err != nil {
+		return err
+	}
+	if err := s.appendEvent(ctx, run.ID, "run_started", agentruntime.AgentName, "", map[string]any{
+		"model": s.runtime.Model(), "provider": s.runtime.Provider(),
+	}); err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+	if err := emit(StreamEvent{Type: "start", RunID: run.ID, Message: &userMessage}); err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+
+	// V0.1 只发送最近 40 条可见消息，先建立明确上限；V0.3 将替换为摘要和长期记忆召回。
+	messages, err := s.store.ListMessages(ctx, conversationID, 40)
+	if err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+	history := toEinoMessages(messages)
+
+	answer, err := s.runtime.Execute(ctx, history, func(event agentruntime.Event) error {
+		payload := map[string]any{}
+		if event.Content != "" {
+			payload["content"] = event.Content
+		}
+		if event.Arguments != "" {
+			payload["arguments"] = event.Arguments
+		}
+		if event.ToolCallID != "" {
+			payload["tool_call_id"] = event.ToolCallID
+		}
+		// token 级 delta 只发给客户端，不逐条落库，避免审计表退化为巨大的 token 日志。
+		if event.Type != "delta" {
+			if err := s.appendEvent(ctx, run.ID, event.Type, event.AgentName, event.ToolName, payload); err != nil {
+				return err
+			}
+		}
+		return emit(StreamEvent{
+			Type: event.Type, RunID: run.ID, AgentName: event.AgentName,
+			Content: event.Content, ToolName: event.ToolName,
+			ToolCallID: event.ToolCallID, Arguments: event.Arguments,
+		})
+	})
+	if err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+
+	assistantMessage, err := s.store.AddMessage(ctx, domain.Message{
+		ID: id.New("msg"), ConversationID: conversationID,
+		Role: domain.RoleAssistant, Content: answer, CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+	completedAt := time.Now().UTC()
+	if err := s.appendEvent(ctx, run.ID, "model_output", agentruntime.AgentName, "", map[string]any{
+		"assistant_message_id": assistantMessage.ID,
+		"characters":           utf8.RuneCountInString(answer),
+	}); err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+	if err := s.appendEvent(ctx, run.ID, "run_completed", agentruntime.AgentName, "", map[string]any{
+		"assistant_message_id": assistantMessage.ID,
+	}); err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+	if err := s.store.FinishRun(ctx, run.ID, domain.RunCompleted, assistantMessage.ID, "", completedAt); err != nil {
+		return err
+	}
+	return emit(StreamEvent{Type: "done", RunID: run.ID, Message: &assistantMessage})
+}
+
+func (s *Service) failRun(ctx context.Context, runID string, cause error) error {
+	status := domain.RunFailed
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		status = domain.RunCancelled
+	}
+	// 浏览器断开时原 Context 已取消；这里派生一个短时独立 Context，
+	// 确保 Run 最终落为 cancelled/failed，而不是永久停留在 running。
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	_ = s.appendEvent(persistCtx, runID, "run_"+status, agentruntime.AgentName, "", map[string]any{"error": cause.Error()})
+	_ = s.store.FinishRun(persistCtx, runID, status, "", cause.Error(), time.Now().UTC())
+	return cause
+}
+
+func (s *Service) appendEvent(ctx context.Context, runID, eventType, agentName, toolName string, payload map[string]any) error {
+	_, err := s.store.AppendRunEvent(ctx, domain.RunEvent{
+		ID: id.New("evt"), RunID: runID, Type: eventType,
+		AgentName: agentName, ToolName: toolName, Payload: payload,
+		CreatedAt: time.Now().UTC(),
+	})
+	return err
+}
+
+func (s *Service) lockConversation(id string) func() {
+	// map 本身由 locksMu 保护；真正的业务临界区由每个会话自己的 Mutex 保护。
+	s.locksMu.Lock()
+	lock := s.locks[id]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		s.locks[id] = lock
+	}
+	s.locksMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func toEinoMessages(messages []domain.Message) []*schema.Message {
+	// 领域模型在此处一次性转换，避免 Eino 类型渗透到 Store 和 HTTP 层。
+	result := make([]*schema.Message, 0, len(messages))
+	for _, message := range messages {
+		switch message.Role {
+		case domain.RoleUser:
+			result = append(result, schema.UserMessage(message.Content))
+		case domain.RoleAssistant:
+			result = append(result, schema.AssistantMessage(message.Content, nil))
+		case domain.RoleTool:
+			result = append(result, schema.ToolMessage(message.Content, message.ToolCallID, schema.WithToolName(message.ToolName)))
+		}
+	}
+	return result
+}
+
+func titleFromMessage(content string) string {
+	runes := []rune(strings.Join(strings.Fields(content), " "))
+	if len(runes) > 28 {
+		return string(runes[:28]) + "…"
+	}
+	return string(runes)
+}

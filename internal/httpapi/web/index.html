@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Zora - 用 Go 和 Eino 构建的可观察 Agent">
+  <title>Zora Agent</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand-row">
+        <div class="brand-mark" aria-hidden="true">Z</div>
+        <div>
+          <div class="brand-name">Zora</div>
+          <div class="brand-caption">Agent workspace</div>
+        </div>
+        <button class="icon-button mobile-only" id="closeSidebar" aria-label="关闭侧边栏">×</button>
+      </div>
+
+      <button class="new-chat" id="newConversation">
+        <span aria-hidden="true">＋</span>
+        新建对话
+        <kbd>⌘ K</kbd>
+      </button>
+
+      <div class="section-label">最近对话</div>
+      <nav class="conversation-list" id="conversationList" aria-label="对话列表"></nav>
+
+      <div class="sidebar-footer">
+        <div class="runtime-card">
+          <span class="status-dot" id="statusDot"></span>
+          <div>
+            <strong id="runtimeModel">连接中…</strong>
+            <span id="runtimeProvider">检查运行状态</span>
+          </div>
+        </div>
+        <div class="roadmap-mini">
+          <span>V0.1</span>
+          <div><i></i></div>
+          <small>下一站：RAG</small>
+        </div>
+      </div>
+    </aside>
+
+    <div class="sidebar-scrim" id="sidebarScrim"></div>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <button class="icon-button mobile-only" id="openSidebar" aria-label="打开侧边栏">☰</button>
+        <div class="conversation-heading">
+          <strong id="conversationTitle">新对话</strong>
+          <span><b class="live-dot"></b> Eino ReAct Runtime</span>
+        </div>
+        <button class="icon-button" id="renameConversation" aria-label="重命名对话" title="重命名">✎</button>
+      </header>
+
+      <section class="chat-scroll" id="chatScroll">
+        <div class="chat-column" id="messageList">
+          <section class="welcome" id="welcome">
+            <div class="welcome-orb"><span>Z</span></div>
+            <h1>今天想解决什么问题？</h1>
+            <p>这是一个真正运行 Agent 循环的 Go 项目。每次工具选择、调用结果与执行状态都会被记录。</p>
+            <div class="suggestion-grid">
+              <button class="suggestion" data-prompt="现在上海几点？">
+                <span class="suggestion-icon purple">◷</span>
+                <strong>查询当前时间</strong>
+                <small>触发 current_time 工具</small>
+              </button>
+              <button class="suggestion" data-prompt="帮我计算 (128 + 72) * 3.5">
+                <span class="suggestion-icon blue">∑</span>
+                <strong>精确计算</strong>
+                <small>触发安全计算工具</small>
+              </button>
+              <button class="suggestion" data-prompt="介绍一下这个项目现在有哪些功能">
+                <span class="suggestion-icon green">⌁</span>
+                <strong>查看项目能力</strong>
+                <small>读取当前里程碑</small>
+              </button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <footer class="composer-wrap">
+        <form class="composer" id="composer">
+          <textarea id="messageInput" rows="1" maxlength="20000" placeholder="给 Zora 发送消息…" aria-label="消息"></textarea>
+          <div class="composer-bottom">
+            <div class="composer-meta">
+              <span class="tool-badge"><i></i> 3 个只读工具</span>
+              <span>Enter 发送 · Shift Enter 换行</span>
+            </div>
+            <button type="submit" class="send-button" id="sendButton" aria-label="发送" disabled>
+              <span id="sendIcon">↑</span>
+            </button>
+          </div>
+        </form>
+        <p class="disclaimer">Zora 可能会犯错。重要信息请核实，写操作将在后续版本加入人工确认。</p>
+      </footer>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
