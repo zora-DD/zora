@@ -39,6 +39,13 @@ func NewService(store Store, embedder Embedder, chunkOptions ChunkOptions) (*Ser
 
 func (s *Service) EmbeddingModel() string { return s.embedder.Name() }
 
+func (s *Service) RetrievalBackend() string {
+	if _, ok := s.store.(CandidateStore); ok {
+		return "postgres-pgvector-fts"
+	}
+	return "sqlite-exact-scan"
+}
+
 func (s *Service) Ingest(ctx context.Context, input IngestInput) (IngestResult, error) {
 	input.Name = strings.TrimSpace(input.Name)
 	if input.Name == "" {
@@ -140,6 +147,31 @@ func (s *Service) SearchWithMode(ctx context.Context, query string, topK int, mo
 	if mode != RetrievalHybrid && mode != RetrievalVector && mode != RetrievalKeyword {
 		return nil, fmt.Errorf("不支持的检索模式：%q", mode)
 	}
+	if candidateStore, ok := s.store.(CandidateStore); ok {
+		var queryVector []float64
+		if mode != RetrievalKeyword {
+			vector, err := s.embedQuery(ctx, query)
+			if err != nil {
+				return nil, err
+			}
+			queryVector = vector
+		}
+		queryTermCounts, _ := termCounts(query)
+		queryTerms := make([]string, 0, len(queryTermCounts))
+		for term := range queryTermCounts {
+			queryTerms = append(queryTerms, term)
+		}
+		slices.Sort(queryTerms)
+		candidates, err := candidateStore.SearchCandidates(ctx, CandidateRequest{
+			Mode: mode, QueryVector: queryVector, QueryTerms: queryTerms,
+			EmbeddingModel: s.embedder.Name(), EmbeddingDimensions: s.embedder.Dimensions(),
+			Limit: 50,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return rankCandidates(candidates, topK, mode), nil
+	}
 
 	chunks, err := s.store.ListChunks(ctx, maxSearchChunks)
 	if err != nil {
@@ -152,12 +184,9 @@ func (s *Service) SearchWithMode(ctx context.Context, query string, topK int, mo
 		return rankSearch(query, nil, chunks, topK, mode), nil
 	}
 
-	vectors, err := s.embedder.Embed(ctx, []string{query})
+	queryVector, err := s.embedQuery(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("检索问题向量化失败：%w", err)
-	}
-	if len(vectors) != 1 || len(vectors[0]) != s.embedder.Dimensions() {
-		return nil, fmt.Errorf("Embedding 器返回的检索向量无效")
+		return nil, err
 	}
 
 	compatible := make([]Chunk, 0, len(chunks))
@@ -170,7 +199,18 @@ func (s *Service) SearchWithMode(ctx context.Context, query string, topK int, mo
 	if len(compatible) == 0 {
 		return nil, ErrEmbeddingMismatch
 	}
-	return rankSearch(query, vectors[0], compatible, topK, mode), nil
+	return rankSearch(query, queryVector, compatible, topK, mode), nil
+}
+
+func (s *Service) embedQuery(ctx context.Context, query string) ([]float64, error) {
+	vectors, err := s.embedder.Embed(ctx, []string{query})
+	if err != nil {
+		return nil, fmt.Errorf("检索问题向量化失败：%w", err)
+	}
+	if len(vectors) != 1 || len(vectors[0]) != s.embedder.Dimensions() {
+		return nil, fmt.Errorf("Embedding 器返回的检索向量无效")
+	}
+	return vectors[0], nil
 }
 
 type scoredChunk struct {
@@ -235,6 +275,50 @@ func rankSearch(query string, queryVector []float64, chunks []Chunk, topK int, m
 	})
 
 	results := make([]SearchResult, 0, topK)
+	for _, item := range items {
+		if item.fusedScore <= 0 {
+			continue
+		}
+		results = append(results, SearchResult{
+			ChunkID: item.chunk.ID, DocumentID: item.chunk.DocumentID,
+			DocumentName: item.chunk.DocumentName, Ordinal: item.chunk.Ordinal,
+			Content: item.chunk.Content, StartRune: item.chunk.StartRune, EndRune: item.chunk.EndRune,
+			Score: item.fusedScore, VectorScore: item.vectorScore, KeywordScore: item.keywordScore,
+		})
+		if len(results) == topK {
+			break
+		}
+	}
+	return results
+}
+
+func rankCandidates(candidates []Candidate, topK int, mode RetrievalMode) []SearchResult {
+	items := make([]scoredChunk, 0, len(candidates))
+	for _, candidate := range candidates {
+		score := 0.0
+		switch mode {
+		case RetrievalHybrid:
+			if candidate.VectorRank > 0 {
+				score += 1 / (rrfConstant + float64(candidate.VectorRank))
+			}
+			if candidate.KeywordRank > 0 {
+				score += 1 / (rrfConstant + float64(candidate.KeywordRank))
+			}
+		case RetrievalVector:
+			score = candidate.VectorScore
+		case RetrievalKeyword:
+			score = candidate.KeywordScore
+		}
+		items = append(items, scoredChunk{
+			chunk: candidate.Chunk, vectorScore: candidate.VectorScore,
+			keywordScore: candidate.KeywordScore, fusedScore: score,
+		})
+	}
+	slices.SortFunc(items, func(a, b scoredChunk) int {
+		return compareRank(b.fusedScore, a.fusedScore, a.chunk, b.chunk)
+	})
+
+	results := make([]SearchResult, 0, min(topK, len(items)))
 	for _, item := range items {
 		if item.fusedScore <= 0 {
 			continue

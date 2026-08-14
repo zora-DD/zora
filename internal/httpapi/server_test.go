@@ -170,6 +170,20 @@ func TestEmbeddedSPA(t *testing.T) {
 	}
 }
 
+func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
+	t.Parallel()
+	handler := newTestHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "/api/info", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("info status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
+		t.Fatalf("info body = %s", response.Body.String())
+	}
+}
+
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
 	database, err := sqlite.Open(filepath.Join(t.TempDir(), "spa.db"))

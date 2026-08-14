@@ -11,7 +11,7 @@ Zora 将系统划分为七个边界：
 3. `agentruntime`：Eino ADK 适配，输出与传输协议无关的事件。
 4. `agenttools`：工具 Schema、输入校验和执行代码。
 5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
-6. `store`：对话与知识库的持久化边界，当前由 SQLite 实现。
+6. `store`：对话与知识库的持久化边界，由 SQLite 或 PostgreSQL 实现。
 7. `rageval`：固定数据集校验、检索指标计算和单路/混合效果对比。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
@@ -56,7 +56,7 @@ V0.1 直接使用 `ChatModelAgent + Runner`，以获得：
 - 浏览器 Abort、HTTP Context 取消和服务端 Deadline 会传入 Eino 与模型请求。
 - 模型客户端和整个消息请求都有超时。
 
-V0.2 引入 PostgreSQL 后，应把进程内对话锁升级为数据库 advisory lock 或带租约的分布式锁。
+PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业务对话锁仍是进程内 Mutex，多实例部署前还应升级为数据库 advisory lock 或带租约的分布式锁。
 
 ## 5. 安全基线
 
@@ -85,24 +85,24 @@ internal/knowledge/
 internal/store/sqlite/
 └── sqlite.go        Document/Chunk 事务存储
 
+internal/store/postgres/
+├── postgres.go      pgxpool、pgvector 注册、迁移锁和维度校验
+├── conversations.go Conversation/Message/Run/Event
+├── knowledge.go     Document/Chunk、HNSW/FTS 候选召回
+└── schema.go        PostgreSQL DDL 与索引
+
 internal/rageval/
 └── evaluator.go     Recall@K、MRR、命中率和模式对比
 
 evals/
 └── knowledge.json   固定语料、问题、相关文档与阈值
 
-当前候选召回在 Go 内最多精确扫描 10,000 个 Chunk。V0.2 下一子阶段保持 Service 和 Tool 契约，将召回下推到：
-
-internal/store/postgres/
-├── conversations.go
-├── documents.go
-├── chunks.go        pgvector + FTS
-└── memories.go
+SQLite 候选召回在 Go 内最多精确扫描 10,000 个 Chunk。PostgreSQL 使用 `CandidateStore` 将 pgvector HNSW 和 `tsvector`/GIN 两路 Top 50 候选下推数据库，再由 `knowledge.Service` 统一执行 RRF。两个后端保持相同的 Service 和 Tool 契约。
 ```
 
 检索作为 Eino Tool 或 Graph 暴露给 Agent，但召回、权限过滤和评估属于业务层。
 
-线上 `knowledge_search` 固定使用 hybrid；离线评测通过 `SearchWithMode` 分别执行 vector、keyword 和 hybrid。`cmd/zora-eval` 每次在临时 SQLite 中重建固定语料，因此不会被开发者在线知识库中的历史数据污染，也可在后续切换 pgvector 时作为回归基线。
+线上 `knowledge_search` 固定使用 hybrid；离线评测通过 `SearchWithMode` 分别执行 vector、keyword 和 hybrid。`cmd/zora-eval` 每次在临时 SQLite 中重建固定语料，因此不会被在线历史数据污染。PostgreSQL 集成测试通过 `ZORA_TEST_POSTGRES_DSN` 显式启用。
 
 ## 7. 长期记忆接入点
 

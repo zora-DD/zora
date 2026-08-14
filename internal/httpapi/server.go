@@ -65,14 +65,19 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
+	capabilities := []string{
+		"chat", "streaming", "tools", "persistence", "run-audit",
+		"knowledge-ingestion", "hybrid-retrieval", "knowledge-citations",
+	}
+	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
+		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "Zora", "version": "0.2.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
-		"embedding_model": s.knowledge.EmbeddingModel(),
-		"capabilities": []string{
-			"chat", "streaming", "tools", "persistence", "run-audit",
-			"knowledge-ingestion", "hybrid-retrieval", "knowledge-citations",
-		},
+		"embedding_model":   s.knowledge.EmbeddingModel(),
+		"retrieval_backend": s.knowledge.RetrievalBackend(),
+		"capabilities":      capabilities,
 	})
 }
 

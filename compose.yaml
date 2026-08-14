@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg16-bookworm
+    environment:
+      POSTGRES_DB: zora
+      POSTGRES_USER: zora
+      POSTGRES_PASSWORD: zora
+    ports:
+      - "54328:5432"
+    volumes:
+      - zora-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zora -d zora"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  zora:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ZORA_ADDR: :8088
+      ZORA_STORE_PROVIDER: postgres
+      ZORA_POSTGRES_DSN: postgres://zora:zora@postgres:5432/zora?sslmode=disable
+      ZORA_POSTGRES_MAX_CONNS: 10
+      ZORA_MODEL_PROVIDER: mock
+      ZORA_EMBEDDING_PROVIDER: hash
+      ZORA_EMBEDDING_DIMENSIONS: 384
+    ports:
+      - "8088:8088"
+
+volumes:
+  zora-postgres-data:

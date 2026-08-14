@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.2 Knowledge Base（开发中）**。V0.1 Agent Core 已完成，当前已打通可运行、可引用、可离线评测的 RAG 纵向切片。
+当前版本：**V0.2 Knowledge Base（开发中）**。V0.1 Agent Core 已完成，当前已打通本地 SQLite 与 PostgreSQL/pgvector 两种 RAG 运行模式。
 
 ## 当前能力
 
@@ -15,12 +15,13 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 模型接入 | 已完成 | 本地 Mock、OpenAI-compatible、通义千问 |
 | 工具系统 | 已完成 | 时间、计算器、项目状态、知识检索四个只读工具 |
 | 对话管理 | 已完成 | 创建、列表、自动标题、重命名、删除 |
-| 持久化 | 已完成 | SQLite 保存 Conversation、Message、AgentRun |
+| 持久化 | 已完成 | SQLite 或 PostgreSQL 保存 Conversation、Message、AgentRun 和 RunEvent |
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
 | Web UI | 已完成 | 内嵌响应式页面，不需要 Node.js 部署 |
 | 知识库 MVP | 已完成 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
 | RAG 检索评测 | 已完成 | 固定语料与问题集，对比向量/关键词/混合召回，输出 Recall@K、MRR、命中率和延迟 |
-| 生产向量库 | V0.2 进行中 | PostgreSQL + pgvector、FTS、权限过滤和答案忠实度评估 |
+| PostgreSQL 向量库 | 已实现 | pgx 连接池、幂等迁移、pgvector HNSW、PostgreSQL FTS、RRF 候选融合 |
+| 生产知识库剩余项 | V0.2 进行中 | 文档权限、版本、PDF、答案忠实度和真实数据验收 |
 | 长期记忆 | V0.3 | Semantic/Episodic Memory、合并、过期和用户控制 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
@@ -34,6 +35,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **Mock 不绕过 Agent**：无密钥模式仍经过 Eino ChatModelAgent 和 ToolNode，可稳定测试完整链路。
 - **RAG 召回可解释**：同时保留向量相似度、BM25 得分和 RRF 融合结果，每条证据可追溯到文档和字符区间。
 - **检索效果可回归**：固定评测集在隔离数据库中重建语料，分别测量 vector、keyword 和 hybrid，避免算法升级只凭主观体验。
+- **双存储后端**：SQLite 保留零依赖精确扫描；PostgreSQL 将向量和全文候选召回下推数据库，HTTP 与 Agent Tool 契约保持不变。
 - **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
@@ -87,6 +89,25 @@ make eval-rag
 ./data/zora.db
 ```
 
+### 使用 PostgreSQL + pgvector
+
+直接启动 PostgreSQL 和 Zora：
+
+```bash
+docker compose up --build
+```
+
+也可以只启动数据库，再从本机运行 Go 服务：
+
+```bash
+make postgres-up
+make run-postgres
+```
+
+PostgreSQL 模式使用 HNSW 余弦向量索引和 GIN 全文索引生成两路候选，`knowledge.Service` 继续执行 RRF，保证与 SQLite 使用相同的融合规则。首次启动会执行幂等建表；多实例迁移通过 advisory lock 串行化。
+
+修改 `ZORA_EMBEDDING_DIMENSIONS` 后，现有 `vector(N)` 列不会被静默改写。服务会在启动时拒绝维度不一致的数据库，需要先迁移或重建知识索引。
+
 ## 接入通义千问
 
 Zora 使用 OpenAI-compatible 模型协议：
@@ -124,6 +145,9 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 |---|---|---|
 | `ZORA_ADDR` | `:8088` | HTTP 监听地址 |
 | `ZORA_DATA_DIR` | `./data` | SQLite 数据目录 |
+| `ZORA_STORE_PROVIDER` | `sqlite` | `sqlite` 或 `postgres` |
+| `ZORA_POSTGRES_DSN` | 空 | postgres 模式必填的连接串 |
+| `ZORA_POSTGRES_MAX_CONNS` | `10` | PostgreSQL 连接池上限，范围 1–100 |
 | `ZORA_MODEL_PROVIDER` | `mock` | `mock` 或 `openai` |
 | `ZORA_MODEL` | `qwen-plus` | 真实模型名称 |
 | `ZORA_API_KEY` | 空 | openai 模式必填 |
@@ -142,6 +166,14 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
 ## Docker
+
+推荐的 PostgreSQL + pgvector 方式：
+
+```bash
+docker compose up --build
+```
+
+Compose 使用 `pgvector/pgvector:0.8.6-pg16-bookworm`，数据库从宿主机映射到 `54328`，Zora 仍监听 `8088`。
 
 构建并运行本地 Mock 模式：
 
@@ -234,6 +266,7 @@ internal/rageval/          Recall@K、MRR、命中率和模式对比
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
 internal/store/sqlite/     对话与知识库的 SQLite 实现
+internal/store/postgres/   pgx、pgvector HNSW、PostgreSQL FTS 和迁移
 internal/httpapi/          REST、SSE 和内嵌 Web UI
 docs/                      分析、技术设计、架构和 Roadmap
 ```
@@ -250,6 +283,10 @@ make vet
 # 固定 RAG 检索评测
 make eval-rag
 
+# 启动 pgvector 并执行真实数据库集成测试
+make postgres-up
+make test-postgres
+
 # 格式化、测试和静态分析
 make check
 
@@ -265,6 +302,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - 计算器优先级、括号、一元运算、非法表达式和除零；
 - Mock 模型通过 Eino 完成 ToolCall → ToolResult → Answer；
 - SQLite Conversation/Message 生命周期和级联删除；
+- PostgreSQL Store 契约、向量维度、FTS 词项和可选真实数据库生命周期测试；
 - HTTP 创建对话和 SSE 工具调用链；
 - 根页面、静态资源和 SPA 路由回退；
 - Unicode 分块边界、重叠与原文字符偏移；
@@ -286,9 +324,9 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 为了让项目在没有 API Key 时仍能运行和测试。Mock 实现的是 Eino 模型接口，工具调用仍经过真实 Agent 链路。
 
-### 为什么当前知识库仍使用 SQLite？
+### 为什么默认仍使用 SQLite？
 
-它能提供零运维体验，适合先验证“上传 → 分块 → Embedding → 召回 → Agent 引用”的完整业务闭环。当前向量在 Go 内做精确扫描，上限为 10,000 个分块，不适合大规模生产数据。V0.2 下一子阶段会增加 PostgreSQL + pgvector，并保留同一 Service 业务语义。
+它提供零运维体验，适合演示和本地开发。需要更大的数据规模或多连接服务时，可将 `ZORA_STORE_PROVIDER` 改为 `postgres`；向量 HNSW 和全文候选召回会下推 PostgreSQL，而上层 Service、Tool 和 HTTP API 不变。
 
 ### 为什么不立即实现多 Agent？
 
@@ -305,7 +343,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 ## Roadmap
 
 - V0.1：Agent Core——已完成
-- V0.2：向量知识库与 RAG——进行中，本地 MVP 已打通
+- V0.2：向量知识库与 RAG——进行中，SQLite/pgvector 双后端已实现
 - V0.3：长期记忆
 - V0.4：多 Agent
 - V0.5：MCP 办公助手

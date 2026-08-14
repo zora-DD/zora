@@ -14,7 +14,7 @@
 
 ## V0.2 Knowledge Base — 进行中
 
-- [ ] PostgreSQL + pgvector Store
+- [x] PostgreSQL + pgvector Store（完整会话/Run/知识库持久化）
 - [x] 文档上传和 SHA-256 内容去重
 - [ ] 文档版本控制
 - [x] TXT、Markdown 基础解析
@@ -23,7 +23,7 @@
 - [ ] 递归/语义切块策略
 - [x] Embedding Provider 抽象（本地 Hash + OpenAI-compatible）
 - [x] SQLite 精确向量扫描 + BM25（最多 10,000 chunks）
-- [ ] pgvector 向量检索 + PostgreSQL FTS
+- [x] pgvector HNSW 向量检索 + PostgreSQL FTS/GIN 候选召回
 - [x] RRF 混合召回
 - [x] 结构化引用坐标与 Agent Tool 证据查看
 - [ ] 文档级权限过滤
@@ -32,7 +32,7 @@
 
 验收条件：每个知识库答案能够定位到原文；能用固定数据证明混合召回优于单一路径。
 
-当前验证结果：上传 → 分块 → Embedding → 向量/BM25 → RRF → `knowledge_search` → 对话 SSE 的本地纵向链路已打通；自动化测试已验证去重、偏移引用、三种检索模式和级联删除。`zora-rag-smoke-v1` 在默认 Hash Embedding 下得到 Recall@3=1、MRR=1，但 vector、keyword、hybrid 三种模式打平。当前样本只证明评测链路和基础召回可回归；仍需扩充语义改写、干扰文档和多相关文档样本，才能验证混合召回是否优于单路，因此 V0.2 未标记完成。
+当前验证结果：上传 → 分块 → Embedding → 向量/关键词 → RRF → `knowledge_search` → 对话 SSE 的纵向链路已打通。SQLite 采用进程内精确扫描；PostgreSQL 实现完整 Store、pgvector HNSW、`tsvector`/GIN、维度校验、迁移锁和数据库候选下推。自动化测试已覆盖 Store 契约、候选融合和评测指标；真实 PostgreSQL 生命周期测试可通过 `make test-postgres` 执行，但本次开发环境没有 Docker，容器验收尚未实际运行。`zora-rag-smoke-v1` 在默认 Hash Embedding 下得到 Recall@3=1、MRR=1，但三种模式打平；仍需真实语义样本、ACL 和答案忠实度，因此 V0.2 未标记完成。
 
 ## V0.3 Long-term Memory
 

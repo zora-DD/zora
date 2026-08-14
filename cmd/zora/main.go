@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,8 +18,15 @@ import (
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/httpapi"
 	"github.com/zhiruo/zora/internal/knowledge"
+	"github.com/zhiruo/zora/internal/store"
+	"github.com/zhiruo/zora/internal/store/postgres"
 	"github.com/zhiruo/zora/internal/store/sqlite"
 )
+
+type applicationStore interface {
+	store.Store
+	knowledge.Store
+}
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -34,7 +42,9 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	database, err := sqlite.Open(filepath.Join(cfg.DataDir, "zora.db"))
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), cfg.RequestTimeout)
+	defer cancelStartup()
+	database, err := buildStore(startupCtx, cfg)
 	if err != nil {
 		return err
 	}
@@ -79,7 +89,8 @@ func run(logger *slog.Logger) error {
 	serveErrors := make(chan error, 1)
 	// HTTP 服务放入 goroutine，主 goroutine 同时监听系统信号和异常退出。
 	go func() {
-		logger.Info("zora is ready", "addr", cfg.Addr, "provider", cfg.Provider, "model", cfg.Model,
+		logger.Info("zora is ready", "addr", cfg.Addr, "store", cfg.StoreProvider,
+			"provider", cfg.Provider, "model", cfg.Model,
 			"embedding_provider", cfg.EmbeddingProvider, "embedding_model", embedder.Name())
 		serveErrors <- server.ListenAndServe()
 	}()
@@ -99,6 +110,20 @@ func run(logger *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return server.Shutdown(shutdownCtx)
+}
+
+func buildStore(ctx context.Context, cfg config.Config) (applicationStore, error) {
+	switch cfg.StoreProvider {
+	case "sqlite":
+		return sqlite.Open(filepath.Join(cfg.DataDir, "zora.db"))
+	case "postgres":
+		return postgres.Open(ctx, postgres.Config{
+			DSN: cfg.PostgresDSN, MaxConns: int32(cfg.PostgresMaxConns),
+			EmbeddingDimensions: cfg.EmbeddingDimensions,
+		})
+	default:
+		return nil, fmt.Errorf("不支持的存储提供方：%q", cfg.StoreProvider)
+	}
 }
 
 func buildEmbedder(cfg config.Config) (knowledge.Embedder, error) {

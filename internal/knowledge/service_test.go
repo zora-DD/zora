@@ -93,3 +93,52 @@ func TestServiceIngestSearchDeduplicateAndDelete(t *testing.T) {
 		t.Fatalf("search after delete = %+v, %v", results, err)
 	}
 }
+
+type fixedCandidateStore struct {
+	knowledge.Store
+	candidates []knowledge.Candidate
+}
+
+func (s *fixedCandidateStore) SearchCandidates(_ context.Context, request knowledge.CandidateRequest) ([]knowledge.Candidate, error) {
+	if request.Limit != 50 || request.EmbeddingModel == "" || len(request.QueryTerms) == 0 {
+		return nil, errors.New("candidate request is incomplete")
+	}
+	return append([]knowledge.Candidate(nil), s.candidates...), nil
+}
+
+func TestServiceUsesDatabaseCandidatesAndKeepsRRFInService(t *testing.T) {
+	t.Parallel()
+	database, err := sqlite.Open(filepath.Join(t.TempDir(), "candidate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	store := &fixedCandidateStore{Store: database, candidates: []knowledge.Candidate{
+		{
+			Chunk:       knowledge.Chunk{ID: "both", DocumentID: "doc-both", DocumentName: "融合命中.md", Content: "融合命中"},
+			VectorScore: 0.8, KeywordScore: 0.7, VectorRank: 2, KeywordRank: 1,
+		},
+		{
+			Chunk:       knowledge.Chunk{ID: "vector", DocumentID: "doc-vector", DocumentName: "仅向量.md", Content: "仅向量"},
+			VectorScore: 0.9, VectorRank: 1,
+		},
+	}}
+	embedder, err := knowledge.NewHashEmbedder(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := knowledge.NewService(store, embedder, knowledge.ChunkOptions{MaxRunes: 300, OverlapRunes: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := service.SearchWithMode(context.Background(), "融合检索", 2, knowledge.RetrievalHybrid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].DocumentName != "融合命中.md" {
+		t.Fatalf("unexpected candidate ranking: %+v", results)
+	}
+	if results[0].Score <= results[1].Score || results[0].VectorScore != 0.8 || results[0].KeywordScore != 0.7 {
+		t.Fatalf("RRF scores were not preserved: %+v", results)
+	}
+}

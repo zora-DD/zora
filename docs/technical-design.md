@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.2 Knowledge Base（本地 MVP）
+> 适用版本：V0.2 Knowledge Base（SQLite + PostgreSQL/pgvector）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -11,7 +11,8 @@
 | 语言 | Go | `go.mod` 指定 Go 1.26 |
 | Agent Runtime | `github.com/cloudwego/eino` | v0.9.14 |
 | 模型适配 | `eino-ext/components/model/openai` | v0.1.13 |
-| 数据库 | `modernc.org/sqlite` | v1.56.0，纯 Go 驱动 |
+| 本地数据库 | `modernc.org/sqlite` | v1.56.0，纯 Go 驱动 |
+| 生产数据库 | `pgx/v5` + `pgvector-go` | pgx v5.9.2；pgvector-go v0.4.0 |
 | HTTP | Go `net/http` | Method-aware ServeMux |
 | 流式协议 | Server-Sent Events | `text/event-stream` |
 | 前端 | 原生 HTML/CSS/JavaScript | 通过 `go:embed` 打包 |
@@ -33,7 +34,8 @@ internal/
 ├── domain/                    稳定领域对象
 ├── id/                        随机业务 ID
 ├── store/                     持久化接口
-│   └── sqlite/                SQLite 实现
+│   ├── sqlite/                SQLite 精确扫描实现
+│   └── postgres/              pgx、pgvector、FTS 和迁移
 ├── agenttools/                Eino Tool 及安全执行逻辑
 ├── agentruntime/              Eino/模型适配与统一事件
 ├── knowledge/                 分块、Embedding、混合检索与 Agent Tool
@@ -50,6 +52,7 @@ flowchart TD
     Main --> Chat["chat"]
     Main --> Runtime["agentruntime"]
     Main --> SQLite["store/sqlite"]
+    Main --> Postgres["store/postgres"]
     Main --> Tools["agenttools"]
     Main --> Knowledge["knowledge"]
     Eval["cmd/zora-eval"] --> RAGEval["rageval"]
@@ -67,6 +70,9 @@ flowchart TD
     SQLite --> Store
     SQLite --> KStore
     SQLite --> Domain
+    Postgres --> Store
+    Postgres --> KStore
+    Postgres --> Domain
 ```
 
 约束：
@@ -83,8 +89,8 @@ flowchart TD
 `cmd/zora/main.go` 按以下顺序启动：
 
 1. `config.Load` 读取并校验环境变量；
-2. 在 `ZORA_DATA_DIR` 中打开 `zora.db`；
-3. 执行幂等 DDL，启用 WAL 和 busy timeout；
+2. 根据 `ZORA_STORE_PROVIDER` 打开 SQLite 或 PostgreSQL；
+3. SQLite 启用 WAL/busy timeout；PostgreSQL 初始化连接池、pgvector 类型和幂等迁移；
 4. 构造时间、计算器和项目状态工具；
 5. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder；
 6. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
@@ -101,6 +107,9 @@ flowchart TD
 |---|---|---|---|
 | `ZORA_ADDR` | `:8088` | 否 | HTTP 监听地址 |
 | `ZORA_DATA_DIR` | `./data` | 否 | SQLite 数据目录 |
+| `ZORA_STORE_PROVIDER` | `sqlite` | 否 | `sqlite` 或 `postgres` |
+| `ZORA_POSTGRES_DSN` | 空 | postgres 模式必填 | PostgreSQL 连接串，只从环境变量读取 |
+| `ZORA_POSTGRES_MAX_CONNS` | `10` | 否 | pgxpool 最大连接数，范围 1–100 |
 | `ZORA_MODEL_PROVIDER` | `mock` | 否 | `mock` 或 `openai` |
 | `ZORA_MODEL` | `qwen-plus` | openai 模式需要 | 模型名称 |
 | `ZORA_API_KEY` | 空 | openai 模式必填 | 模型服务密钥 |
@@ -282,12 +291,22 @@ SQL 子查询先按 sequence 倒序取最近 N 条，外层再升序输出。结
 
 ### 8.4 Store 替换策略
 
-应用层依赖 `store.Store`，后续 PostgreSQL 版本需保持相同 Conversation/Message/Run 语义。迁移时需要额外处理：
+应用层依赖 `store.Store` 与 `knowledge.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/Document 语义；`cmd/zora` 只在启动组装阶段选择实现。
+
+PostgreSQL 已处理：
+
+- pgxpool 连接池和启动连通性检查；
+- `Conversation`、`Message`、`AgentRun`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk` 的事务与级联关系；
+- advisory transaction lock 串行化多实例 DDL；
+- pgvector 类型注册、固定维度校验、HNSW cosine index；
+- 基于统一 tokenizer 词项的 `tsvector` generated column 和 GIN index。
+
+仍需额外处理：
 
 - 多实例会话互斥；
-- schema migration 工具；
+- 带版本升级/回滚的正式 migration 工具；
 - tenant_id 和 ACL；
-- pgvector、全文索引及其事务边界。
+- 备份、恢复和连接池生产参数基准。
 
 ### 8.5 知识库摄取流程（当前实现）
 
@@ -375,6 +394,29 @@ flowchart LR
 报告同时给出 hybrid 相对 vector 和 keyword 的 Recall/MRR 差值。阈值只约束线上默认使用的 hybrid 模式；未达阈值时命令输出完整报告后以非零状态退出，可直接接入 CI。
 
 默认 `zora-rag-smoke-v1` 含 4 份文档和 4 个问题。在 Hash Embedding 下实际结果为 Recall@3=1、MRR=1，三种模式当前打平。这是小规模冒烟基线，不构成“混合召回优于单路”的证据。
+
+### 8.9 PostgreSQL、pgvector 与 FTS
+
+PostgreSQL Store 实现完整业务持久化，而不只是单独保存向量。`knowledge.Service` 通过可选的 `CandidateStore` 判断后端能力：
+
+```text
+SQLite
+  ListChunks(max=10000) → Go 余弦/BM25 → Go RRF
+
+PostgreSQL
+  pgvector HNSW Top 50 ─┐
+                        ├→ CandidateStore → Go RRF → Top K
+  tsvector GIN Top 50 ──┘
+```
+
+关键约束：
+
+- 向量列为 `vector(N)`，使用 `vector_cosine_ops` HNSW 索引；查询分数为 `1 - cosine_distance`；
+- `search_terms` 由与 SQLite 相同的中文单字/双字和西文 tokenizer 生成，`search_vector` 是 `simple` 配置的 stored generated column；
+- FTS 使用受参数化保护的 `to_tsquery`，词项之间用 OR 扩大候选集，最终排序由 RRF 决定；
+- vector/keyword 各最多返回 50 个候选；数据库返回原始分数和单路名次，融合公式仍在应用层；
+- Embedding 维度与现有列不一致时启动失败，禁止把不同维度静默写入同一索引；
+- `/api/info` 通过 `retrieval_backend` 返回 `sqlite-exact-scan` 或 `postgres-pgvector-fts`。
 
 ## 9. 并发、取消与错误处理
 
@@ -664,6 +706,7 @@ Content-Type: application/json
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
 | Store/知识库测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用和级联删除 |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；vector/keyword/hybrid 差值 |
+| PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
 | HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索和删除 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
 | 工程检查 | `go test`、`go vet`、race、无 CGO build |
@@ -675,6 +718,8 @@ make test
 make vet
 make check
 make eval-rag
+make postgres-up
+make test-postgres
 go test -race ./internal/...
 CGO_ENABLED=0 go build ./cmd/zora
 ```
@@ -685,6 +730,13 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 ```bash
 make run
+```
+
+PostgreSQL 模式：
+
+```bash
+make postgres-up
+make run-postgres
 ```
 
 ### Docker
@@ -717,7 +769,7 @@ flowchart LR
     Cite --> Agent["Agent 回答"]
 ```
 
-本地 MVP 已实现内容哈希、chunk 来源范围、Embedding 抽象、混合召回、引用和固定检索评测。剩余工作是将候选召回下推 PostgreSQL + pgvector/FTS，并增加文档版本、tenant/ACL、PDF、异步摄取、可选 Rerank、答案引用覆盖率/忠实度评估以及更有区分度的语义评测样本。
+当前已实现内容哈希、chunk 来源范围、Embedding 抽象、混合召回、引用、固定检索评测，以及 PostgreSQL + pgvector HNSW/FTS 候选下推。剩余工作是增加文档版本、tenant/ACL、PDF、异步摄取、可选 Rerank、答案引用覆盖率/忠实度评估以及更有区分度的语义评测样本。
 
 ### 17.2 V0.3 Memory
 

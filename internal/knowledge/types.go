@@ -89,3 +89,28 @@ type Store interface {
 	DeleteDocument(ctx context.Context, id string) error
 	ListChunks(ctx context.Context, limit int) ([]Chunk, error)
 }
+
+// CandidateRequest 是向量库下推候选召回时使用的稳定契约。
+// SQLite 不实现该接口，仍保留便于理解算法的进程内精确扫描路径。
+type CandidateRequest struct {
+	Mode                RetrievalMode
+	QueryVector         []float64
+	QueryTerms          []string
+	EmbeddingModel      string
+	EmbeddingDimensions int
+	Limit               int
+}
+
+// Candidate 同时携带单路原始分数和名次，Service 继续负责 RRF 融合。
+type Candidate struct {
+	Chunk        Chunk
+	VectorScore  float64
+	KeywordScore float64
+	VectorRank   int
+	KeywordRank  int
+}
+
+// CandidateStore 由能够在数据库侧执行候选召回的 Store 可选实现。
+type CandidateStore interface {
+	SearchCandidates(ctx context.Context, request CandidateRequest) ([]Candidate, error)
+}

@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.2 Knowledge Base（本地 MVP）
+> 文档基线：V0.2 Knowledge Base（SQLite + PostgreSQL/pgvector）
 > 最后更新：2026-08-14  
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通 TXT/Markdown 上传、去重、分块、Embedding、向量 + BM25/RRF 混合召回、Agent 引用和固定检索评测的本地闭环。PostgreSQL + pgvector、权限过滤、答案忠实度和更大规模的语义评测集仍是 V0.2 后续子阶段；长期记忆、多 Agent 和办公连接器属于后续里程碑。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通 TXT/Markdown 上传、去重、分块、Embedding、混合召回、Agent 引用、固定检索评测，以及 SQLite/PostgreSQL 双存储闭环。PostgreSQL 模式包含完整业务持久化、pgvector HNSW 和 FTS/GIN；权限过滤、答案忠实度和更大规模语义评测集仍是后续子阶段。
 
 ## 2. 背景与问题
 
@@ -88,7 +88,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 本地持久化 | 已实现 | SQLite、WAL、事务与级联删除 |
 | 知识库本地 MVP | 已实现 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
 | RAG 检索评测 | 已实现 | 固定语料与问题、三种检索模式、Recall@K、MRR、命中率、延迟和阈值门禁 |
-| 生产知识库 | V0.2 进行中 | PostgreSQL + pgvector、FTS、权限过滤、答案忠实度评估 |
+| PostgreSQL 知识库 | 已实现 | pgxpool、完整 Store、pgvector HNSW、FTS/GIN、RRF 候选融合 |
+| 生产知识库剩余项 | V0.2 进行中 | 权限、文档版本/PDF、答案忠实度和生产验收 |
 | 长期记忆 | 规划 V0.3 | Semantic/Episodic Memory 与 Consolidation |
 | 多 Agent | 规划 V0.4 | Supervisor、专业 Agent、预算和效果对比 |
 | 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
@@ -273,7 +274,7 @@ V0.1 的主消息历史只写 user 和最终 assistant 消息。中间工具轨�
 | `term_counts` | TEXT | JSON 对象 | BM25 词频；中文使用单字 + 双字特征 |
 | `token_count` | INTEGER | NOT NULL | BM25 文档长度 |
 
-向量和词频在 SQLite 中以 JSON 保存，是为了零运维 MVP，不是最终生产存储方案。
+SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embedding` 使用 `vector(N)`，并增加 `search_terms`、stored generated `search_vector`、HNSW 与 GIN 索引。两个实现共享同一 Document/Chunk 领域模型。
 
 ## 8. 技术架构
 
@@ -291,6 +292,9 @@ flowchart LR
     Knowledge --> KStore["knowledge.Store"]
     Store --> SQLite["SQLite"]
     KStore --> SQLite
+    Store --> PostgreSQL["PostgreSQL"]
+    KStore --> PostgreSQL
+    PostgreSQL --> PGVector["pgvector HNSW + FTS GIN"]
     Knowledge --> Embedder["Hash / OpenAI Embedder"]
     EvalCLI["zora-eval"] --> RAGEval["rageval"]
     EvalCLI --> Knowledge
@@ -313,6 +317,7 @@ flowchart LR
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
+| 基础设施层 | `internal/store/postgres` | pgxpool、迁移、业务 Store、HNSW/FTS 候选召回 |
 
 ### 8.2 关键技术选型
 
@@ -322,9 +327,10 @@ flowchart LR
 | Agent 框架 | Eino ADK | Go 原生、ReAct、Tool、流式事件及后续多 Agent 能力 |
 | 模型协议 | OpenAI-compatible | 可连接通义千问及其他兼容模型 |
 | 本地数据库 | SQLite | 零运维，便于演示、测试和 RAG 纵向切片 |
-| 检索 | 精确余弦扫描 + BM25 + RRF | 算法透明、便于验证；后续下推 pgvector/FTS |
+| 生产数据库 | PostgreSQL + pgvector | 多连接持久化、HNSW 向量索引和 GIN 全文索引 |
+| 检索 | SQLite 精确扫描 / PostgreSQL 候选下推 + RRF | 两后端共享融合规则，能用固定集做迁移回归 |
 | Embedding | Hash / OpenAI-compatible | 本地零密钥与生产语义模型共用接口 |
-| RAG 评测 | 版本化 JSON + 隔离 SQLite | 同一语料可在 Hash、真实 Embedding 和未来 pgvector 上重复对比 |
+| RAG 评测 | 版本化 JSON + 隔离 SQLite | 同一语料可在 Hash、真实 Embedding 和 PostgreSQL 候选链路上重复对比 |
 | 前端传输 | SSE | 单向模型流简单、代理支持广、易于调试 |
 | UI 发布 | `go:embed` | 单二进制运行，无 Node.js 部署依赖 |
 | ID | `crypto/rand` | 不依赖数据库自增 ID，不暴露业务规模 |
@@ -357,7 +363,7 @@ RAG 已把语料、问题、相关文档和阈值作为版本化资产，并对 
 
 ### 9.7 可交换的 RAG 边界
 
-`knowledge.Service` 不依赖 SQLite 细节，`Embedder` 也不依赖具体厂商。当前精确向量扫描、BM25 和 RRF 把召回算法明确展示出来；切换 PostgreSQL + pgvector 时，只需将候选召回下推到 Store，HTTP 与 Agent Tool 契约可保持不变。
+`knowledge.Service` 不依赖数据库细节，`Embedder` 也不依赖具体厂商。SQLite 负责教学友好的精确向量/BM25；PostgreSQL 通过可选 `CandidateStore` 下推 HNSW/FTS 候选，RRF、HTTP 与 Agent Tool 契约保持不变。
 
 ### 9.8 证据引用不是 Prompt 幻觉
 
@@ -367,8 +373,9 @@ RAG 已把语料、问题、相关文档和阈值作为版本化资产，并对 
 
 | 限制/风险 | 当前影响 | 后续处理 |
 |---|---|---|
-| SQLite 单连接 | 适合单机和作品演示，不适合高并发多实例 | V0.2 增加 PostgreSQL Store |
-| 本地向量精确扫描 | 最多读取 10,000 个 chunk，内存和延迟随数据增长 | pgvector ANN 召回 + PostgreSQL FTS |
+| SQLite 单连接 | 适合单机和作品演示，不适合高并发多实例 | 生产配置切换 PostgreSQL Store |
+| 本地向量精确扫描 | 最多读取 10,000 个 chunk，内存和延迟随数据增长 | PostgreSQL 模式使用 pgvector HNSW + FTS |
+| PostgreSQL 容器验收未在当前环境执行 | 代码、单测和可选集成测试已完成，但缺少本机 Docker 实测记录 | 在有 Docker 的环境运行 `make postgres-up && make test-postgres` |
 | Hash Embedding 无深度语义 | 适合关键词相关性和链路测试，不适合生产问答 | 生产切换 text-embedding-v4 等语义模型 |
 | 固定评测集仅 4 题 | 能做冒烟回归，无法证明复杂语义场景或融合收益 | 增加语义改写、难负例、多相关文档和真实业务问题 |
 | 同步文档索引 | 大文件会占用 HTTP 请求 | 异步 Ingestion Job、重试和状态机 |
@@ -408,11 +415,13 @@ RAG 已把语料、问题、相关文档和阈值作为版本化资产，并对 
 - 默认无密钥可运行，同时有真实 Embedding 适配器的契约测试。
 - 固定评测命令在隔离数据库中复现语料，并输出 vector、keyword、hybrid 的 Recall@K、MRR、命中率和延迟；
 - 默认 `zora-rag-smoke-v1` 的实际基线为 Recall@3=1、MRR=1，三种模式打平，尚不能证明融合收益。
+- PostgreSQL 与 SQLite 实现相同 Store 契约，数据库侧只下推 Top 50 单路候选，RRF 仍由应用层统一计算；
+- PostgreSQL 启动校验 `vector(N)` 维度，多实例 DDL 使用 advisory transaction lock。
 
 ## 12. 演进路线
 
 1. **V0.1 Agent Core**：建立当前可运行基线。
-2. **V0.2 Knowledge Base（进行中）**：本地摄取、混合检索、引用和固定检索评测已实现；继续完成 PostgreSQL + pgvector、权限和答案质量评估。
+2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
 3. **V0.3 Long-term Memory**：记忆提取、合并、过期、召回和用户控制。
 4. **V0.4 Multi-Agent**：Supervisor、专业 Agent、预算和对照评估。
 5. **V0.5 Office Agent**：MCP、办公连接器、审批、权限和审计。
