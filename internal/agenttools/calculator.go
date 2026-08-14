@@ -22,10 +22,10 @@ func calculate(expression string) (float64, error) {
 	}
 	p.skipSpace()
 	if p.pos != len(p.input) {
-		return 0, fmt.Errorf("unexpected character %q at position %d", p.input[p.pos], p.pos+1)
+		return 0, fmt.Errorf("第 %d 个字符 %q 不被计算器支持", p.pos+1, p.input[p.pos])
 	}
 	if math.IsInf(value, 0) || math.IsNaN(value) {
-		return 0, fmt.Errorf("result is not a finite number")
+		return 0, fmt.Errorf("计算结果不是有限数值")
 	}
 	return value, nil
 }
@@ -72,7 +72,7 @@ func (p *expressionParser) parseTerm() (float64, error) {
 			left *= right
 		} else {
 			if right == 0 {
-				return 0, fmt.Errorf("division by zero")
+				return 0, fmt.Errorf("不能除以 0")
 			}
 			left /= right
 		}
@@ -95,7 +95,7 @@ func (p *expressionParser) parseFactor() (float64, error) {
 		}
 		p.skipSpace()
 		if !p.accept(')') {
-			return 0, fmt.Errorf("missing closing parenthesis")
+			return 0, fmt.Errorf("缺少右括号")
 		}
 		return value, nil
 	}
@@ -122,11 +122,11 @@ func (p *expressionParser) parseNumber() (float64, error) {
 		p.pos++
 	}
 	if start == p.pos {
-		return 0, fmt.Errorf("expected number at position %d", p.pos+1)
+		return 0, fmt.Errorf("第 %d 个位置应为数字", p.pos+1)
 	}
 	value, err := strconv.ParseFloat(string(p.input[start:p.pos]), 64)
 	if err != nil {
-		return 0, fmt.Errorf("invalid number: %w", err)
+		return 0, fmt.Errorf("数字格式无效：%w", err)
 	}
 	return value, nil
 }

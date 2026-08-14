@@ -25,6 +25,12 @@
         <kbd>⌘ K</kbd>
       </button>
 
+      <button class="knowledge-button" id="openKnowledge">
+        <span aria-hidden="true">◇</span>
+        知识库
+        <small id="knowledgeCount">0 份文档</small>
+      </button>
+
       <div class="section-label">最近对话</div>
       <nav class="conversation-list" id="conversationList" aria-label="对话列表"></nav>
 
@@ -37,9 +43,9 @@
           </div>
         </div>
         <div class="roadmap-mini">
-          <span>V0.1</span>
+          <span>V0.2</span>
           <div><i></i></div>
-          <small>下一站：RAG</small>
+          <small>下一站：pgvector</small>
         </div>
       </div>
     </aside>
@@ -88,7 +94,7 @@
           <textarea id="messageInput" rows="1" maxlength="20000" placeholder="给 Zora 发送消息…" aria-label="消息"></textarea>
           <div class="composer-bottom">
             <div class="composer-meta">
-              <span class="tool-badge"><i></i> 3 个只读工具</span>
+              <span class="tool-badge"><i></i> 4 个只读工具</span>
               <span>Enter 发送 · Shift Enter 换行</span>
             </div>
             <button type="submit" class="send-button" id="sendButton" aria-label="发送" disabled>
@@ -100,6 +106,26 @@
       </footer>
     </main>
   </div>
+
+  <dialog class="knowledge-dialog" id="knowledgeDialog">
+    <div class="dialog-heading">
+      <div>
+        <strong>知识库</strong>
+        <span id="embeddingModel">加载 Embedding 配置…</span>
+      </div>
+      <button class="icon-button" id="closeKnowledge" aria-label="关闭知识库">×</button>
+    </div>
+    <p class="dialog-description">上传 UTF-8 编码的 TXT 或 Markdown（不超过 5 MiB）。Zora 会自动分块并通过向量 + BM25 检索。</p>
+    <form class="upload-form" id="knowledgeUpload">
+      <label class="file-picker">
+        <input type="file" id="knowledgeFile" accept=".txt,.md,.markdown,text/plain,text/markdown" required>
+        <span>选择文档</span>
+        <small id="selectedFile">尚未选择</small>
+      </label>
+      <button type="submit" id="uploadKnowledge">上传并索引</button>
+    </form>
+    <div class="document-list" id="knowledgeDocuments"></div>
+  </dialog>
 
   <div class="toast" id="toast" role="status"></div>
   <script src="/app.js"></script>

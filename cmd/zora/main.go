@@ -16,6 +16,7 @@ import (
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/httpapi"
+	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/store/sqlite"
 )
 
@@ -43,12 +44,28 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	embedder, err := buildEmbedder(cfg)
+	if err != nil {
+		return err
+	}
+	knowledgeService, err := knowledge.NewService(database, embedder, knowledge.ChunkOptions{
+		MaxRunes: cfg.KnowledgeChunkSize, OverlapRunes: cfg.KnowledgeOverlap,
+	})
+	if err != nil {
+		return err
+	}
+	// 知识库检索和时间、计算器一样走统一 Tool 协议，便于后续加入多 Agent 调度。
+	knowledgeTool, err := knowledge.NewSearchTool(knowledgeService)
+	if err != nil {
+		return err
+	}
+	registeredTools = append(registeredTools, knowledgeTool)
 	runtime, err := agentruntime.New(context.Background(), cfg, registeredTools)
 	if err != nil {
 		return err
 	}
 	chatService := chat.NewService(database, runtime)
-	handler, err := httpapi.New(chatService, logger, cfg.RequestTimeout)
+	handler, err := httpapi.New(chatService, knowledgeService, logger, cfg.RequestTimeout)
 	if err != nil {
 		return err
 	}
@@ -62,7 +79,8 @@ func run(logger *slog.Logger) error {
 	serveErrors := make(chan error, 1)
 	// HTTP 服务放入 goroutine，主 goroutine 同时监听系统信号和异常退出。
 	go func() {
-		logger.Info("zora is ready", "addr", cfg.Addr, "provider", cfg.Provider, "model", cfg.Model)
+		logger.Info("zora is ready", "addr", cfg.Addr, "provider", cfg.Provider, "model", cfg.Model,
+			"embedding_provider", cfg.EmbeddingProvider, "embedding_model", embedder.Name())
 		serveErrors <- server.ListenAndServe()
 	}()
 
@@ -81,4 +99,19 @@ func run(logger *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return server.Shutdown(shutdownCtx)
+}
+
+func buildEmbedder(cfg config.Config) (knowledge.Embedder, error) {
+	switch cfg.EmbeddingProvider {
+	case "hash":
+		return knowledge.NewHashEmbedder(cfg.EmbeddingDimensions)
+	case "openai":
+		return knowledge.NewOpenAIEmbedder(knowledge.OpenAIEmbedderConfig{
+			APIKey: cfg.EmbeddingAPIKey, BaseURL: cfg.EmbeddingBaseURL,
+			Model: cfg.EmbeddingModel, Dimensions: cfg.EmbeddingDimensions,
+			HTTPClient: &http.Client{Timeout: cfg.RequestTimeout},
+		})
+	default:
+		return nil, errors.New("不支持的 Embedding 提供方")
+	}
 }

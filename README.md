@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.1 Agent Core**。
+当前版本：**V0.2 Knowledge Base（开发中）**。V0.1 Agent Core 已完成，当前已打通可运行的 RAG 纵向切片。
 
 ## 当前能力
 
@@ -13,12 +13,13 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 流式对话 | 已完成 | SSE 增量回复、停止生成、超时取消 |
 | ReAct Agent | 已完成 | Eino ChatModelAgent、工具循环、最大迭代 |
 | 模型接入 | 已完成 | 本地 Mock、OpenAI-compatible、通义千问 |
-| 工具系统 | 已完成 | 时间、计算器、项目状态三个只读工具 |
+| 工具系统 | 已完成 | 时间、计算器、项目状态、知识检索四个只读工具 |
 | 对话管理 | 已完成 | 创建、列表、自动标题、重命名、删除 |
 | 持久化 | 已完成 | SQLite 保存 Conversation、Message、AgentRun |
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
 | Web UI | 已完成 | 内嵌响应式页面，不需要 Node.js 部署 |
-| 向量知识库 | V0.2 | PostgreSQL + pgvector、混合检索、引用和评估 |
+| 知识库 MVP | 已完成 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
+| 生产向量库 | V0.2 进行中 | PostgreSQL + pgvector、FTS、权限过滤和固定评测集 |
 | 长期记忆 | V0.3 | Semantic/Episodic Memory、合并、过期和用户控制 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
@@ -30,6 +31,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **Go 原生 Agent Runtime**：核心服务、并发、流式传输和持久化均使用 Go。
 - **框架复用、业务自研**：Eino 负责 ReAct、Tool 和模型事件；会话、Run、审计及后续 RAG/Memory 机制由项目控制。
 - **Mock 不绕过 Agent**：无密钥模式仍经过 Eino ChatModelAgent 和 ToolNode，可稳定测试完整链路。
+- **RAG 召回可解释**：同时保留向量相似度、BM25 得分和 RRF 融合结果，每条证据可追溯到文档和字符区间。
+- **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
@@ -50,7 +53,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 make run
 ```
 
-打开 [http://localhost:8080](http://localhost:8080)。默认不需要 API Key。
+打开 [http://localhost:8088](http://localhost:8088)。默认不需要 API Key。
 
 可以尝试：
 
@@ -59,6 +62,14 @@ make run
 帮我计算 (128 + 72) * 3.5
 介绍一下这个项目现在有哪些功能
 ```
+
+点击侧边栏的“知识库”可上传 UTF-8 编码的 `.txt` / `.md` / `.markdown` 文件（单文件最大 5 MiB）。上传后可以询问：
+
+```text
+根据我上传的文档，项目的发布日期和上线要求是什么？
+```
+
+本地 Mock 会展示确定性的证据摘要和 `[README.md#0]` 形式引用，工具 Trace 中可查看完整检索结果；配置真实 Chat Model 后，模型会根据证据组织回答并标注文档名与分块编号。
 
 数据默认保存到：
 
@@ -86,11 +97,22 @@ make run
 - 所选模型需要支持 Tool Calling；
 - 自定义 System Prompt 中如果包含 Eino 模板占位符语法，需要正确转义花括号。
 
+如果需要真实语义检索，再增加：
+
+```bash
+ZORA_EMBEDDING_PROVIDER=openai \
+ZORA_EMBEDDING_MODEL=text-embedding-v4 \
+ZORA_EMBEDDING_DIMENSIONS=1024 \
+make run
+```
+
+Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `ZORA_EMBEDDING_API_KEY` / `ZORA_EMBEDDING_BASE_URL` 单独指定。
+
 ## 配置
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `ZORA_ADDR` | `:8080` | HTTP 监听地址 |
+| `ZORA_ADDR` | `:8088` | HTTP 监听地址 |
 | `ZORA_DATA_DIR` | `./data` | SQLite 数据目录 |
 | `ZORA_MODEL_PROVIDER` | `mock` | `mock` 或 `openai` |
 | `ZORA_MODEL` | `qwen-plus` | 真实模型名称 |
@@ -99,6 +121,13 @@ make run
 | `ZORA_SYSTEM_PROMPT` | 内置中文指令 | Agent 系统指令 |
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 单次 Agent 请求超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | ReAct 最大迭代，范围 1–50 |
+| `ZORA_EMBEDDING_PROVIDER` | `hash` | `hash` 或 `openai` |
+| `ZORA_EMBEDDING_MODEL` | `text-embedding-v4` | 真实 Embedding 模型名 |
+| `ZORA_EMBEDDING_API_KEY` | 复用 `ZORA_API_KEY` | Embedding 独立密钥 |
+| `ZORA_EMBEDDING_BASE_URL` | 复用 `ZORA_BASE_URL` | Embedding API 的 v1 根地址 |
+| `ZORA_EMBEDDING_DIMENSIONS` | hash: `384`；openai: `1024` | 向量维度，变更后需重建旧索引 |
+| `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 每个分块的 Unicode 字符上限 |
+| `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 相邻分块重叠字符数 |
 
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
@@ -109,7 +138,7 @@ make run
 ```bash
 docker build -t zora:dev .
 docker run --rm \
-  -p 8080:8080 \
+  -p 8088:8088 \
   -v zora-data:/app/data \
   zora:dev
 ```
@@ -118,7 +147,7 @@ docker run --rm \
 
 ```bash
 docker run --rm \
-  -p 8080:8080 \
+  -p 8088:8088 \
   -v zora-data:/app/data \
   -e ZORA_MODEL_PROVIDER=openai \
   -e ZORA_MODEL=qwen-plus \
@@ -170,6 +199,10 @@ sequenceDiagram
 | `GET` | `/api/conversations/{id}/messages` | 查询消息历史 |
 | `POST` | `/api/conversations/{id}/messages` | 发送消息并接收 SSE |
 | `GET` | `/api/runs/{id}/events` | 查询持久执行事件 |
+| `GET` | `/api/knowledge/documents` | 查询已索引文档 |
+| `POST` | `/api/knowledge/documents` | multipart 上传 TXT/Markdown 并同步索引 |
+| `DELETE` | `/api/knowledge/documents/{id}` | 删除文档及其分块 |
+| `POST` | `/api/knowledge/search` | 执行向量 + BM25/RRF 混合检索 |
 
 SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。
 
@@ -184,9 +217,10 @@ internal/domain/           Conversation、Message、Run、Event
 internal/id/               随机业务 ID
 internal/agentruntime/     Eino Runtime、模型适配和事件转换
 internal/agenttools/       只读工具和安全计算器
+internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
-internal/store/sqlite/     V0.1 SQLite 实现
+internal/store/sqlite/     对话与知识库的 SQLite 实现
 internal/httpapi/          REST、SSE 和内嵌 Web UI
 docs/                      分析、技术设计、架构和 Roadmap
 ```
@@ -216,7 +250,11 @@ CGO_ENABLED=0 go build ./cmd/zora
 - Mock 模型通过 Eino 完成 ToolCall → ToolResult → Answer；
 - SQLite Conversation/Message 生命周期和级联删除；
 - HTTP 创建对话和 SSE 工具调用链；
-- 根页面、静态资源和 SPA 路由回退。
+- 根页面、静态资源和 SPA 路由回退；
+- Unicode 分块边界、重叠与原文字符偏移；
+- Hash Embedding 可复现性和 OpenAI-compatible Embedding 批处理；
+- 文档入库、哈希去重、混合检索、引用和级联删除；
+- HTTP multipart 上传、知识检索与删除。
 
 ## 文档导航
 
@@ -231,9 +269,9 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 为了让项目在没有 API Key 时仍能运行和测试。Mock 实现的是 Eino 模型接口，工具调用仍经过真实 Agent 链路。
 
-### 为什么 V0.1 使用 SQLite？
+### 为什么当前知识库仍使用 SQLite？
 
-它能提供零运维体验，适合个人开发和项目演示。V0.2 知识库会增加 PostgreSQL + pgvector，并保留相同 Store 业务语义。
+它能提供零运维体验，适合先验证“上传 → 分块 → Embedding → 召回 → Agent 引用”的完整业务闭环。当前向量在 Go 内做精确扫描，上限为 10,000 个分块，不适合大规模生产数据。V0.2 下一子阶段会增加 PostgreSQL + pgvector，并保留同一 Service 业务语义。
 
 ### 为什么不立即实现多 Agent？
 
@@ -250,7 +288,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 ## Roadmap
 
 - V0.1：Agent Core——已完成
-- V0.2：向量知识库与 RAG——下一里程碑
+- V0.2：向量知识库与 RAG——进行中，本地 MVP 已打通
 - V0.3：长期记忆
 - V0.4：多 Agent
 - V0.5：MCP 办公助手

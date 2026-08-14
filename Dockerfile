@@ -18,13 +18,12 @@ WORKDIR /app
 COPY --from=build /out/zora /usr/local/bin/zora
 
 USER zora
-ENV ZORA_ADDR=:8080 \
+ENV ZORA_ADDR=:8088 \
     ZORA_DATA_DIR=/app/data \
     ZORA_MODEL_PROVIDER=mock
 VOLUME ["/app/data"]
-EXPOSE 8080
+EXPOSE 8088
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -q -O /dev/null http://127.0.0.1:8080/api/health || exit 1
+    CMD wget -q -O /dev/null http://127.0.0.1:8088/api/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/zora"]
-

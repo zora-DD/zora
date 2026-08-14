@@ -14,6 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/zhiruo/zora/internal/domain"
+	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/store"
 )
 
@@ -64,6 +65,37 @@ CREATE TABLE IF NOT EXISTS run_events (
 );
 CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence
     ON run_events(run_id, sequence);
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    content_hash TEXT NOT NULL UNIQUE,
+    embedding_model TEXT NOT NULL,
+    embedding_dimensions INTEGER NOT NULL,
+    chunk_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_documents_created
+    ON knowledge_documents(created_at DESC);
+CREATE TABLE IF NOT EXISTS knowledge_chunks (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    document_id TEXT NOT NULL REFERENCES knowledge_documents(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    start_rune INTEGER NOT NULL,
+    end_rune INTEGER NOT NULL,
+    embedding_model TEXT NOT NULL,
+    embedding TEXT NOT NULL,
+    term_counts TEXT NOT NULL,
+    token_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(document_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document
+    ON knowledge_chunks(document_id, ordinal);
 `
 
 type SQLite struct {
@@ -73,24 +105,24 @@ type SQLite struct {
 // Open 创建数据库文件，并执行可重复运行的建表语句。
 func Open(path string) (*SQLite, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create data directory: %w", err)
+		return nil, fmt.Errorf("创建数据目录失败：%w", err)
 	}
 
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, fmt.Errorf("打开 SQLite 数据库失败：%w", err)
 	}
-	// SQLite 的 PRAGMA 是连接级配置。V0.1 固定单连接以保证配置一致；
+	// SQLite 的 PRAGMA 是连接级配置。本地模式固定单连接以保证配置一致；
 	// WAL 允许读写更平滑，busy_timeout 用于吸收短暂的写锁竞争。
 	// 上层仅依赖 Store 接口，后续可替换为 PostgreSQL 实现。
 	db.SetMaxOpenConns(1)
 	if _, err = db.Exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("configure sqlite: %w", err)
+		return nil, fmt.Errorf("配置 SQLite 失败：%w", err)
 	}
 	if _, err = db.Exec(schema); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate sqlite: %w", err)
+		return nil, fmt.Errorf("执行 SQLite 表结构迁移失败：%w", err)
 	}
 	return &SQLite{db: db}, nil
 }
@@ -101,7 +133,7 @@ func (s *SQLite) CreateConversation(ctx context.Context, c domain.Conversation) 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO conversations(id, title, created_at, updated_at) VALUES(?, ?, ?, ?)`,
 		c.ID, c.Title, formatTime(c.CreatedAt), formatTime(c.UpdatedAt))
-	return wrap("create conversation", err)
+	return wrap("创建对话", err)
 }
 
 func (s *SQLite) GetConversation(ctx context.Context, id string) (domain.Conversation, error) {
@@ -117,7 +149,7 @@ GROUP BY c.id`, id).Scan(&c.ID, &c.Title, &createdAt, &updatedAt, &c.MessageCoun
 		return domain.Conversation{}, store.ErrNotFound
 	}
 	if err != nil {
-		return domain.Conversation{}, fmt.Errorf("get conversation: %w", err)
+		return domain.Conversation{}, fmt.Errorf("查询对话失败：%w", err)
 	}
 	c.CreatedAt, err = parseTime(createdAt)
 	if err != nil {
@@ -136,7 +168,7 @@ GROUP BY c.id
 ORDER BY c.updated_at DESC
 LIMIT ?`, limit)
 	if err != nil {
-		return nil, fmt.Errorf("list conversations: %w", err)
+		return nil, fmt.Errorf("查询对话列表失败：%w", err)
 	}
 	defer rows.Close()
 
@@ -145,7 +177,7 @@ LIMIT ?`, limit)
 		var c domain.Conversation
 		var createdAt, updatedAt string
 		if err := rows.Scan(&c.ID, &c.Title, &createdAt, &updatedAt, &c.MessageCount); err != nil {
-			return nil, fmt.Errorf("scan conversation: %w", err)
+			return nil, fmt.Errorf("读取对话数据失败：%w", err)
 		}
 		if c.CreatedAt, err = parseTime(createdAt); err != nil {
 			return nil, err
@@ -162,19 +194,19 @@ func (s *SQLite) RenameConversation(ctx context.Context, id, title string) error
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?`,
 		title, formatTime(time.Now().UTC()), id)
-	return affected("rename conversation", result, err)
+	return affected("重命名对话", result, err)
 }
 
 func (s *SQLite) DeleteConversation(ctx context.Context, id string) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM conversations WHERE id = ?`, id)
-	return affected("delete conversation", result, err)
+	return affected("删除对话", result, err)
 }
 
 func (s *SQLite) AddMessage(ctx context.Context, m domain.Message) (domain.Message, error) {
 	// 新消息和会话 updated_at 必须原子更新，否则侧边栏排序可能与消息历史不一致。
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return domain.Message{}, fmt.Errorf("begin add message: %w", err)
+		return domain.Message{}, fmt.Errorf("开始保存消息事务失败：%w", err)
 	}
 	defer tx.Rollback()
 
@@ -183,19 +215,19 @@ INSERT INTO messages(id, conversation_id, role, content, tool_name, tool_call_id
 VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		m.ID, m.ConversationID, m.Role, m.Content, m.ToolName, m.ToolCallID, formatTime(m.CreatedAt))
 	if err != nil {
-		return domain.Message{}, fmt.Errorf("add message: %w", err)
+		return domain.Message{}, fmt.Errorf("保存消息失败：%w", err)
 	}
 	sequence, err := result.LastInsertId()
 	if err != nil {
-		return domain.Message{}, fmt.Errorf("message sequence: %w", err)
+		return domain.Message{}, fmt.Errorf("获取消息顺序号失败：%w", err)
 	}
 	if _, err = tx.ExecContext(ctx,
 		`UPDATE conversations SET updated_at = ? WHERE id = ?`,
 		formatTime(m.CreatedAt), m.ConversationID); err != nil {
-		return domain.Message{}, fmt.Errorf("touch conversation: %w", err)
+		return domain.Message{}, fmt.Errorf("更新对话时间失败：%w", err)
 	}
 	if err = tx.Commit(); err != nil {
-		return domain.Message{}, fmt.Errorf("commit message: %w", err)
+		return domain.Message{}, fmt.Errorf("提交消息事务失败：%w", err)
 	}
 	m.Sequence = sequence
 	return m, nil
@@ -212,7 +244,7 @@ FROM (
 )
 ORDER BY sequence ASC`, conversationID, limit)
 	if err != nil {
-		return nil, fmt.Errorf("list messages: %w", err)
+		return nil, fmt.Errorf("查询消息列表失败：%w", err)
 	}
 	defer rows.Close()
 
@@ -221,7 +253,7 @@ ORDER BY sequence ASC`, conversationID, limit)
 		var m domain.Message
 		var createdAt string
 		if err := rows.Scan(&m.ID, &m.ConversationID, &m.Role, &m.Content, &m.ToolName, &m.ToolCallID, &m.Sequence, &createdAt); err != nil {
-			return nil, fmt.Errorf("scan message: %w", err)
+			return nil, fmt.Errorf("读取消息数据失败：%w", err)
 		}
 		if m.CreatedAt, err = parseTime(createdAt); err != nil {
 			return nil, err
@@ -236,7 +268,7 @@ func (s *SQLite) CreateRun(ctx context.Context, run domain.AgentRun) error {
 INSERT INTO agent_runs(id, conversation_id, user_message_id, status, model, started_at)
 VALUES(?, ?, ?, ?, ?, ?)`,
 		run.ID, run.ConversationID, run.UserMessageID, run.Status, run.Model, formatTime(run.StartedAt))
-	return wrap("create run", err)
+	return wrap("创建执行记录", err)
 }
 
 func (s *SQLite) FinishRun(ctx context.Context, id, status, assistantMessageID, errorMessage string, completedAt time.Time) error {
@@ -244,20 +276,20 @@ func (s *SQLite) FinishRun(ctx context.Context, id, status, assistantMessageID, 
 UPDATE agent_runs
 SET status = ?, assistant_message_id = NULLIF(?, ''), error = ?, completed_at = ?
 WHERE id = ?`, status, assistantMessageID, errorMessage, formatTime(completedAt), id)
-	return affected("finish run", result, err)
+	return affected("完成执行记录", result, err)
 }
 
 func (s *SQLite) AppendRunEvent(ctx context.Context, event domain.RunEvent) (domain.RunEvent, error) {
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {
-		return domain.RunEvent{}, fmt.Errorf("encode run event: %w", err)
+		return domain.RunEvent{}, fmt.Errorf("编码执行事件失败：%w", err)
 	}
 	result, err := s.db.ExecContext(ctx, `
 INSERT INTO run_events(id, run_id, type, agent_name, tool_name, payload, created_at)
 VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		event.ID, event.RunID, event.Type, event.AgentName, event.ToolName, string(payload), formatTime(event.CreatedAt))
 	if err != nil {
-		return domain.RunEvent{}, fmt.Errorf("append run event: %w", err)
+		return domain.RunEvent{}, fmt.Errorf("保存执行事件失败：%w", err)
 	}
 	event.Sequence, err = result.LastInsertId()
 	return event, err
@@ -268,7 +300,7 @@ func (s *SQLite) ListRunEvents(ctx context.Context, runID string) ([]domain.RunE
 SELECT id, run_id, type, agent_name, tool_name, payload, sequence, created_at
 FROM run_events WHERE run_id = ? ORDER BY sequence ASC`, runID)
 	if err != nil {
-		return nil, fmt.Errorf("list run events: %w", err)
+		return nil, fmt.Errorf("查询执行事件失败：%w", err)
 	}
 	defer rows.Close()
 
@@ -277,10 +309,10 @@ FROM run_events WHERE run_id = ? ORDER BY sequence ASC`, runID)
 		var event domain.RunEvent
 		var payload, createdAt string
 		if err := rows.Scan(&event.ID, &event.RunID, &event.Type, &event.AgentName, &event.ToolName, &payload, &event.Sequence, &createdAt); err != nil {
-			return nil, fmt.Errorf("scan run event: %w", err)
+			return nil, fmt.Errorf("读取执行事件失败：%w", err)
 		}
 		if err := json.Unmarshal([]byte(payload), &event.Payload); err != nil {
-			return nil, fmt.Errorf("decode run event: %w", err)
+			return nil, fmt.Errorf("解析执行事件失败：%w", err)
 		}
 		if event.CreatedAt, err = parseTime(createdAt); err != nil {
 			return nil, err
@@ -288,6 +320,163 @@ FROM run_events WHERE run_id = ? ORDER BY sequence ASC`, runID)
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+// CreateDocument 在同一事务中写入文档与全部分块，避免出现“只有文档没有向量”的半成品。
+func (s *SQLite) CreateDocument(ctx context.Context, document knowledge.Document, chunks []knowledge.Chunk) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始保存知识库文档事务失败：%w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO knowledge_documents(
+    id, name, source_type, mime_type, content_hash, embedding_model, embedding_dimensions,
+    chunk_count, created_at, updated_at
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		document.ID, document.Name, document.SourceType, document.MIMEType,
+		document.ContentHash, document.EmbeddingModel, document.EmbeddingDimensions, document.ChunkCount,
+		formatTime(document.CreatedAt), formatTime(document.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("保存知识库文档失败：%w", err)
+	}
+
+	for _, chunk := range chunks {
+		embedding, err := json.Marshal(chunk.Embedding)
+		if err != nil {
+			return fmt.Errorf("编码分块向量失败：%w", err)
+		}
+		terms, err := json.Marshal(chunk.TermCounts)
+		if err != nil {
+			return fmt.Errorf("编码分块词频失败：%w", err)
+		}
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO knowledge_chunks(
+    id, document_id, ordinal, content, start_rune, end_rune, embedding_model,
+    embedding, term_counts, token_count, created_at
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			chunk.ID, chunk.DocumentID, chunk.Ordinal, chunk.Content,
+			chunk.StartRune, chunk.EndRune, chunk.EmbeddingModel,
+			string(embedding), string(terms), chunk.TokenCount, formatTime(chunk.CreatedAt))
+		if err != nil {
+			return fmt.Errorf("保存第 %d 个知识库分块失败：%w", chunk.Ordinal+1, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交知识库文档事务失败：%w", err)
+	}
+	return nil
+}
+
+func (s *SQLite) GetDocumentByHash(ctx context.Context, contentHash string) (knowledge.Document, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, name, source_type, mime_type, content_hash, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
+FROM knowledge_documents WHERE content_hash = ?`, contentHash)
+	document, err := scanKnowledgeDocument(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return knowledge.Document{}, knowledge.ErrNotFound
+	}
+	if err != nil {
+		return knowledge.Document{}, fmt.Errorf("按哈希查询知识库文档失败：%w", err)
+	}
+	return document, nil
+}
+
+func (s *SQLite) ListDocuments(ctx context.Context, limit int) ([]knowledge.Document, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, name, source_type, mime_type, content_hash, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
+FROM knowledge_documents ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("查询知识库文档列表失败：%w", err)
+	}
+	defer rows.Close()
+
+	documents := make([]knowledge.Document, 0)
+	for rows.Next() {
+		document, err := scanKnowledgeDocument(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取知识库文档失败：%w", err)
+		}
+		documents = append(documents, document)
+	}
+	return documents, rows.Err()
+}
+
+func (s *SQLite) DeleteDocument(ctx context.Context, id string) error {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM knowledge_documents WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("删除知识库文档失败：%w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("确认知识库文档删除结果失败：%w", err)
+	}
+	if count == 0 {
+		return knowledge.ErrNotFound
+	}
+	return nil
+}
+
+func (s *SQLite) ListChunks(ctx context.Context, limit int) ([]knowledge.Chunk, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT c.id, c.document_id, d.name, c.ordinal, c.content, c.start_rune, c.end_rune,
+       c.embedding_model, c.embedding, c.term_counts, c.token_count, c.created_at
+FROM knowledge_chunks c
+JOIN knowledge_documents d ON d.id = c.document_id
+ORDER BY c.sequence ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("查询知识库分块失败：%w", err)
+	}
+	defer rows.Close()
+
+	chunks := make([]knowledge.Chunk, 0)
+	for rows.Next() {
+		var chunk knowledge.Chunk
+		var embedding, terms, createdAt string
+		if err := rows.Scan(
+			&chunk.ID, &chunk.DocumentID, &chunk.DocumentName, &chunk.Ordinal, &chunk.Content,
+			&chunk.StartRune, &chunk.EndRune, &chunk.EmbeddingModel, &embedding, &terms,
+			&chunk.TokenCount, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("读取知识库分块失败：%w", err)
+		}
+		if err := json.Unmarshal([]byte(embedding), &chunk.Embedding); err != nil {
+			return nil, fmt.Errorf("解析分块向量失败：%w", err)
+		}
+		if err := json.Unmarshal([]byte(terms), &chunk.TermCounts); err != nil {
+			return nil, fmt.Errorf("解析分块词频失败：%w", err)
+		}
+		if chunk.CreatedAt, err = parseTime(createdAt); err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, rows.Err()
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanKnowledgeDocument(row rowScanner) (knowledge.Document, error) {
+	var document knowledge.Document
+	var createdAt, updatedAt string
+	if err := row.Scan(
+		&document.ID, &document.Name, &document.SourceType, &document.MIMEType,
+		&document.ContentHash, &document.EmbeddingModel, &document.EmbeddingDimensions, &document.ChunkCount,
+		&createdAt, &updatedAt,
+	); err != nil {
+		return knowledge.Document{}, err
+	}
+	var err error
+	if document.CreatedAt, err = parseTime(createdAt); err != nil {
+		return knowledge.Document{}, err
+	}
+	if document.UpdatedAt, err = parseTime(updatedAt); err != nil {
+		return knowledge.Document{}, err
+	}
+	return document, nil
 }
 
 func affected(operation string, result sql.Result, err error) error {
@@ -316,7 +505,7 @@ func formatTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 func parseTime(value string) (time.Time, error) {
 	t, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("parse stored time: %w", err)
+		return time.Time{}, fmt.Errorf("解析存储时间失败：%w", err)
 	}
 	return t, nil
 }

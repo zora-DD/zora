@@ -11,7 +11,7 @@ import (
 )
 
 type timeInput struct {
-	Timezone string `json:"timezone" jsonschema_description:"IANA timezone such as Asia/Shanghai; defaults to Asia/Shanghai"`
+	Timezone string `json:"timezone" jsonschema_description:"IANA 时区，例如 Asia/Shanghai；默认为 Asia/Shanghai"`
 }
 
 type timeOutput struct {
@@ -20,7 +20,7 @@ type timeOutput struct {
 }
 
 type calculatorInput struct {
-	Expression string `json:"expression" jsonschema_description:"Arithmetic expression using numbers, parentheses, +, -, *, and /"`
+	Expression string `json:"expression" jsonschema_description:"仅支持数字、括号和 +、-、*、/ 的四则运算表达式"`
 }
 
 type calculatorOutput struct {
@@ -41,7 +41,7 @@ func Build() ([]tool.BaseTool, error) {
 	// InferTool 会从 Go 结构体生成 JSON Schema，并在执行前完成参数反序列化。
 	clock, err := utils.InferTool(
 		"current_time",
-		"Get the exact current time in an IANA timezone.",
+		"获取指定 IANA 时区的精确当前时间。",
 		func(_ context.Context, input *timeInput) (*timeOutput, error) {
 			zone := input.Timezone
 			if zone == "" {
@@ -49,19 +49,19 @@ func Build() ([]tool.BaseTool, error) {
 			}
 			location, err := time.LoadLocation(zone)
 			if err != nil {
-				return nil, fmt.Errorf("unknown timezone %q", zone)
+				return nil, fmt.Errorf("未知的时区：%q", zone)
 			}
 			now := time.Now().In(location)
 			return &timeOutput{Timezone: zone, Time: now.Format(time.RFC3339)}, nil
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("build current_time tool: %w", err)
+		return nil, fmt.Errorf("创建时间工具失败：%w", err)
 	}
 
 	calculator, err := utils.InferTool(
 		"calculator",
-		"Safely evaluate a basic arithmetic expression. Use it instead of mental arithmetic.",
+		"安全计算基本四则运算表达式。遇到精确计算时应使用此工具，不要心算。",
 		func(_ context.Context, input *calculatorInput) (*calculatorOutput, error) {
 			// calculate 使用自研语法解析器，只支持四则运算，不会执行 Go、Shell 或脚本代码。
 			value, err := calculate(input.Expression)
@@ -72,25 +72,26 @@ func Build() ([]tool.BaseTool, error) {
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("build calculator tool: %w", err)
+		return nil, fmt.Errorf("创建计算器工具失败：%w", err)
 	}
 
 	status, err := utils.InferTool(
 		"project_status",
-		"Describe the capabilities and next milestone of the current Zora project.",
+		"介绍当前 Zora 项目的已实现能力与下一个里程碑。",
 		func(_ context.Context, _ *projectStatusInput) (*projectStatusOutput, error) {
 			return &projectStatusOutput{
-				Version: "0.1.0",
+				Version: "0.2.0-dev",
 				Available: []string{
-					"streaming chat", "durable conversations", "Eino ReAct loop",
-					"read-only tools", "run event audit",
+					"流式对话", "持久化会话", "Eino ReAct 循环",
+					"只读工具", "执行事件审计", "TXT/Markdown 知识库摄取",
+					"向量与 BM25 混合检索", "知识库引用",
 				},
-				NextMilestone: "document ingestion and hybrid RAG with citations",
+				NextMilestone: "PostgreSQL + pgvector 检索与异步文档解析",
 			}, nil
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("build project_status tool: %w", err)
+		return nil, fmt.Errorf("创建项目状态工具失败：%w", err)
 	}
 
 	return []tool.BaseTool{clock, calculator, status}, nil

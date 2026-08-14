@@ -2,6 +2,7 @@ package agentruntime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -45,6 +46,8 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 			prefix = "计算结果"
 		case "project_status":
 			prefix = "项目状态"
+		case "knowledge_search":
+			return schema.AssistantMessage(formatKnowledgeResult(last.Content), nil), nil
 		}
 		return schema.AssistantMessage(prefix+"："+last.Content, nil), nil
 	}
@@ -54,6 +57,10 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	// 新版 Eino 会通过调用级 Option 注入工具，不能只读取 WithTools 保存的字段。
 	availableTools := model.GetCommonOptions(&model.Options{Tools: m.tools}, opts...).Tools
 	switch {
+	// “发布日期”等资料字段会包含“日期”。知识库意图必须优先于时间意图，
+	// 否则本地 Mock 会错误地把“查文档里的日期”理解成“查询当前日期”。
+	case containsAny(lower, "知识库", "文档", "资料", "上传", "knowledge") && hasTool(availableTools, "knowledge_search"):
+		return m.toolCall("knowledge_search", fmt.Sprintf(`{"query":%q,"top_k":5}`, query)), nil
 	case containsAny(lower, "几点", "时间", "日期", "date", "time") && hasTool(availableTools, "current_time"):
 		return m.toolCall("current_time", `{"timezone":"Asia/Shanghai"}`), nil
 	case containsAny(lower, "计算", "算一下", "calculator", "calculate") && hasTool(availableTools, "calculator"):
@@ -67,10 +74,42 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	default:
 		return schema.AssistantMessage(
 			"这是 Zora 的本地演示模型。我已经收到：\n\n"+query+
-				"\n\n你可以让我查询当前时间、计算算式或介绍项目能力。配置 OpenAI-compatible 模型后，我会处理开放式问题。",
+				"\n\n你可以让我查询当前时间、计算算式、检索上传的知识文档或介绍项目能力。配置 OpenAI-compatible 模型后，我会处理开放式问题。",
 			nil,
 		), nil
 	}
+}
+
+func formatKnowledgeResult(raw string) string {
+	var output struct {
+		Results []struct {
+			DocumentName string `json:"document_name"`
+			Ordinal      int    `json:"ordinal"`
+			Content      string `json:"content"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(raw), &output); err != nil {
+		return "知识库工具已返回结果，但本地 Mock 无法解析证据：" + truncateRunes(raw, 240)
+	}
+	if len(output.Results) == 0 {
+		return "没有在已上传的文档中找到相关证据。"
+	}
+	var answer strings.Builder
+	answer.WriteString("本地 Mock 找到以下证据：\n\n")
+	for _, result := range output.Results[:min(len(output.Results), 5)] {
+		content := strings.Join(strings.Fields(result.Content), " ")
+		fmt.Fprintf(&answer, "- [%s#%d] %s\n", result.DocumentName, result.Ordinal, truncateRunes(content, 140))
+	}
+	answer.WriteString("\n以上是用于验证 RAG 链路的确定性回答；接入真实 Chat Model 后会根据证据综合作答。")
+	return answer.String()
+}
+
+func truncateRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
 }
 
 func (m *mockModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {

@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.1 Agent Core  
+> 适用版本：V0.2 Knowledge Base（本地 MVP）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -32,6 +32,7 @@ internal/
 │   └── sqlite/                SQLite 实现
 ├── agenttools/                Eino Tool 及安全执行逻辑
 ├── agentruntime/              Eino/模型适配与统一事件
+├── knowledge/                 分块、Embedding、混合检索与 Agent Tool
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
 ```
@@ -45,13 +46,18 @@ flowchart TD
     Main --> Runtime["agentruntime"]
     Main --> SQLite["store/sqlite"]
     Main --> Tools["agenttools"]
+    Main --> Knowledge["knowledge"]
     HTTP --> Chat
+    HTTP --> Knowledge
     Chat --> Domain["domain"]
     Chat --> Store["store interface"]
     Chat --> Runtime
     Runtime --> Eino["Eino ADK"]
     Tools --> Eino
+    Knowledge --> Eino
+    Knowledge --> KStore["knowledge.Store"]
     SQLite --> Store
+    SQLite --> KStore
     SQLite --> Domain
 ```
 
@@ -60,6 +66,7 @@ flowchart TD
 - `domain` 不依赖 Eino、HTTP 或数据库驱动；
 - `store.Store` 不暴露 SQL 类型；
 - `httpapi` 不直接调用模型和工具；
+- `httpapi` 只通过 `knowledge.Service` 调用摄取和检索用例；
 - `chat` 只依赖 `agentruntime.Runtime` 的统一事件；
 - 工具只能从 `agenttools.Build` 的 allowlist 注入。
 
@@ -70,12 +77,13 @@ flowchart TD
 1. `config.Load` 读取并校验环境变量；
 2. 在 `ZORA_DATA_DIR` 中打开 `zora.db`；
 3. 执行幂等 DDL，启用 WAL 和 busy timeout；
-4. 构造三个只读工具；
-5. 根据 Provider 创建 Mock 或 OpenAI-compatible ChatModel；
-6. 创建 Eino ChatModelAgent 和 Runner；
-7. 创建 Chat Service 与 HTTP Handler；
-8. 启动 HTTP Server；
-9. 监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
+4. 构造时间、计算器和项目状态工具；
+5. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder；
+6. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
+7. 根据 Model Provider 创建 Mock 或 OpenAI-compatible ChatModel；
+8. 创建 Eino ChatModelAgent 和 Runner；
+9. 创建 Chat Service 与 HTTP Handler；
+10. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
 
@@ -83,7 +91,7 @@ flowchart TD
 
 | 环境变量 | 默认值 | 是否必填 | 作用 |
 |---|---|---|---|
-| `ZORA_ADDR` | `:8080` | 否 | HTTP 监听地址 |
+| `ZORA_ADDR` | `:8088` | 否 | HTTP 监听地址 |
 | `ZORA_DATA_DIR` | `./data` | 否 | SQLite 数据目录 |
 | `ZORA_MODEL_PROVIDER` | `mock` | 否 | `mock` 或 `openai` |
 | `ZORA_MODEL` | `qwen-plus` | openai 模式需要 | 模型名称 |
@@ -92,6 +100,13 @@ flowchart TD
 | `ZORA_SYSTEM_PROMPT` | 内置中文指令 | 否 | Agent 系统指令 |
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 否 | 整次消息请求与模型客户端超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | 否 | ReAct 最大迭代，允许范围 1–50 |
+| `ZORA_EMBEDDING_PROVIDER` | `hash` | 否 | `hash` 或 `openai` |
+| `ZORA_EMBEDDING_MODEL` | `text-embedding-v4` | openai Embedding 需要 | Embedding 模型名 |
+| `ZORA_EMBEDDING_API_KEY` | 复用 Chat Key | openai Embedding 需要 | 可独立的 Embedding Key |
+| `ZORA_EMBEDDING_BASE_URL` | 复用 Chat BaseURL | openai Embedding 需要 | v1 根地址，客户端追加 `/embeddings` |
+| `ZORA_EMBEDDING_DIMENSIONS` | hash 384 / openai 1024 | 否 | 向量维度 |
+| `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 否 | Unicode 字符分块上限，最少 100 |
+| `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 否 | 重叠字符数，必须小于分块上限的一半 |
 
 配置原则：
 
@@ -99,6 +114,7 @@ flowchart TD
 - 启动时校验 Provider 和 API Key 组合；
 - BaseURL 会移除末尾 `/`，降低路径拼接差异；
 - Mock 模式固定模型名为 `zora-mock`，保证测试结果可解释。
+- 分块与查询的 Embedding 模型名和维度必须一致；切换模型后需重建旧文档索引。
 
 ## 5. 核心对话流程
 
@@ -265,6 +281,66 @@ SQL 子查询先按 sequence 倒序取最近 N 条，外层再升序输出。结
 - tenant_id 和 ACL；
 - pgvector、全文索引及其事务边界。
 
+### 8.5 知识库摄取流程（当前实现）
+
+```mermaid
+sequenceDiagram
+    participant UI as Web UI
+    participant API as httpapi
+    participant KB as knowledge.Service
+    participant Embed as Embedder
+    participant DB as SQLite
+
+    UI->>API: multipart TXT/Markdown
+    API->>API: 扩展名、5 MiB 和 multipart 限制
+    API->>KB: Ingest(name, mime, bytes)
+    KB->>KB: UTF-8 校验 + SHA-256 去重
+    KB->>KB: 归一化换行 + Unicode 重叠分块
+    KB->>Embed: 批量 Embed(chunks)
+    Embed-->>KB: 等长度稠密向量
+    KB->>KB: 生成中文单/双字特征和西文词频
+    KB->>DB: 事务写入 Document + Chunks
+    DB-->>UI: document + deduplicated
+```
+
+关键设计：
+
+- 先按 SHA-256 查询已有文档，命中后直接返回 `deduplicated=true`；
+- 如果同内容文档使用了不同的 Embedding 模型或维度，返回 409，要求删除后重新索引，不会静默复用错误向量；
+- 分块按 rune 而非 byte 计数，优先在段落、换行、句末和空格处截断；
+- `start_rune` / `end_rune` 指向换行归一化后的文本，可以精确恢复引用内容；
+- Embedder 返回数量和每个向量维度都必须与请求匹配，否则整个摄取失败；
+- Document 与所有 Chunk 在一个 SQLite 事务内写入，不暴露半成品索引。
+
+### 8.6 Embedding Provider
+
+`Embedder` 接口只包含 `Embed`、`Name` 和 `Dimensions`：
+
+- `HashEmbedder`：用词项 feature hashing 生成确定性并归一化的向量，无网络、无密钥，用于开发和测试；
+- `OpenAIEmbedder`：调用 `{base_url}/embeddings`，携带 model、input、dimensions 和 `encoding_format=float`，单批最多 10 条，并按返回 `index` 恢复顺序。
+
+DashScope `text-embedding-v4` 的请求字段、可配维度和批量限制以[阿里云官方 OpenAI 兼容 Embedding 文档](https://help.aliyun.com/zh/model-studio/embedding-interfaces-compatible-with-openai)为准。
+
+两种实现都对向量做 L2 归一化，因此精确扫描可以直接用点积计算余弦相似度。
+
+### 8.7 混合检索与引用
+
+```mermaid
+flowchart LR
+    Query["用户问题"] --> QE["Query Embedding"]
+    Query --> Token["中文单/双字 + 西文分词"]
+    QE --> Vector["余弦相似度排名"]
+    Token --> BM25["BM25 排名"]
+    Vector --> RRF["RRF(k=60)"]
+    BM25 --> RRF
+    RRF --> TopK["Top K 证据 + 引用坐标"]
+    TopK --> Tool["knowledge_search"]
+```
+
+当前 SQLite MVP 最多读取 10,000 个 Chunk 做精确扫描。向量和 BM25 各取前 50 名，使用 `1 / (60 + rank)` 融合，避免直接相加两种量纲不同的原始分数。结果同时返回 fused、vector 和 keyword 分数，用于调试与后续评估。
+
+`knowledge_search` 默认返回 5 条，Agent Tool 最多返回 8 条。每条包含 `document_name`、`ordinal`、`chunk_id`、原文和 rune 范围，这些字段是最终回答引用的真实来源。
+
 ## 9. 并发、取消与错误处理
 
 ### 9.1 会话级并发
@@ -302,7 +378,7 @@ Browser Abort / HTTP Disconnect / Deadline
 
 - JSON 使用 UTF-8；
 - JSON 请求拒绝未知字段和多余对象；
-- 请求体最大 1 MiB；
+- JSON 请求体最大 1 MiB；文档 multipart 请求最大 6 MiB，其中文件内容最大 5 MiB；
 - 消息正文最大 20,000 个 Unicode 字符；
 - 时间输出为 UTC RFC3339/RFC3339Nano；
 - 资源不存在返回 404；输入错误返回 400。
@@ -411,6 +487,74 @@ GET /api/runs/{runID}/events
 
 返回按 sequence 正序排列的持久事件。SSE delta 不在此接口中逐条返回。
 
+### 10.10 上传知识文档
+
+```http
+POST /api/knowledge/documents
+Content-Type: multipart/form-data
+
+file=@release.md
+name=可选显示名
+```
+
+`file` 必须是 `.txt`、`.md` 或 `.markdown`，内容必须为 UTF-8。新文档返回 201，内容哈希已存在时返回 200：
+
+```json
+{
+  "document": {
+    "id": "doc_xxx",
+    "name": "release.md",
+    "source_type": "upload",
+    "mime_type": "text/markdown",
+    "content_hash": "sha256-hex",
+    "embedding_model": "zora-hash-384-v1",
+    "embedding_dimensions": 384,
+    "chunk_count": 3,
+    "created_at": "2026-08-14T06:00:00Z",
+    "updated_at": "2026-08-14T06:00:00Z"
+  },
+  "deduplicated": false
+}
+```
+
+### 10.11 查询和删除知识文档
+
+```http
+GET /api/knowledge/documents
+DELETE /api/knowledge/documents/{documentID}
+```
+
+GET 返回 `{"documents": [...]}`；DELETE 成功返回 204，不存在返回 404，关联 Chunk 级联删除。
+
+### 10.12 调试混合检索
+
+```http
+POST /api/knowledge/search
+Content-Type: application/json
+
+{"query":"项目什么时候发布？","top_k":3}
+```
+
+```json
+{
+  "embedding_model": "zora-hash-384-v1",
+  "results": [{
+    "chunk_id": "chunk_xxx",
+    "document_id": "doc_xxx",
+    "document_name": "release.md",
+    "ordinal": 2,
+    "content": "项目的发布日是……",
+    "start_rune": 1200,
+    "end_rune": 1710,
+    "score": 0.0325,
+    "vector_score": 0.71,
+    "keyword_score": 3.26
+  }]
+}
+```
+
+`top_k` 默认 5，HTTP 调试接口最大 20。库中存在 Chunk 但没有与当前 Embedder 兼容的向量时返回 409，提示重建索引。
+
 ## 11. SSE 事件契约
 
 | 事件 | 关键字段 | 是否持久化 | 说明 |
@@ -428,6 +572,7 @@ GET /api/runs/{runID}/events
 
 - 对话列表、自动标题、重命名和删除；
 - 欢迎页提供三个可触发工具的示例；
+- 侧边栏知识库弹窗支持上传、文档列表、分块数和删除；
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用以可折叠 Trace 展示；
@@ -448,6 +593,7 @@ GET /api/runs/{runID}/events
 - CSP、`nosniff`、Referrer Policy；
 - 最大 Agent 迭代和请求超时；
 - 删除 Conversation 时明确由用户确认。
+- 删除知识文档时明确由用户确认，上传限制文件类型、大小和 UTF-8。
 
 ### 上线前必须补充
 
@@ -479,10 +625,10 @@ GET /api/runs/{runID}/events
 
 | 层级 | 当前覆盖 |
 |---|---|
-| 单元测试 | 计算器优先级、括号、一元运算、非法输入和除零 |
+| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder |
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
-| Store 测试 | Conversation、Message、计数和级联删除 |
-| HTTP 集成测试 | 创建对话、POST SSE、工具链和 JSON 帧 |
+| Store/知识库测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用和级联删除 |
+| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索和删除 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
 | 工程检查 | `go test`、`go vet`、race、无 CGO build |
 
@@ -518,7 +664,7 @@ Dockerfile 使用 Go 构建阶段产出静态二进制，最终镜像只包含 A
 
 ## 17. 后续目标设计
 
-### 17.1 V0.2 RAG
+### 17.1 V0.2 RAG 剩余工作
 
 ```mermaid
 flowchart LR
@@ -534,7 +680,7 @@ flowchart LR
     Cite --> Agent["Agent 回答"]
 ```
 
-必须包含文档版本、内容哈希、chunk 来源范围、tenant/ACL 和离线评估集。
+本地 MVP 已实现内容哈希、chunk 来源范围、Embedding 抽象、混合召回和引用。剩余工作是将候选召回下推 PostgreSQL + pgvector/FTS，并增加文档版本、tenant/ACL、PDF、异步摄取、可选 Rerank 和离线评估集。
 
 ### 17.2 V0.3 Memory
 
@@ -564,4 +710,3 @@ Supervisor 通过 Agent-as-Tool 调用 Research、Document、Writer Agent。每�
 3. 项目分析文档中的业务模型和风险；
 4. Roadmap 的完成状态和验收结果；
 5. 对应测试，确保文档描述可被代码验证。
-

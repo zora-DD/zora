@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.1 Agent Core  
+> 文档基线：V0.2 Knowledge Base（本地 MVP）
 > 最后更新：2026-08-14  
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 已完成单 Agent 核心链路，知识库、长期记忆、多 Agent 和办公连接器属于后续里程碑。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通 TXT/Markdown 上传、去重、分块、Embedding、向量 + BM25/RRF 混合召回和 Agent 引用的本地闭环。PostgreSQL + pgvector、权限过滤和固定评测集仍是 V0.2 后续子阶段；长期记忆、多 Agent 和办公连接器属于后续里程碑。
 
 ## 2. 背景与问题
 
@@ -28,7 +28,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - RAG、Memory 和 Multi-Agent 是否真的提高效果；
 - 如何在能力、成本、延迟和安全之间做取舍。
 
-Zora 将这些问题作为项目主线。V0.1 先建立一条可运行、可测试、可观察的执行骨架，再在同一骨架上增加高级能力。
+Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可观察的执行骨架；V0.2 通过端到端知识库来验证这套骨架能够承载真实 Agent 能力。
 
 ## 3. 项目目标与非目标
 
@@ -43,11 +43,12 @@ Zora 将这些问题作为项目主线。V0.1 先建立一条可运行、可测�
 
 ### 3.2 当前非目标
 
-- V0.1 不提供公网多租户服务和用户登录系统。
-- V0.1 不执行 Shell、代码或任意外部写操作。
-- V0.1 不把全部聊天历史直接向量化并称为长期记忆。
-- V0.1 不为了展示多 Agent 而堆叠多个 Prompt。
-- V0.1 不承担本地大模型推理，模型能力通过 API 接入。
+- 当前不提供公网多租户服务和用户登录系统。
+- 当前不执行 Shell、代码或任意外部写操作。
+- 当前的 Hash Embedding 只用于本地链路验证，不宣称具有生产语义检索质量。
+- 不把全部聊天历史直接向量化并称为长期记忆。
+- 不为了展示多 Agent 而堆叠多个 Prompt。
+- 不承担本地大模型推理，模型能力通过 API 接入。
 
 ## 4. 用户与使用场景
 
@@ -69,18 +70,24 @@ Zora 将这些问题作为项目主线。V0.1 先建立一条可运行、可测�
 5. 模型基于工具结果生成最终回答。
 6. 回答落库，Run 进入 completed、failed 或 cancelled 状态。
 
+知识库场景增加两条业务链：
+
+1. 用户上传文档，系统验证大小和 UTF-8，按内容哈希去重，分块并批量生成向量，最后事务入库。
+2. 对话涉及上传资料时，Agent 调用 `knowledge_search`，系统独立计算向量相似度与 BM25，用 RRF 融合后返回带文档名和分块序号的证据。
+
 ## 5. 业务能力模型
 
-| 能力域 | V0.1 状态 | 说明 |
+| 能力域 | 当前状态 | 说明 |
 |---|---|---|
 | 对话管理 | 已实现 | 创建、列表、重命名、删除和历史查询 |
 | 流式交互 | 已实现 | SSE 增量文本、工具轨迹、停止生成 |
 | Agent Runtime | 已实现 | Eino ReAct、最大迭代、上下文传递 |
 | 模型接入 | 已实现 | Mock 与 OpenAI-compatible Provider |
-| 工具系统 | 已实现 | 显式 allowlist、Schema 推断、三个只读工具 |
+| 工具系统 | 已实现 | 显式 allowlist、Schema 推断、四个只读工具 |
 | 执行审计 | 已实现 | AgentRun 与 append-only RunEvent |
 | 本地持久化 | 已实现 | SQLite、WAL、事务与级联删除 |
-| 向量知识库 | 规划 V0.2 | PostgreSQL + pgvector、混合检索、引用、评估 |
+| 知识库本地 MVP | 已实现 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
+| 生产知识库 | V0.2 进行中 | PostgreSQL + pgvector、FTS、权限过滤、评估 |
 | 长期记忆 | 规划 V0.3 | Semantic/Episodic Memory 与 Consolidation |
 | 多 Agent | 规划 V0.4 | Supervisor、专业 Agent、预算和效果对比 |
 | 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
@@ -97,6 +104,8 @@ Zora 将这些问题作为项目主线。V0.1 先建立一条可运行、可测�
 | RunEvent | Run 内部发生的可观察事实 | append-only，随 AgentRun 删除 |
 | Tool | Agent 可选择的受控能力 | 启动时注册，当前均为只读 |
 | Model Provider | 生成回答和工具决策的模型来源 | 由环境配置选择 |
+| KnowledgeDocument | 一份已完成索引的用户文档 | 上传后持续存在，可删除 |
+| KnowledgeChunk | 可检索、可引用的原文片段 | 与文档在同一事务创建，随文档级联删除 |
 
 ### 6.2 对象关系
 
@@ -139,6 +148,28 @@ erDiagram
         string agent_name
         string tool_name
         json payload
+    }
+```
+
+知识库对象独立于对话，因此同一文档能够被多个 Conversation 复用：
+
+```mermaid
+erDiagram
+    KNOWLEDGE_DOCUMENT ||--|{ KNOWLEDGE_CHUNK : contains
+    KNOWLEDGE_DOCUMENT {
+        string id PK
+        string content_hash UK
+        string embedding_model
+        int embedding_dimensions
+        int chunk_count
+    }
+    KNOWLEDGE_CHUNK {
+        string id UK
+        string document_id FK
+        int ordinal
+        text content
+        json embedding
+        json term_counts
     }
 ```
 
@@ -212,18 +243,54 @@ V0.1 的主消息历史只写 user 和最终 assistant 消息。中间工具轨�
 
 持久事件包括：`run_started`、`tool_call`、`tool_result`、`model_output`、`run_completed`、`run_failed`、`run_cancelled`。token 级 `delta` 只通过 SSE 发送，不逐条落库。
 
+### 7.5 knowledge_documents
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | TEXT | PK | `doc_` 前缀 ID |
+| `name` | TEXT | NOT NULL | 显示文档名 |
+| `source_type` | TEXT | NOT NULL | 当前为 `upload` |
+| `mime_type` | TEXT | NOT NULL | `text/plain` 或 `text/markdown` |
+| `content_hash` | TEXT | UNIQUE | SHA-256，用于内容去重 |
+| `embedding_model` | TEXT | NOT NULL | 索引使用的向量空间标识 |
+| `embedding_dimensions` | INTEGER | NOT NULL | 索引向量维度，用于变更检测 |
+| `chunk_count` | INTEGER | NOT NULL | 分块数 |
+| `created_at` / `updated_at` | TEXT | NOT NULL | UTC RFC3339Nano |
+
+### 7.6 knowledge_chunks
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `sequence` | INTEGER | PK AUTOINCREMENT | 稳定扫描顺序 |
+| `id` | TEXT | UNIQUE | `chunk_` 前缀 ID |
+| `document_id` | TEXT | FK | 删除 Document 时级联删除 |
+| `ordinal` | INTEGER | UNIQUE(document, ordinal) | 文档内从 0 开始的片段序号 |
+| `content` | TEXT | NOT NULL | 可引用原文 |
+| `start_rune` / `end_rune` | INTEGER | NOT NULL | 归一化文本中的 Unicode 字符区间 |
+| `embedding_model` | TEXT | NOT NULL | 用于防止向量空间混用 |
+| `embedding` | TEXT | JSON 数组 | 本地 MVP 的稠密向量 |
+| `term_counts` | TEXT | JSON 对象 | BM25 词频；中文使用单字 + 双字特征 |
+| `token_count` | INTEGER | NOT NULL | BM25 文档长度 |
+
+向量和词频在 SQLite 中以 JSON 保存，是为了零运维 MVP，不是最终生产存储方案。
+
 ## 8. 技术架构
 
 ```mermaid
 flowchart LR
     Browser["Web UI"] -->|"JSON / SSE"| HTTP["httpapi"]
     HTTP --> Chat["chat.Service"]
+    HTTP --> Knowledge["knowledge.Service"]
     Chat --> Runtime["agentruntime.Runtime"]
     Runtime --> ADK["Eino ChatModelAgent"]
     ADK --> Model["Mock / OpenAI-compatible Model"]
     ADK --> Tools["Read-only Tool Allowlist"]
+    Tools --> Knowledge
     Chat --> Store["store.Store"]
-    Store --> SQLite["SQLite V0.1"]
+    Knowledge --> KStore["knowledge.Store"]
+    Store --> SQLite["SQLite"]
+    KStore --> SQLite
+    Knowledge --> Embedder["Hash / OpenAI Embedder"]
 
     Runtime -. "领域事件" .-> Chat
     Chat -. "SSE 事件" .-> HTTP
@@ -238,6 +305,7 @@ flowchart LR
 | 应用层 | `internal/chat` | 用例编排、执行顺序、状态落库、会话锁 |
 | Agent 适配层 | `internal/agentruntime` | Eino 组装、模型选择、事件归一化 |
 | 能力层 | `internal/agenttools` | 工具 Schema、校验和安全执行 |
+| 知识库应用层 | `internal/knowledge` | 分块、Embedding 适配、混合召回、引用与 Agent Tool |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
@@ -249,7 +317,9 @@ flowchart LR
 | 主语言 | Go | 并发、网络服务、部署和类型约束能力强 |
 | Agent 框架 | Eino ADK | Go 原生、ReAct、Tool、流式事件及后续多 Agent 能力 |
 | 模型协议 | OpenAI-compatible | 可连接通义千问及其他兼容模型 |
-| 本地数据库 | SQLite | V0.1 零运维，便于演示和测试 |
+| 本地数据库 | SQLite | 零运维，便于演示、测试和 RAG 纵向切片 |
+| 检索 | 精确余弦扫描 + BM25 + RRF | 算法透明、便于验证；后续下推 pgvector/FTS |
+| Embedding | Hash / OpenAI-compatible | 本地零密钥与生产语义模型共用接口 |
 | 前端传输 | SSE | 单向模型流简单、代理支持广、易于调试 |
 | UI 发布 | `go:embed` | 单二进制运行，无 Node.js 部署依赖 |
 | ID | `crypto/rand` | 不依赖数据库自增 ID，不暴露业务规模 |
@@ -280,11 +350,22 @@ HTTP 和 Store 不依赖 Eino 事件类型。`agentruntime.Event` 作为防腐�
 
 后续 RAG、Memory 和 Multi-Agent 都设置验收指标。多 Agent 只有在质量收益能够覆盖成本和延迟时才保留，避免“功能数量等于技术深度”的误区。
 
+### 9.7 可交换的 RAG 边界
+
+`knowledge.Service` 不依赖 SQLite 细节，`Embedder` 也不依赖具体厂商。当前精确向量扫描、BM25 和 RRF 把召回算法明确展示出来；切换 PostgreSQL + pgvector 时，只需将候选召回下推到 Store，HTTP 与 Agent Tool 契约可保持不变。
+
+### 9.8 证据引用不是 Prompt 幻觉
+
+每个 SearchResult 都带 `document_id`、`document_name`、`chunk_id`、`ordinal`、`start_rune` 和 `end_rune`。引用信息来自持久化原文坐标，而不是让模型临时编造来源。
+
 ## 10. 当前限制与风险
 
 | 限制/风险 | 当前影响 | 后续处理 |
 |---|---|---|
 | SQLite 单连接 | 适合单机和作品演示，不适合高并发多实例 | V0.2 增加 PostgreSQL Store |
+| 本地向量精确扫描 | 最多读取 10,000 个 chunk，内存和延迟随数据增长 | pgvector ANN 召回 + PostgreSQL FTS |
+| Hash Embedding 无深度语义 | 适合关键词相关性和链路测试，不适合生产问答 | 生产切换 text-embedding-v4 等语义模型 |
+| 同步文档索引 | 大文件会占用 HTTP 请求 | 异步 Ingestion Job、重试和状态机 |
 | 进程内会话锁 | 多实例之间不能互斥 | advisory lock 或带租约分布式锁 |
 | 最近 40 条上下文 | 长对话会丢失早期信息 | 摘要 + 长期记忆召回 |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
@@ -312,13 +393,20 @@ HTTP 和 Store 不依赖 Eino 事件类型。`agentruntime.Event` 作为防腐�
 | Multi-Agent | 任务成功率、P95 延迟、token 成本、人工干预率 |
 | 办公 Agent | 审批覆盖率、越权操作数、操作成功率、可恢复率 |
 
+### V0.2 本地 MVP 工程指标
+
+- 同一文档内容可被 SHA-256 稳定去重；
+- 所有分块都能用 Unicode 偏移恢复原文；
+- 向量召回和 BM25 召回分别计分，RRF 不依赖两类分数量纲；
+- 知识库工具结果必须包含文档名、分块序号和原文；
+- 默认无密钥可运行，同时有真实 Embedding 适配器的契约测试。
+
 ## 12. 演进路线
 
 1. **V0.1 Agent Core**：建立当前可运行基线。
-2. **V0.2 Knowledge Base**：PostgreSQL + pgvector、摄取、混合检索、引用和评估。
+2. **V0.2 Knowledge Base（进行中）**：本地摄取、混合检索和引用已实现；继续完成 PostgreSQL + pgvector、权限与评估。
 3. **V0.3 Long-term Memory**：记忆提取、合并、过期、召回和用户控制。
 4. **V0.4 Multi-Agent**：Supervisor、专业 Agent、预算和对照评估。
 5. **V0.5 Office Agent**：MCP、办公连接器、审批、权限和审计。
 
 详细任务与验收条件见 [Roadmap](roadmap.md)。
-

@@ -53,7 +53,7 @@ func (s *Service) CreateConversation(ctx context.Context, title string) (domain.
 		title = defaultConversationTitle
 	}
 	if utf8.RuneCountInString(title) > 80 {
-		return domain.Conversation{}, fmt.Errorf("title must be at most 80 characters")
+		return domain.Conversation{}, fmt.Errorf("对话标题最多可包含 80 个字符")
 	}
 	now := time.Now().UTC()
 	conversation := domain.Conversation{
@@ -76,7 +76,7 @@ func (s *Service) ListConversations(ctx context.Context) ([]domain.Conversation,
 func (s *Service) RenameConversation(ctx context.Context, conversationID, title string) error {
 	title = strings.TrimSpace(title)
 	if title == "" || utf8.RuneCountInString(title) > 80 {
-		return fmt.Errorf("title must contain 1 to 80 characters")
+		return fmt.Errorf("对话标题必须包含 1 到 80 个字符")
 	}
 	return s.store.RenameConversation(ctx, conversationID, title)
 }
@@ -100,10 +100,10 @@ func (s *Service) ListRunEvents(ctx context.Context, runID string) ([]domain.Run
 func (s *Service) Send(ctx context.Context, conversationID, content string, emit func(StreamEvent) error) error {
 	content = strings.TrimSpace(content)
 	if content == "" {
-		return fmt.Errorf("message content is required")
+		return fmt.Errorf("消息内容不能为空")
 	}
 	if utf8.RuneCountInString(content) > 20_000 {
-		return fmt.Errorf("message content exceeds 20000 characters")
+		return fmt.Errorf("消息内容不能超过 20000 个字符")
 	}
 
 	// 同一会话串行执行，避免两个请求读取相同历史后交错写入回答。

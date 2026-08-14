@@ -11,11 +11,13 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/zhiruo/zora/internal/chat"
+	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/store"
 )
 
@@ -24,12 +26,16 @@ var webFiles embed.FS
 
 type Server struct {
 	chat           *chat.Service
+	knowledge      *knowledge.Service
 	logger         *slog.Logger
 	requestTimeout time.Duration
 }
 
-func New(chatService *chat.Service, logger *slog.Logger, requestTimeout time.Duration) (http.Handler, error) {
-	server := &Server{chat: chatService, logger: logger, requestTimeout: requestTimeout}
+func New(chatService *chat.Service, knowledgeService *knowledge.Service, logger *slog.Logger, requestTimeout time.Duration) (http.Handler, error) {
+	if chatService == nil || knowledgeService == nil {
+		return nil, fmt.Errorf("对话服务和知识库服务不能为空")
+	}
+	server := &Server{chat: chatService, knowledge: knowledgeService, logger: logger, requestTimeout: requestTimeout}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", server.health)
 	mux.HandleFunc("GET /api/info", server.info)
@@ -40,11 +46,15 @@ func New(chatService *chat.Service, logger *slog.Logger, requestTimeout time.Dur
 	mux.HandleFunc("DELETE /api/conversations/{conversationID}", server.deleteConversation)
 	mux.HandleFunc("POST /api/conversations/{conversationID}/messages", server.sendMessage)
 	mux.HandleFunc("GET /api/runs/{runID}/events", server.listRunEvents)
+	mux.HandleFunc("GET /api/knowledge/documents", server.listKnowledgeDocuments)
+	mux.HandleFunc("POST /api/knowledge/documents", server.uploadKnowledgeDocument)
+	mux.HandleFunc("DELETE /api/knowledge/documents/{documentID}", server.deleteKnowledgeDocument)
+	mux.HandleFunc("POST /api/knowledge/search", server.searchKnowledge)
 
 	// 前端资源编译进 Go 二进制，部署时不需要额外静态文件服务器。
 	assets, err := fs.Sub(webFiles, "web")
 	if err != nil {
-		return nil, fmt.Errorf("open embedded web assets: %w", err)
+		return nil, fmt.Errorf("加载内嵌 Web 资源失败：%w", err)
 	}
 	mux.Handle("/", spaHandler{assets: assets})
 	return server.middleware(mux), nil
@@ -56,9 +66,13 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.1.0",
+		"name": "Zora", "version": "0.2.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
-		"capabilities": []string{"chat", "streaming", "tools", "persistence", "run-audit"},
+		"embedding_model": s.knowledge.EmbeddingModel(),
+		"capabilities": []string{
+			"chat", "streaming", "tools", "persistence", "run-audit",
+			"knowledge-ingestion", "hybrid-retrieval", "knowledge-citations",
+		},
 	})
 }
 
@@ -129,7 +143,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		s.problem(w, errors.New("streaming is not supported by this server"))
+		s.problem(w, errors.New("当前服务器不支持流式输出"))
 		return
 	}
 
@@ -172,10 +186,101 @@ func (s *Server) listRunEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
 }
 
+func (s *Server) listKnowledgeDocuments(w http.ResponseWriter, r *http.Request) {
+	documents, err := s.knowledge.ListDocuments(r.Context())
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"documents": documents})
+}
+
+func (s *Server) uploadKnowledgeDocument(w http.ResponseWriter, r *http.Request) {
+	// V0.2 先限制为 5 MiB 纯文本；多出的 1 MiB 留给 multipart 边界和表单字段。
+	r.Body = http.MaxBytesReader(w, r.Body, 6<<20)
+	if err := r.ParseMultipartForm(6 << 20); err != nil {
+		s.problem(w, fmt.Errorf("multipart 上传请求无效：%w", err))
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		s.problem(w, fmt.Errorf("请通过 file 字段上传文件：%w", err))
+		return
+	}
+	defer file.Close()
+
+	extension := strings.ToLower(filepath.Ext(header.Filename))
+	if extension != ".txt" && extension != ".md" && extension != ".markdown" {
+		s.problem(w, fmt.Errorf("仅支持 .txt、.md 和 .markdown 文件"))
+		return
+	}
+	contents, err := io.ReadAll(io.LimitReader(file, (5<<20)+1))
+	if err != nil {
+		s.problem(w, fmt.Errorf("读取上传文档失败：%w", err))
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		name = filepath.Base(header.Filename)
+	}
+	mimeType := header.Header.Get("Content-Type")
+	if mimeType == "" || mimeType == "application/octet-stream" {
+		if extension == ".md" || extension == ".markdown" {
+			mimeType = "text/markdown"
+		} else {
+			mimeType = "text/plain"
+		}
+	}
+	result, err := s.knowledge.Ingest(r.Context(), knowledge.IngestInput{
+		Name: name, SourceType: "upload", MIMEType: mimeType, Content: contents,
+	})
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Deduplicated {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) deleteKnowledgeDocument(w http.ResponseWriter, r *http.Request) {
+	if err := s.knowledge.DeleteDocument(r.Context(), r.PathValue("documentID")); err != nil {
+		s.problem(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) searchKnowledge(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Query string `json:"query"`
+		TopK  int    `json:"top_k"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		s.problem(w, err)
+		return
+	}
+	results, err := s.knowledge.Search(r.Context(), input.Query, input.TopK)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"embedding_model": s.knowledge.EmbeddingModel(), "results": results,
+	})
+}
+
 func (s *Server) problem(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
-	if errors.Is(err, store.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) {
 		status = http.StatusNotFound
+	} else if errors.Is(err, knowledge.ErrEmbeddingMismatch) {
+		status = http.StatusConflict
 	}
 	if status >= 500 {
 		s.logger.Error("request failed", "error", err)
@@ -207,10 +312,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, destination any) error {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
-		return fmt.Errorf("invalid JSON body: %w", err)
+		return fmt.Errorf("JSON 请求体无效：%w", err)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("JSON body must contain one object")
+		return errors.New("JSON 请求体只能包含一个对象")
 	}
 	return nil
 }
@@ -248,7 +353,7 @@ func (h spaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		path = "index.html"
 		info, err = fs.Stat(h.assets, path)
 		if err != nil {
-			http.Error(w, "web application unavailable", http.StatusInternalServerError)
+			http.Error(w, "Web 应用暂时不可用", http.StatusInternalServerError)
 			return
 		}
 	}

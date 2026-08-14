@@ -55,17 +55,17 @@ func New(ctx context.Context, cfg config.Config, tools []tool.BaseTool) (*Runtim
 			HTTPClient: client,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("create OpenAI-compatible model: %w", err)
+			return nil, fmt.Errorf("创建 OpenAI-compatible 模型失败：%w", err)
 		}
 		chatModel = openAIModel
 	default:
-		return nil, fmt.Errorf("unsupported provider %q", cfg.Provider)
+		return nil, fmt.Errorf("不支持的模型提供方：%q", cfg.Provider)
 	}
 
 	// MaxIterations 是 Agent 的保险丝；工具只从显式 allowlist 注入。
 	agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:          AgentName,
-		Description:   "General assistant with safe read-only tools",
+		Description:   "可以使用安全只读工具的通用中文助手",
 		Instruction:   cfg.Instruction,
 		Model:         chatModel,
 		MaxIterations: cfg.MaxIterations,
@@ -74,7 +74,7 @@ func New(ctx context.Context, cfg config.Config, tools []tool.BaseTool) (*Runtim
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create Eino agent: %w", err)
+		return nil, fmt.Errorf("创建 Eino Agent 失败：%w", err)
 	}
 
 	return &Runtime{
@@ -160,7 +160,7 @@ func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit f
 		return "", err
 	}
 	if strings.TrimSpace(answer.String()) == "" {
-		return "", errors.New("agent completed without an assistant response")
+		return "", errors.New("Agent 未返回助手回答")
 	}
 	return answer.String(), nil
 }
@@ -170,7 +170,7 @@ func consumeVariant(ctx context.Context, variant *adk.MessageVariant, agentName 
 		return variant.Message, false, nil
 	}
 	if variant.MessageStream == nil {
-		return nil, true, errors.New("streaming event has no message stream")
+		return nil, true, errors.New("流式事件缺少消息流")
 	}
 	defer variant.MessageStream.Close()
 

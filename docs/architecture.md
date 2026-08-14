@@ -4,13 +4,14 @@
 
 ## 1. 边界
 
-Zora 将系统划分为五个边界：
+Zora 将系统划分为六个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
 3. `agentruntime`：Eino ADK 适配，输出与传输协议无关的事件。
 4. `agenttools`：工具 Schema、输入校验和执行代码。
-5. `store`：持久化接口，V0.1 由 SQLite 实现。
+5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
+6. `store`：对话与知识库的持久化边界，当前由 SQLite 实现。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -65,18 +66,25 @@ V0.2 引入 PostgreSQL 后，应把进程内对话锁升级为数据库 advisory
 - 默认 Content Security Policy 只允许同源资源。
 - API Key 只从环境变量读取。
 - 当前没有任何写入外部系统的工具。
+- 知识文档限制为 UTF-8 TXT/Markdown 且最大 5 MiB，文档删除需要用户确认。
 
-## 6. V0.2 RAG 接入点
+## 6. V0.2 RAG 当前架构
 
-RAG 不直接塞进 HTTP Handler。计划增加：
+RAG 没有塞进 HTTP Handler，而是以独立应用层和 Store 边界实现：
 
 ```text
 internal/knowledge/
-├── ingest.go        文档摄取用例
-├── chunk.go         可测试的切块策略
-├── retrieve.go      混合召回与 RRF
-├── cite.go          引用和证据映射
-└── eval.go          固定问题集评估
+├── types.go         Document/Chunk/Store 契约
+├── chunker.go       Unicode 边界感知分块
+├── tokenizer.go     中文单/双字与西文词项
+├── embedder.go      Hash/OpenAI-compatible Embedding
+├── service.go       摄取、BM25/向量、RRF 和引用
+└── tool.go          knowledge_search
+
+internal/store/sqlite/
+└── sqlite.go        Document/Chunk 事务存储
+
+当前候选召回在 Go 内最多精确扫描 10,000 个 Chunk。V0.2 下一子阶段保持 Service 和 Tool 契约，将召回下推到：
 
 internal/store/postgres/
 ├── conversations.go

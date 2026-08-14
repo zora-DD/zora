@@ -1,4 +1,4 @@
-// Package store defines durable persistence boundaries.
+// Package store 定义可持久化的存储边界。
 package store
 
 import (
@@ -9,11 +9,11 @@ import (
 	"github.com/zhiruo/zora/internal/domain"
 )
 
-// ErrNotFound is returned when a requested entity does not exist.
-var ErrNotFound = errors.New("not found")
+// ErrNotFound 在请求的资源不存在时返回。
+var ErrNotFound = errors.New("请求的资源不存在")
 
-// Store is the persistence contract used by the chat service.
-// A PostgreSQL implementation can replace SQLite without changing agent code.
+// Store 是会话服务使用的持久化契约。
+// 后续可以用 PostgreSQL 实现替换 SQLite，而不需修改 Agent 代码。
 type Store interface {
 	Close() error
 	CreateConversation(ctx context.Context, conversation domain.Conversation) error

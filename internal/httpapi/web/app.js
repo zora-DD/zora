@@ -4,6 +4,7 @@ const state = {
   conversations: [],
   activeID: null,
   messages: [],
+	 documents: [],
   busy: false,
   controller: null,
   draft: null,
@@ -28,13 +29,28 @@ const elements = {
   runtimeModel: document.querySelector("#runtimeModel"),
   runtimeProvider: document.querySelector("#runtimeProvider"),
   statusDot: document.querySelector("#statusDot"),
+	openKnowledge: document.querySelector("#openKnowledge"),
+	closeKnowledge: document.querySelector("#closeKnowledge"),
+	knowledgeDialog: document.querySelector("#knowledgeDialog"),
+	knowledgeUpload: document.querySelector("#knowledgeUpload"),
+	knowledgeFile: document.querySelector("#knowledgeFile"),
+	selectedFile: document.querySelector("#selectedFile"),
+	uploadKnowledge: document.querySelector("#uploadKnowledge"),
+	knowledgeDocuments: document.querySelector("#knowledgeDocuments"),
+	knowledgeCount: document.querySelector("#knowledgeCount"),
+	embeddingModel: document.querySelector("#embeddingModel"),
   toast: document.querySelector("#toast"),
 };
 
 async function api(path, options = {}) {
+	const headers = { ...(options.headers || {}) };
+	// multipart/form-data 的 boundary 必须由浏览器生成，不能手动覆盖 Content-Type。
+	if (!(options.body instanceof FormData) && !headers["Content-Type"]) {
+		headers["Content-Type"] = "application/json";
+	}
   const response = await fetch(path, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+		headers,
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -48,11 +64,16 @@ async function initialize() {
   bindEvents();
   resizeInput();
   try {
-    const [info, result] = await Promise.all([api("/api/info"), api("/api/conversations")]);
+		const [info, result, knowledgeResult] = await Promise.all([
+			api("/api/info"), api("/api/conversations"), api("/api/knowledge/documents"),
+		]);
     elements.runtimeModel.textContent = info.model;
     elements.runtimeProvider.textContent = `${info.provider} · ${info.version}`;
     state.conversations = result.conversations || [];
+		state.documents = knowledgeResult.documents || [];
+		elements.embeddingModel.textContent = `Embedding: ${info.embedding_model}`;
     renderConversations();
+		renderKnowledgeDocuments();
     if (state.conversations.length) {
       await selectConversation(state.conversations[0].id);
     }
@@ -67,6 +88,12 @@ async function initialize() {
 
 function bindEvents() {
   elements.newConversation.addEventListener("click", () => createConversation());
+	elements.openKnowledge.addEventListener("click", openKnowledge);
+	elements.closeKnowledge.addEventListener("click", () => elements.knowledgeDialog.close());
+	elements.knowledgeUpload.addEventListener("submit", uploadKnowledgeDocument);
+	elements.knowledgeFile.addEventListener("change", () => {
+		elements.selectedFile.textContent = elements.knowledgeFile.files[0]?.name || "尚未选择";
+	});
   elements.renameConversation.addEventListener("click", renameActiveConversation);
   elements.composer.addEventListener("submit", event => {
     event.preventDefault();
@@ -95,6 +122,89 @@ function bindEvents() {
   elements.openSidebar.addEventListener("click", openSidebar);
   elements.closeSidebar.addEventListener("click", closeSidebar);
   elements.sidebarScrim.addEventListener("click", closeSidebar);
+}
+
+async function openKnowledge() {
+	try {
+		await refreshKnowledgeDocuments();
+		elements.knowledgeDialog.showModal();
+		closeSidebar();
+	} catch (error) {
+		notify(error.message);
+	}
+}
+
+async function uploadKnowledgeDocument(event) {
+	event.preventDefault();
+	const file = elements.knowledgeFile.files[0];
+	if (!file) return;
+	const formData = new FormData();
+	formData.append("file", file);
+	elements.uploadKnowledge.disabled = true;
+	elements.uploadKnowledge.textContent = "索引中…";
+	try {
+		const result = await api("/api/knowledge/documents", { method: "POST", body: formData });
+		await refreshKnowledgeDocuments();
+		elements.knowledgeUpload.reset();
+		elements.selectedFile.textContent = "尚未选择";
+		notify(result.deduplicated ? "文档内容已存在，未重复索引" : "文档已完成分块和索引");
+	} catch (error) {
+		notify(error.message);
+	} finally {
+		elements.uploadKnowledge.disabled = false;
+		elements.uploadKnowledge.textContent = "上传并索引";
+	}
+}
+
+async function refreshKnowledgeDocuments() {
+	const result = await api("/api/knowledge/documents");
+	state.documents = result.documents || [];
+	renderKnowledgeDocuments();
+}
+
+async function deleteKnowledgeDocument(document) {
+	if (!confirm(`删除「${document.name}」及其全部分块？`)) return;
+	try {
+		await api(`/api/knowledge/documents/${document.id}`, { method: "DELETE" });
+		state.documents = state.documents.filter(item => item.id !== document.id);
+		renderKnowledgeDocuments();
+		notify("文档已删除");
+	} catch (error) {
+		notify(error.message);
+	}
+}
+
+function renderKnowledgeDocuments() {
+	elements.knowledgeCount.textContent = `${state.documents.length} 份文档`;
+	elements.knowledgeDocuments.replaceChildren();
+	if (!state.documents.length) {
+		const empty = document.createElement("div");
+		empty.className = "document-empty";
+		empty.textContent = "还没有文档，上传后就可以在对话中提问。";
+		elements.knowledgeDocuments.append(empty);
+		return;
+	}
+	for (const document of state.documents) {
+		const item = documentNode(document);
+		elements.knowledgeDocuments.append(item);
+	}
+}
+
+function documentNode(document) {
+	const item = window.document.createElement("div");
+	item.className = "document-item";
+	const info = window.document.createElement("div");
+	const name = window.document.createElement("strong");
+	name.textContent = document.name;
+	const detail = window.document.createElement("span");
+	detail.textContent = `${document.chunk_count} 个分块 · ${document.embedding_model}`;
+	info.append(name, detail);
+	const remove = window.document.createElement("button");
+	remove.type = "button";
+	remove.textContent = "删除";
+	remove.addEventListener("click", () => deleteKnowledgeDocument(document));
+	item.append(info, remove);
+	return item;
 }
 
 async function createConversation() {

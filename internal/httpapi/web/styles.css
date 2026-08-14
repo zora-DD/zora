@@ -29,13 +29,14 @@ body {
   color: var(--text);
 }
 
-button, textarea { font: inherit; }
+button, textarea, input { font: inherit; }
 button { color: inherit; }
 
 .app-shell {
   display: grid;
   grid-template-columns: 276px minmax(0, 1fr);
   height: 100%;
+  min-height: 0;
 }
 
 .sidebar {
@@ -117,6 +118,24 @@ button { color: inherit; }
   font-size: 10px;
 }
 
+.knowledge-button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 9px 11px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: #c3c4ca;
+  font-size: 12px;
+  cursor: pointer;
+}
+.knowledge-button:hover { background: rgba(255,255,255,.055); color: var(--text); }
+.knowledge-button > span { color: #aa9cff; font-size: 16px; }
+.knowledge-button small { margin-left: auto; color: var(--muted-2); font-size: 9px; }
+
 .section-label {
   padding: 24px 9px 8px;
   color: var(--muted-2);
@@ -181,9 +200,15 @@ button { color: inherit; }
 .status-dot.offline { background: var(--danger); box-shadow: none; }
 .roadmap-mini { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; padding: 7px 8px; color: var(--muted-2); font-size: 9px; }
 .roadmap-mini div { height: 2px; overflow: hidden; border-radius: 2px; background: var(--panel-3); }
-.roadmap-mini i { display: block; width: 25%; height: 100%; background: var(--accent); }
+.roadmap-mini i { display: block; width: 55%; height: 100%; background: var(--accent); }
 
-.main-panel { display: grid; grid-template-rows: 64px minmax(0, 1fr) auto; min-width: 0; height: 100%; }
+.main-panel {
+  display: grid;
+  grid-template-rows: 64px minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
 .topbar {
   z-index: 5;
   display: flex;
@@ -200,7 +225,13 @@ button { color: inherit; }
 .conversation-heading span { margin-top: 4px; color: var(--muted-2); font-size: 9px; letter-spacing: .05em; text-transform: uppercase; }
 .live-dot { width: 4px; height: 4px; margin-right: 4px; vertical-align: 1px; }
 
-.chat-scroll { overflow-y: auto; scroll-behavior: smooth; scrollbar-width: thin; }
+.chat-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+}
 .chat-column { width: min(790px, calc(100% - 40px)); min-height: 100%; margin: 0 auto; padding: 52px 0 44px; }
 
 .welcome { padding-top: min(7vh, 80px); text-align: center; animation: fade-up .35s ease both; }
@@ -286,6 +317,41 @@ button { color: inherit; }
 
 .toast { position: fixed; z-index: 50; left: 50%; bottom: 118px; max-width: min(440px, calc(100% - 32px)); padding: 10px 14px; border: 1px solid var(--line-strong); border-radius: 10px; background: #222329; box-shadow: 0 12px 35px rgba(0,0,0,.35); color: #dedee2; font-size: 11px; opacity: 0; pointer-events: none; transform: translate(-50%, 10px); transition: opacity .18s ease, transform .18s ease; }
 .toast.visible { opacity: 1; transform: translate(-50%, 0); }
+.knowledge-dialog {
+  width: min(620px, calc(100% - 28px));
+  max-height: min(720px, calc(100vh - 40px));
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  background: #17181d;
+  box-shadow: 0 30px 90px rgba(0,0,0,.55);
+  color: var(--text);
+}
+.knowledge-dialog::backdrop { background: rgba(3,4,7,.7); backdrop-filter: blur(5px); }
+.dialog-heading { display: flex; align-items: center; padding: 18px 20px 14px; border-bottom: 1px solid var(--line); }
+.dialog-heading > div { min-width: 0; margin-right: auto; }
+.dialog-heading strong, .dialog-heading span { display: block; }
+.dialog-heading strong { font-size: 15px; }
+.dialog-heading span { margin-top: 4px; color: var(--muted-2); font-size: 9px; }
+.dialog-description { margin: 0; padding: 15px 20px 5px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+.upload-form { display: flex; align-items: stretch; gap: 9px; padding: 12px 20px 18px; }
+.file-picker { display: flex; align-items: center; min-width: 0; flex: 1; padding: 10px 12px; border: 1px dashed var(--line-strong); border-radius: 11px; cursor: pointer; }
+.file-picker:hover { border-color: rgba(124,102,255,.55); background: var(--accent-soft); }
+.file-picker input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.file-picker span { flex: 0 0 auto; color: #cfc9ff; font-size: 11px; }
+.file-picker small { min-width: 0; margin-left: 10px; overflow: hidden; color: var(--muted-2); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.upload-form > button { padding: 0 14px; border: 0; border-radius: 10px; background: var(--accent); color: white; font-size: 11px; cursor: pointer; }
+.upload-form > button:disabled { opacity: .55; cursor: wait; }
+.document-list { max-height: 390px; padding: 0 20px 20px; overflow-y: auto; }
+.document-empty { padding: 30px 14px; border: 1px solid var(--line); border-radius: 12px; color: var(--muted-2); font-size: 11px; text-align: center; }
+.document-item { display: flex; align-items: center; gap: 12px; padding: 12px 13px; border-top: 1px solid var(--line); }
+.document-item > div { min-width: 0; margin-right: auto; }
+.document-item strong, .document-item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.document-item strong { font-size: 11px; font-weight: 600; }
+.document-item span { margin-top: 5px; color: var(--muted-2); font-size: 9px; }
+.document-item button { padding: 5px 8px; border: 0; border-radius: 7px; background: transparent; color: var(--muted-2); font-size: 9px; cursor: pointer; }
+.document-item button:hover { background: rgba(255,107,125,.12); color: var(--danger); }
 .mobile-only { display: none; }
 .sidebar-scrim { display: none; }
 
@@ -308,9 +374,10 @@ button { color: inherit; }
   .composer-wrap { padding-inline: 12px; }
   .composer-meta > span:last-child { display: none; }
   .message { grid-template-columns: 28px minmax(0, 1fr); gap: 10px; }
+  .upload-form { flex-direction: column; }
+  .upload-form > button { min-height: 38px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
-
