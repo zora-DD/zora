@@ -1,0 +1,51 @@
+{
+  "name": "zora-rag-smoke-v1",
+  "description": "覆盖项目发布、差旅制度、值班响应和研发环境的固定检索基准。",
+  "top_k": 3,
+  "minimum_recall_at_k": 1.0,
+  "minimum_mrr": 0.8,
+  "documents": [
+    {
+      "name": "蓝鲸项目发布计划.md",
+      "mime_type": "text/markdown",
+      "content": "# 蓝鲸项目发布计划\n\n蓝鲸项目计划于 2026 年 9 月 18 日正式发布。上线前必须完成灰度验证、回滚演练和负责人签字确认。发布日期变更需要提前三个工作日通知项目组。"
+    },
+    {
+      "name": "差旅报销制度.md",
+      "mime_type": "text/markdown",
+      "content": "# 差旅报销制度\n\n员工前往上海出差时，住宿费报销上限为每晚 600 元。报销时必须提交酒店发票和审批通过的差旅申请单，超出标准的部分由个人承担。"
+    },
+    {
+      "name": "值班响应手册.md",
+      "mime_type": "text/markdown",
+      "content": "# 值班响应手册\n\n收到 P1 级生产告警后，值班人员必须在 5 分钟内响应，并在 10 分钟内通知事故负责人。故障恢复后 24 小时内提交复盘记录。"
+    },
+    {
+      "name": "研发环境规范.md",
+      "mime_type": "text/markdown",
+      "content": "# 研发环境规范\n\nZora 项目使用 Go 1.26 或更高版本。Web 服务默认监听 8088 端口，本地数据保存在 data 目录。提交代码前需要运行 make check。"
+    }
+  ],
+  "cases": [
+    {
+      "id": "release-date-and-gate",
+      "question": "蓝鲸项目什么时候发布，上线前要完成哪些事项？",
+      "relevant_documents": ["蓝鲸项目发布计划.md"]
+    },
+    {
+      "id": "travel-hotel-limit",
+      "question": "去上海出差的住宿报销上限是多少？",
+      "relevant_documents": ["差旅报销制度.md"]
+    },
+    {
+      "id": "p1-response-time",
+      "question": "P1 生产告警需要在几分钟内响应？",
+      "relevant_documents": ["值班响应手册.md"]
+    },
+    {
+      "id": "local-web-port",
+      "question": "Zora Web 服务默认监听哪个端口？",
+      "relevant_documents": ["研发环境规范.md"]
+    }
+  ]
+}

@@ -102,16 +102,10 @@ func run(logger *slog.Logger) error {
 }
 
 func buildEmbedder(cfg config.Config) (knowledge.Embedder, error) {
-	switch cfg.EmbeddingProvider {
-	case "hash":
-		return knowledge.NewHashEmbedder(cfg.EmbeddingDimensions)
-	case "openai":
-		return knowledge.NewOpenAIEmbedder(knowledge.OpenAIEmbedderConfig{
-			APIKey: cfg.EmbeddingAPIKey, BaseURL: cfg.EmbeddingBaseURL,
-			Model: cfg.EmbeddingModel, Dimensions: cfg.EmbeddingDimensions,
-			HTTPClient: &http.Client{Timeout: cfg.RequestTimeout},
-		})
-	default:
-		return nil, errors.New("不支持的 Embedding 提供方")
-	}
+	return knowledge.NewEmbedder(knowledge.EmbedderConfig{
+		Provider: cfg.EmbeddingProvider, APIKey: cfg.EmbeddingAPIKey,
+		BaseURL: cfg.EmbeddingBaseURL, Model: cfg.EmbeddingModel,
+		Dimensions: cfg.EmbeddingDimensions,
+		HTTPClient: &http.Client{Timeout: cfg.RequestTimeout},
+	})
 }

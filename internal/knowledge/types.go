@@ -12,6 +12,16 @@ var (
 	ErrEmbeddingMismatch = errors.New("已存在分块使用了不同的 Embedding 模型或维度")
 )
 
+// RetrievalMode 用于固定评测时分别观察单路召回和融合召回的效果。
+// 对外问答仍默认使用 hybrid，避免把评测开关暴露给普通用户。
+type RetrievalMode string
+
+const (
+	RetrievalHybrid  RetrievalMode = "hybrid"
+	RetrievalVector  RetrievalMode = "vector"
+	RetrievalKeyword RetrievalMode = "keyword"
+)
+
 // Document 是一份完成摄取的知识库文档。
 type Document struct {
 	ID                  string    `json:"id"`

@@ -21,8 +21,12 @@
 ## 2. 目录与依赖规则
 
 ```text
-cmd/zora/
-└── main.go                    启动、组装、信号和关闭
+cmd/
+├── zora/main.go               服务启动、组装、信号和关闭
+└── zora-eval/main.go          固定 RAG 检索评测命令
+
+evals/
+└── knowledge.json             可版本化的评测语料、问题和阈值
 
 internal/
 ├── config/                    环境配置与启动校验
@@ -33,6 +37,7 @@ internal/
 ├── agenttools/                Eino Tool 及安全执行逻辑
 ├── agentruntime/              Eino/模型适配与统一事件
 ├── knowledge/                 分块、Embedding、混合检索与 Agent Tool
+├── rageval/                   Recall@K、MRR、命中率与模式对比
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
 ```
@@ -47,6 +52,8 @@ flowchart TD
     Main --> SQLite["store/sqlite"]
     Main --> Tools["agenttools"]
     Main --> Knowledge["knowledge"]
+    Eval["cmd/zora-eval"] --> RAGEval["rageval"]
+    Eval --> Knowledge
     HTTP --> Chat
     HTTP --> Knowledge
     Chat --> Domain["domain"]
@@ -56,6 +63,7 @@ flowchart TD
     Tools --> Eino
     Knowledge --> Eino
     Knowledge --> KStore["knowledge.Store"]
+    RAGEval --> Knowledge
     SQLite --> Store
     SQLite --> KStore
     SQLite --> Domain
@@ -340,6 +348,33 @@ flowchart LR
 当前 SQLite MVP 最多读取 10,000 个 Chunk 做精确扫描。向量和 BM25 各取前 50 名，使用 `1 / (60 + rank)` 融合，避免直接相加两种量纲不同的原始分数。结果同时返回 fused、vector 和 keyword 分数，用于调试与后续评估。
 
 `knowledge_search` 默认返回 5 条，Agent Tool 最多返回 8 条。每条包含 `document_name`、`ordinal`、`chunk_id`、原文和 rune 范围，这些字段是最终回答引用的真实来源。
+
+`knowledge.Service.SearchWithMode` 额外支持 `vector`、`keyword`、`hybrid` 三种模式。该方法用于离线评测；线上 `knowledge_search` 仍调用 `Search` 并固定使用 `hybrid`，普通用户不能通过请求参数改变检索策略。
+
+### 8.8 固定 RAG 检索评测
+
+```mermaid
+flowchart LR
+    Dataset["evals/knowledge.json"] --> CLI["cmd/zora-eval"]
+    CLI --> TempDB["隔离的临时 SQLite"]
+    CLI --> Ingest["按线上配置重新摄取"]
+    Ingest --> Modes["vector / keyword / hybrid"]
+    Modes --> Metrics["Recall@K / MRR / Hit Rate / Latency"]
+    Metrics --> Gate["阈值判断 + JSON 报告"]
+```
+
+评测集将语料、问题、相关文档标注、Top K 和最低阈值放在同一个严格 JSON 文件中。命令每次创建临时数据库并重新摄取固定语料，不读取或修改 `ZORA_DATA_DIR` 中的在线数据；Embedding Provider、维度和分块参数与服务配置保持一致。
+
+指标定义：
+
+- `Recall@K`：前 K 个 chunk 覆盖的唯一相关文档数 / 标注相关文档总数，再对问题取平均；
+- `MRR`：第一个相关 chunk 排名的倒数，再对问题取平均；
+- `Hit Rate`：前 K 个结果至少命中一份相关文档的问题比例；
+- `average_latency_ms`：当前模式下单次检索的平均本地耗时，不包含语料摄取。
+
+报告同时给出 hybrid 相对 vector 和 keyword 的 Recall/MRR 差值。阈值只约束线上默认使用的 hybrid 模式；未达阈值时命令输出完整报告后以非零状态退出，可直接接入 CI。
+
+默认 `zora-rag-smoke-v1` 含 4 份文档和 4 个问题。在 Hash Embedding 下实际结果为 Recall@3=1、MRR=1，三种模式当前打平。这是小规模冒烟基线，不构成“混合召回优于单路”的证据。
 
 ## 9. 并发、取消与错误处理
 
@@ -628,6 +663,7 @@ Content-Type: application/json
 | 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder |
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
 | Store/知识库测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用和级联删除 |
+| RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；vector/keyword/hybrid 差值 |
 | HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索和删除 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
 | 工程检查 | `go test`、`go vet`、race、无 CGO build |
@@ -638,6 +674,7 @@ Content-Type: application/json
 make test
 make vet
 make check
+make eval-rag
 go test -race ./internal/...
 CGO_ENABLED=0 go build ./cmd/zora
 ```
@@ -680,7 +717,7 @@ flowchart LR
     Cite --> Agent["Agent 回答"]
 ```
 
-本地 MVP 已实现内容哈希、chunk 来源范围、Embedding 抽象、混合召回和引用。剩余工作是将候选召回下推 PostgreSQL + pgvector/FTS，并增加文档版本、tenant/ACL、PDF、异步摄取、可选 Rerank 和离线评估集。
+本地 MVP 已实现内容哈希、chunk 来源范围、Embedding 抽象、混合召回、引用和固定检索评测。剩余工作是将候选召回下推 PostgreSQL + pgvector/FTS，并增加文档版本、tenant/ACL、PDF、异步摄取、可选 Rerank、答案引用覆盖率/忠实度评估以及更有区分度的语义评测样本。
 
 ### 17.2 V0.3 Memory
 

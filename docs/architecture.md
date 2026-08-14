@@ -4,7 +4,7 @@
 
 ## 1. 边界
 
-Zora 将系统划分为六个边界：
+Zora 将系统划分为七个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
@@ -12,6 +12,7 @@ Zora 将系统划分为六个边界：
 4. `agenttools`：工具 Schema、输入校验和执行代码。
 5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
 6. `store`：对话与知识库的持久化边界，当前由 SQLite 实现。
+7. `rageval`：固定数据集校验、检索指标计算和单路/混合效果对比。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -84,6 +85,12 @@ internal/knowledge/
 internal/store/sqlite/
 └── sqlite.go        Document/Chunk 事务存储
 
+internal/rageval/
+└── evaluator.go     Recall@K、MRR、命中率和模式对比
+
+evals/
+└── knowledge.json   固定语料、问题、相关文档与阈值
+
 当前候选召回在 Go 内最多精确扫描 10,000 个 Chunk。V0.2 下一子阶段保持 Service 和 Tool 契约，将召回下推到：
 
 internal/store/postgres/
@@ -94,6 +101,8 @@ internal/store/postgres/
 ```
 
 检索作为 Eino Tool 或 Graph 暴露给 Agent，但召回、权限过滤和评估属于业务层。
+
+线上 `knowledge_search` 固定使用 hybrid；离线评测通过 `SearchWithMode` 分别执行 vector、keyword 和 hybrid。`cmd/zora-eval` 每次在临时 SQLite 中重建固定语料，因此不会被开发者在线知识库中的历史数据污染，也可在后续切换 pgvector 时作为回归基线。
 
 ## 7. 长期记忆接入点
 

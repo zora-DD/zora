@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通 TXT/Markdown 上传、去重、分块、Embedding、向量 + BM25/RRF 混合召回和 Agent 引用的本地闭环。PostgreSQL + pgvector、权限过滤和固定评测集仍是 V0.2 后续子阶段；长期记忆、多 Agent 和办公连接器属于后续里程碑。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通 TXT/Markdown 上传、去重、分块、Embedding、向量 + BM25/RRF 混合召回、Agent 引用和固定检索评测的本地闭环。PostgreSQL + pgvector、权限过滤、答案忠实度和更大规模的语义评测集仍是 V0.2 后续子阶段；长期记忆、多 Agent 和办公连接器属于后续里程碑。
 
 ## 2. 背景与问题
 
@@ -87,7 +87,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 执行审计 | 已实现 | AgentRun 与 append-only RunEvent |
 | 本地持久化 | 已实现 | SQLite、WAL、事务与级联删除 |
 | 知识库本地 MVP | 已实现 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
-| 生产知识库 | V0.2 进行中 | PostgreSQL + pgvector、FTS、权限过滤、评估 |
+| RAG 检索评测 | 已实现 | 固定语料与问题、三种检索模式、Recall@K、MRR、命中率、延迟和阈值门禁 |
+| 生产知识库 | V0.2 进行中 | PostgreSQL + pgvector、FTS、权限过滤、答案忠实度评估 |
 | 长期记忆 | 规划 V0.3 | Semantic/Episodic Memory 与 Consolidation |
 | 多 Agent | 规划 V0.4 | Supervisor、专业 Agent、预算和效果对比 |
 | 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
@@ -291,6 +292,8 @@ flowchart LR
     Store --> SQLite["SQLite"]
     KStore --> SQLite
     Knowledge --> Embedder["Hash / OpenAI Embedder"]
+    EvalCLI["zora-eval"] --> RAGEval["rageval"]
+    EvalCLI --> Knowledge
 
     Runtime -. "领域事件" .-> Chat
     Chat -. "SSE 事件" .-> HTTP
@@ -306,6 +309,7 @@ flowchart LR
 | Agent 适配层 | `internal/agentruntime` | Eino 组装、模型选择、事件归一化 |
 | 能力层 | `internal/agenttools` | 工具 Schema、校验和安全执行 |
 | 知识库应用层 | `internal/knowledge` | 分块、Embedding 适配、混合召回、引用与 Agent Tool |
+| RAG 评测层 | `internal/rageval` | 固定集校验、Recall@K/MRR、模式对比和阈值判断 |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
@@ -320,6 +324,7 @@ flowchart LR
 | 本地数据库 | SQLite | 零运维，便于演示、测试和 RAG 纵向切片 |
 | 检索 | 精确余弦扫描 + BM25 + RRF | 算法透明、便于验证；后续下推 pgvector/FTS |
 | Embedding | Hash / OpenAI-compatible | 本地零密钥与生产语义模型共用接口 |
+| RAG 评测 | 版本化 JSON + 隔离 SQLite | 同一语料可在 Hash、真实 Embedding 和未来 pgvector 上重复对比 |
 | 前端传输 | SSE | 单向模型流简单、代理支持广、易于调试 |
 | UI 发布 | `go:embed` | 单二进制运行，无 Node.js 部署依赖 |
 | ID | `crypto/rand` | 不依赖数据库自增 ID，不暴露业务规模 |
@@ -348,7 +353,7 @@ HTTP 和 Store 不依赖 Eino 事件类型。`agentruntime.Event` 作为防腐�
 
 ### 9.6 面向评估演进
 
-后续 RAG、Memory 和 Multi-Agent 都设置验收指标。多 Agent 只有在质量收益能够覆盖成本和延迟时才保留，避免“功能数量等于技术深度”的误区。
+RAG 已把语料、问题、相关文档和阈值作为版本化资产，并对 vector、keyword、hybrid 分别计算 Recall@K、MRR、命中率和延迟。后续 Memory 和 Multi-Agent 同样设置对照指标；多 Agent 只有在质量收益能够覆盖成本和延迟时才保留，避免“功能数量等于技术深度”的误区。
 
 ### 9.7 可交换的 RAG 边界
 
@@ -365,6 +370,7 @@ HTTP 和 Store 不依赖 Eino 事件类型。`agentruntime.Event` 作为防腐�
 | SQLite 单连接 | 适合单机和作品演示，不适合高并发多实例 | V0.2 增加 PostgreSQL Store |
 | 本地向量精确扫描 | 最多读取 10,000 个 chunk，内存和延迟随数据增长 | pgvector ANN 召回 + PostgreSQL FTS |
 | Hash Embedding 无深度语义 | 适合关键词相关性和链路测试，不适合生产问答 | 生产切换 text-embedding-v4 等语义模型 |
+| 固定评测集仅 4 题 | 能做冒烟回归，无法证明复杂语义场景或融合收益 | 增加语义改写、难负例、多相关文档和真实业务问题 |
 | 同步文档索引 | 大文件会占用 HTTP 请求 | 异步 Ingestion Job、重试和状态机 |
 | 进程内会话锁 | 多实例之间不能互斥 | advisory lock 或带租约分布式锁 |
 | 最近 40 条上下文 | 长对话会丢失早期信息 | 摘要 + 长期记忆召回 |
@@ -400,11 +406,13 @@ HTTP 和 Store 不依赖 Eino 事件类型。`agentruntime.Event` 作为防腐�
 - 向量召回和 BM25 召回分别计分，RRF 不依赖两类分数量纲；
 - 知识库工具结果必须包含文档名、分块序号和原文；
 - 默认无密钥可运行，同时有真实 Embedding 适配器的契约测试。
+- 固定评测命令在隔离数据库中复现语料，并输出 vector、keyword、hybrid 的 Recall@K、MRR、命中率和延迟；
+- 默认 `zora-rag-smoke-v1` 的实际基线为 Recall@3=1、MRR=1，三种模式打平，尚不能证明融合收益。
 
 ## 12. 演进路线
 
 1. **V0.1 Agent Core**：建立当前可运行基线。
-2. **V0.2 Knowledge Base（进行中）**：本地摄取、混合检索和引用已实现；继续完成 PostgreSQL + pgvector、权限与评估。
+2. **V0.2 Knowledge Base（进行中）**：本地摄取、混合检索、引用和固定检索评测已实现；继续完成 PostgreSQL + pgvector、权限和答案质量评估。
 3. **V0.3 Long-term Memory**：记忆提取、合并、过期、召回和用户控制。
 4. **V0.4 Multi-Agent**：Supervisor、专业 Agent、预算和对照评估。
 5. **V0.5 Office Agent**：MCP、办公连接器、审批、权限和审计。

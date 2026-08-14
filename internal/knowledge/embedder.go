@@ -19,6 +19,31 @@ type Embedder interface {
 	Dimensions() int
 }
 
+// EmbedderConfig 是不同 Embedding Provider 共用的创建参数。
+// 入口程序和离线评测命令共用该工厂，保证两条链路使用完全相同的实现。
+type EmbedderConfig struct {
+	Provider   string
+	APIKey     string
+	BaseURL    string
+	Model      string
+	Dimensions int
+	HTTPClient *http.Client
+}
+
+func NewEmbedder(config EmbedderConfig) (Embedder, error) {
+	switch strings.ToLower(strings.TrimSpace(config.Provider)) {
+	case "hash":
+		return NewHashEmbedder(config.Dimensions)
+	case "openai":
+		return NewOpenAIEmbedder(OpenAIEmbedderConfig{
+			APIKey: config.APIKey, BaseURL: config.BaseURL, Model: config.Model,
+			Dimensions: config.Dimensions, HTTPClient: config.HTTPClient,
+		})
+	default:
+		return nil, fmt.Errorf("不支持的 Embedding 提供方：%q", config.Provider)
+	}
+}
+
 // HashEmbedder 用 feature hashing 提供零密钥、确定性的本地向量。
 // 它适合开发和链路测试，不应替代生产语义 Embedding 模型。
 type HashEmbedder struct{ dimensions int }

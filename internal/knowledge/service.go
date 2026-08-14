@@ -121,6 +121,12 @@ func (s *Service) DeleteDocument(ctx context.Context, id string) error {
 }
 
 func (s *Service) Search(ctx context.Context, query string, topK int) ([]SearchResult, error) {
+	return s.SearchWithMode(ctx, query, topK, RetrievalHybrid)
+}
+
+// SearchWithMode 主要服务于离线评测，用同一批数据对比向量、关键词和混合召回。
+// Agent Tool 始终调用 Search，因此线上默认路径不会被评测参数改变。
+func (s *Service) SearchWithMode(ctx context.Context, query string, topK int, mode RetrievalMode) ([]SearchResult, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, fmt.Errorf("检索问题不能为空")
@@ -131,6 +137,20 @@ func (s *Service) Search(ctx context.Context, query string, topK int) ([]SearchR
 	if topK > 20 {
 		return nil, fmt.Errorf("top_k 最大为 20")
 	}
+	if mode != RetrievalHybrid && mode != RetrievalVector && mode != RetrievalKeyword {
+		return nil, fmt.Errorf("不支持的检索模式：%q", mode)
+	}
+
+	chunks, err := s.store.ListChunks(ctx, maxSearchChunks)
+	if err != nil {
+		return nil, err
+	}
+	if len(chunks) == 0 {
+		return []SearchResult{}, nil
+	}
+	if mode == RetrievalKeyword {
+		return rankSearch(query, nil, chunks, topK, mode), nil
+	}
 
 	vectors, err := s.embedder.Embed(ctx, []string{query})
 	if err != nil {
@@ -138,13 +158,6 @@ func (s *Service) Search(ctx context.Context, query string, topK int) ([]SearchR
 	}
 	if len(vectors) != 1 || len(vectors[0]) != s.embedder.Dimensions() {
 		return nil, fmt.Errorf("Embedding 器返回的检索向量无效")
-	}
-	chunks, err := s.store.ListChunks(ctx, maxSearchChunks)
-	if err != nil {
-		return nil, err
-	}
-	if len(chunks) == 0 {
-		return []SearchResult{}, nil
 	}
 
 	compatible := make([]Chunk, 0, len(chunks))
@@ -157,7 +170,7 @@ func (s *Service) Search(ctx context.Context, query string, topK int) ([]SearchR
 	if len(compatible) == 0 {
 		return nil, ErrEmbeddingMismatch
 	}
-	return hybridSearch(query, vectors[0], compatible, topK), nil
+	return rankSearch(query, vectors[0], compatible, topK, mode), nil
 }
 
 type scoredChunk struct {
@@ -167,46 +180,58 @@ type scoredChunk struct {
 	fusedScore   float64
 }
 
-func hybridSearch(query string, queryVector []float64, chunks []Chunk, topK int) []SearchResult {
+func rankSearch(query string, queryVector []float64, chunks []Chunk, topK int, mode RetrievalMode) []SearchResult {
 	items := make([]scoredChunk, len(chunks))
 	queryTerms, _ := termCounts(query)
 	keywordScores := bm25Scores(queryTerms, chunks)
 	for i, chunk := range chunks {
+		vectorScore := 0.0
+		if len(queryVector) > 0 {
+			vectorScore = cosineSimilarity(queryVector, chunk.Embedding)
+		}
 		items[i] = scoredChunk{
-			chunk: chunk, vectorScore: cosineSimilarity(queryVector, chunk.Embedding),
-			keywordScore: keywordScores[i],
+			chunk: chunk, vectorScore: vectorScore, keywordScore: keywordScores[i],
 		}
 	}
 
 	vectorRanking := append([]scoredChunk(nil), items...)
 	slices.SortFunc(vectorRanking, func(a, b scoredChunk) int {
-		return compareScore(b.vectorScore, a.vectorScore)
+		return compareRank(b.vectorScore, a.vectorScore, a.chunk, b.chunk)
 	})
 	keywordRanking := append([]scoredChunk(nil), items...)
 	slices.SortFunc(keywordRanking, func(a, b scoredChunk) int {
-		return compareScore(b.keywordScore, a.keywordScore)
+		return compareRank(b.keywordScore, a.keywordScore, a.chunk, b.chunk)
 	})
 
-	fused := make(map[string]float64, len(items))
-	// RRF 只使用名次而不直接相加原始分，避免余弦相似度和 BM25 量纲不一致。
-	for rank, item := range vectorRanking[:min(len(vectorRanking), 50)] {
-		if item.vectorScore > 0 {
-			fused[item.chunk.ID] += 1 / (rrfConstant + float64(rank+1))
+	switch mode {
+	case RetrievalHybrid:
+		fused := make(map[string]float64, len(items))
+		// RRF 只使用名次而不直接相加原始分，避免余弦相似度和 BM25 量纲不一致。
+		for rank, item := range vectorRanking[:min(len(vectorRanking), 50)] {
+			if item.vectorScore > 0 {
+				fused[item.chunk.ID] += 1 / (rrfConstant + float64(rank+1))
+			}
+		}
+		for rank, item := range keywordRanking[:min(len(keywordRanking), 50)] {
+			if item.keywordScore > 0 {
+				fused[item.chunk.ID] += 1 / (rrfConstant + float64(rank+1))
+			}
+		}
+		for i := range items {
+			items[i].fusedScore = fused[items[i].chunk.ID]
+		}
+	case RetrievalVector:
+		for i := range items {
+			items[i].fusedScore = items[i].vectorScore
+		}
+	case RetrievalKeyword:
+		for i := range items {
+			items[i].fusedScore = items[i].keywordScore
 		}
 	}
-	for rank, item := range keywordRanking[:min(len(keywordRanking), 50)] {
-		if item.keywordScore > 0 {
-			fused[item.chunk.ID] += 1 / (rrfConstant + float64(rank+1))
-		}
-	}
-	for i := range items {
-		items[i].fusedScore = fused[items[i].chunk.ID]
-	}
+
 	slices.SortFunc(items, func(a, b scoredChunk) int {
-		if comparison := compareScore(b.fusedScore, a.fusedScore); comparison != 0 {
-			return comparison
-		}
-		return compareScore(b.vectorScore, a.vectorScore)
+		return compareRank(b.fusedScore, a.fusedScore, a.chunk, b.chunk)
 	})
 
 	results := make([]SearchResult, 0, topK)
@@ -225,6 +250,16 @@ func hybridSearch(query string, queryVector []float64, chunks []Chunk, topK int)
 		}
 	}
 	return results
+}
+
+func compareRank(left, right float64, leftChunk, rightChunk Chunk) int {
+	if comparison := compareScore(left, right); comparison != 0 {
+		return comparison
+	}
+	if comparison := strings.Compare(leftChunk.DocumentName, rightChunk.DocumentName); comparison != 0 {
+		return comparison
+	}
+	return leftChunk.Ordinal - rightChunk.Ordinal
 }
 
 func bm25Scores(queryTerms map[string]int, chunks []Chunk) []float64 {

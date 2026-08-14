@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.2 Knowledge Base（开发中）**。V0.1 Agent Core 已完成，当前已打通可运行的 RAG 纵向切片。
+当前版本：**V0.2 Knowledge Base（开发中）**。V0.1 Agent Core 已完成，当前已打通可运行、可引用、可离线评测的 RAG 纵向切片。
 
 ## 当前能力
 
@@ -19,7 +19,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
 | Web UI | 已完成 | 内嵌响应式页面，不需要 Node.js 部署 |
 | 知识库 MVP | 已完成 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
-| 生产向量库 | V0.2 进行中 | PostgreSQL + pgvector、FTS、权限过滤和固定评测集 |
+| RAG 检索评测 | 已完成 | 固定语料与问题集，对比向量/关键词/混合召回，输出 Recall@K、MRR、命中率和延迟 |
+| 生产向量库 | V0.2 进行中 | PostgreSQL + pgvector、FTS、权限过滤和答案忠实度评估 |
 | 长期记忆 | V0.3 | Semantic/Episodic Memory、合并、过期和用户控制 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
@@ -32,6 +33,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **框架复用、业务自研**：Eino 负责 ReAct、Tool 和模型事件；会话、Run、审计及后续 RAG/Memory 机制由项目控制。
 - **Mock 不绕过 Agent**：无密钥模式仍经过 Eino ChatModelAgent 和 ToolNode，可稳定测试完整链路。
 - **RAG 召回可解释**：同时保留向量相似度、BM25 得分和 RRF 融合结果，每条证据可追溯到文档和字符区间。
+- **检索效果可回归**：固定评测集在隔离数据库中重建语料，分别测量 vector、keyword 和 hybrid，避免算法升级只凭主观体验。
 - **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
@@ -70,6 +72,14 @@ make run
 ```
 
 本地 Mock 会展示确定性的证据摘要和 `[README.md#0]` 形式引用，工具 Trace 中可查看完整检索结果；配置真实 Chat Model 后，模型会根据证据组织回答并标注文档名与分块编号。
+
+运行内置 RAG 检索基准：
+
+```bash
+make eval-rag
+```
+
+命令会在临时 SQLite 数据库中摄取 `evals/knowledge.json`，不会修改在线知识库；报告包含三种检索模式的 Recall@K、MRR、命中率、平均延迟和逐题排名。默认 Hash Embedding 基线的 4 个问题均达到 Recall@3=1、MRR=1。当前小样本下三种模式打平，因此尚不能据此声称混合召回优于单路。
 
 数据默认保存到：
 
@@ -211,13 +221,16 @@ SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`�
 ## 项目结构
 
 ```text
-cmd/zora/                  程序入口、依赖组装和优雅关闭
+cmd/zora/                  服务入口、依赖组装和优雅关闭
+cmd/zora-eval/             隔离运行固定 RAG 检索评测集
+evals/                     可版本化的固定评测语料与问题
 internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
 internal/id/               随机业务 ID
 internal/agentruntime/     Eino Runtime、模型适配和事件转换
 internal/agenttools/       只读工具和安全计算器
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
+internal/rageval/          Recall@K、MRR、命中率和模式对比
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
 internal/store/sqlite/     对话与知识库的 SQLite 实现
@@ -233,6 +246,9 @@ make test
 
 # 静态分析
 make vet
+
+# 固定 RAG 检索评测
+make eval-rag
 
 # 格式化、测试和静态分析
 make check
@@ -254,6 +270,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - Unicode 分块边界、重叠与原文字符偏移；
 - Hash Embedding 可复现性和 OpenAI-compatible Embedding 批处理；
 - 文档入库、哈希去重、混合检索、引用和级联删除；
+- 向量、关键词、混合三种检索模式及固定集 Recall@K/MRR 计算；
 - HTTP multipart 上传、知识检索与删除。
 
 ## 文档导航

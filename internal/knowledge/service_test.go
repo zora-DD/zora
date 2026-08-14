@@ -65,6 +65,22 @@ func TestServiceIngestSearchDeduplicateAndDelete(t *testing.T) {
 	if results[0].ChunkID == "" || results[0].Ordinal < 0 {
 		t.Fatalf("citation information is incomplete: %+v", results[0])
 	}
+	for _, mode := range []knowledge.RetrievalMode{
+		knowledge.RetrievalVector,
+		knowledge.RetrievalKeyword,
+		knowledge.RetrievalHybrid,
+	} {
+		modeResults, err := service.SearchWithMode(context.Background(), "蓝鲸项目发布日期", 3, mode)
+		if err != nil {
+			t.Fatalf("search mode %s: %v", mode, err)
+		}
+		if len(modeResults) == 0 || modeResults[0].DocumentName != "release.md" {
+			t.Fatalf("search mode %s returned unexpected results: %+v", mode, modeResults)
+		}
+	}
+	if _, err := service.SearchWithMode(context.Background(), "蓝鲸项目", 3, "unknown"); err == nil {
+		t.Fatal("unsupported retrieval mode should fail")
+	}
 
 	if err := service.DeleteDocument(context.Background(), created.Document.ID); err != nil {
 		t.Fatal(err)

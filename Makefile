@@ -1,7 +1,10 @@
-.PHONY: run test fmt vet check
+.PHONY: run eval-rag test fmt vet check
 
 run:
 	go run ./cmd/zora
+
+eval-rag:
+	go run ./cmd/zora-eval -dataset ./evals/knowledge.json
 
 test:
 	go test ./...
@@ -13,4 +16,3 @@ vet:
 	go vet ./...
 
 check: fmt test vet
-

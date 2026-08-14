@@ -6,9 +6,24 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
+
+func TestNewEmbedderFactory(t *testing.T) {
+	t.Parallel()
+	embedder, err := NewEmbedder(EmbedderConfig{Provider: " HASH ", Dimensions: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if embedder.Name() != "zora-hash-128-v1" {
+		t.Fatalf("embedder name = %s", embedder.Name())
+	}
+	if _, err := NewEmbedder(EmbedderConfig{Provider: "unknown", Dimensions: 128}); err == nil || !strings.Contains(err.Error(), "不支持") {
+		t.Fatalf("unexpected provider error: %v", err)
+	}
+}
 
 func TestHashEmbedderIsDeterministic(t *testing.T) {
 	t.Parallel()
