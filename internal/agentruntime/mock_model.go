@@ -81,6 +81,12 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	switch {
 	case systemHasAgentRole(input, "writer"):
 		return schema.AssistantMessage(formatWriterDraft(query), nil), nil
+	case hasMCPEmailReadIntent(lower) && toolNameWithSuffix(availableTools, "_search_emails") != "":
+		keyword := extractMCPKeyword(query, []string{"搜索邮件", "查找邮件", "search email", "search mail"})
+		return m.toolCall(toolNameWithSuffix(availableTools, "_search_emails"), fmt.Sprintf(`{"query":%q,"limit":10}`, keyword)), nil
+	case hasMCPCalendarReadIntent(lower) && toolNameWithSuffix(availableTools, "_list_calendar_events") != "":
+		keyword := extractMCPKeyword(query, []string{"搜索日程", "查询日程", "搜索日历", "search calendar"})
+		return m.toolCall(toolNameWithSuffix(availableTools, "_list_calendar_events"), fmt.Sprintf(`{"query":%q,"limit":10}`, keyword)), nil
 	case hasMCPListFilesIntent(lower) && toolNameWithSuffix(availableTools, "_list_files") != "":
 		return m.toolCall(toolNameWithSuffix(availableTools, "_list_files"), `{"path":".","recursive":false,"limit":100}`), nil
 	case hasMCPReadFileIntent(lower) && toolNameWithSuffix(availableTools, "_read_text_file") != "":
@@ -89,8 +95,12 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 			return schema.AssistantMessage("请提供要读取的相对文件路径，例如：读取文件 `docs/周报.md`。", nil), nil
 		}
 		return m.toolCall(toolNameWithSuffix(availableTools, "_read_text_file"), fmt.Sprintf(`{"path":%q}`, path)), nil
-	case (hasMCPListFilesIntent(lower) || hasMCPReadFileIntent(lower)) && hasTool(availableTools, DocumentAgentName):
+	case (hasMCPEmailReadIntent(lower) || hasMCPCalendarReadIntent(lower) || hasMCPListFilesIntent(lower) || hasMCPReadFileIntent(lower)) && hasTool(availableTools, DocumentAgentName):
 		return m.toolCall(DocumentAgentName, fmt.Sprintf(`{"request":%q}`, query)), nil
+	case hasMCPEmailReadIntent(lower):
+		return schema.AssistantMessage("MCP 邮件连接器尚未启用，请先配置 Microsoft Graph 只读连接器。", nil), nil
+	case hasMCPCalendarReadIntent(lower):
+		return schema.AssistantMessage("MCP 日历连接器尚未启用，请先配置 Microsoft Graph 只读连接器。", nil), nil
 	case hasMCPListFilesIntent(lower) || hasMCPReadFileIntent(lower):
 		return schema.AssistantMessage("MCP 文件连接器尚未启用，请先完成连接器配置。", nil), nil
 	// “发布日期”等资料字段会包含“日期”。知识库意图必须优先于时间意图，
@@ -168,6 +178,33 @@ func hasMCPReadFileIntent(query string) bool {
 	return containsAny(query, "读取文件", "打开文件", "读取办公文件", "查看文件内容", "read file")
 }
 
+func hasMCPEmailReadIntent(query string) bool {
+	return containsAny(query,
+		"查邮件", "查询邮件", "搜索邮件", "查找邮件", "最近邮件", "最新邮件", "未读邮件", "收件箱",
+		"邮件里", "邮件中", "根据邮件", "email inbox", "search email", "search mail", "recent email")
+}
+
+func hasMCPCalendarReadIntent(query string) bool {
+	return containsAny(query,
+		"查日程", "查询日程", "搜索日程", "最近日程", "今日日程", "今天的日程", "明日日程", "明天的日程",
+		"未来日程", "本周日程", "下周日程", "查看日历", "查询日历", "日历里", "日历中", "会议安排",
+		"calendar events", "search calendar", "my calendar")
+}
+
+func extractMCPKeyword(query string, markers []string) string {
+	if quoted := extractRequestedFilePath(query); quoted != "" {
+		return quoted
+	}
+	lower := strings.ToLower(query)
+	for _, marker := range markers {
+		if index := strings.Index(lower, marker); index >= 0 {
+			value := strings.TrimSpace(query[index+len(marker):])
+			return strings.Trim(strings.TrimSpace(value), "：:，,。？?!！")
+		}
+	}
+	return ""
+}
+
 func extractRequestedFilePath(query string) string {
 	for _, delimiters := range [][2]string{{"`", "`"}, {"“", "”"}, {`"`, `"`}, {"'", "'"}} {
 		start := strings.Index(query, delimiters[0])
@@ -199,6 +236,128 @@ func toolNameWithSuffix(tools []*schema.ToolInfo, suffix string) string {
 }
 
 func formatMCPResult(toolName, content string) string {
+	if strings.HasSuffix(toolName, "_search_emails") {
+		var payload struct {
+			Emails []struct {
+				ID      string `json:"id"`
+				Subject string `json:"subject"`
+				From    struct {
+					Name    string `json:"name"`
+					Address string `json:"address"`
+				} `json:"from"`
+				ReceivedDateTime string `json:"received_date_time"`
+				BodyPreview      string `json:"body_preview"`
+				IsRead           bool   `json:"is_read"`
+				HasAttachments   bool   `json:"has_attachments"`
+			} `json:"emails"`
+			ContentWarning string `json:"content_warning"`
+		}
+		if err := json.Unmarshal([]byte(content), &payload); err == nil {
+			var builder strings.Builder
+			builder.WriteString("Microsoft 邮件查询结果：")
+			if len(payload.Emails) == 0 {
+				builder.WriteString("\n\n没有找到匹配的邮件。")
+			}
+			for _, email := range payload.Emails {
+				readState := "未读"
+				if email.IsRead {
+					readState = "已读"
+				}
+				attachment := ""
+				if email.HasAttachments {
+					attachment = "，含附件"
+				}
+				sender := strings.TrimSpace(email.From.Name)
+				if sender == "" {
+					sender = email.From.Address
+				} else if email.From.Address != "" {
+					sender += " <" + email.From.Address + ">"
+				}
+				fmt.Fprintf(&builder, "\n\n- **%s**（%s%s）\n  发件人：%s\n  时间：%s\n  摘要：%s\n  邮件 ID：`%s`", email.Subject, readState, attachment, sender, email.ReceivedDateTime, email.BodyPreview, email.ID)
+			}
+			appendMCPContentWarning(&builder, payload.ContentWarning)
+			return builder.String()
+		}
+	}
+	if strings.HasSuffix(toolName, "_get_email") {
+		var payload struct {
+			Email struct {
+				ID      string `json:"id"`
+				Subject string `json:"subject"`
+				From    struct {
+					Name    string `json:"name"`
+					Address string `json:"address"`
+				} `json:"from"`
+				ReceivedDateTime string `json:"received_date_time"`
+				BodyPreview      string `json:"body_preview"`
+				HasAttachments   bool   `json:"has_attachments"`
+			} `json:"email"`
+			ContentWarning string `json:"content_warning"`
+		}
+		if err := json.Unmarshal([]byte(content), &payload); err == nil {
+			var builder strings.Builder
+			fmt.Fprintf(&builder, "邮件 **%s**\n\n- 发件人：%s <%s>\n- 接收时间：%s\n- 邮件 ID：`%s`\n\n%s", payload.Email.Subject, payload.Email.From.Name, payload.Email.From.Address, payload.Email.ReceivedDateTime, payload.Email.ID, payload.Email.BodyPreview)
+			if payload.Email.HasAttachments {
+				builder.WriteString("\n\n[此邮件含附件；只读连接器未下载附件]")
+			}
+			appendMCPContentWarning(&builder, payload.ContentWarning)
+			return builder.String()
+		}
+	}
+	if strings.HasSuffix(toolName, "_list_calendar_events") {
+		var payload struct {
+			WindowStart string `json:"window_start"`
+			WindowEnd   string `json:"window_end"`
+			Events      []struct {
+				ID        string                              `json:"id"`
+				Subject   string                              `json:"subject"`
+				Start     struct{ DateTime, TimeZone string } `json:"start"`
+				End       struct{ DateTime, TimeZone string } `json:"end"`
+				Location  string                              `json:"location"`
+				Organizer struct {
+					Name    string `json:"name"`
+					Address string `json:"address"`
+				} `json:"organizer"`
+				IsCancelled bool `json:"is_cancelled"`
+			} `json:"events"`
+			ContentWarning string `json:"content_warning"`
+		}
+		if err := json.Unmarshal([]byte(content), &payload); err == nil {
+			var builder strings.Builder
+			fmt.Fprintf(&builder, "Microsoft 日历查询结果（%s 至 %s）：", payload.WindowStart, payload.WindowEnd)
+			if len(payload.Events) == 0 {
+				builder.WriteString("\n\n没有找到匹配的日程。")
+			}
+			for _, event := range payload.Events {
+				state := ""
+				if event.IsCancelled {
+					state = " [已取消]"
+				}
+				fmt.Fprintf(&builder, "\n\n- **%s**%s\n  时间：%s — %s（%s）\n  地点：%s\n  组织者：%s <%s>\n  日程 ID：`%s`", event.Subject, state, event.Start.DateTime, event.End.DateTime, event.Start.TimeZone, valueOrDefault(event.Location, "未填写"), event.Organizer.Name, event.Organizer.Address, event.ID)
+			}
+			appendMCPContentWarning(&builder, payload.ContentWarning)
+			return builder.String()
+		}
+	}
+	if strings.HasSuffix(toolName, "_get_calendar_event") {
+		var payload struct {
+			Event struct {
+				ID          string                              `json:"id"`
+				Subject     string                              `json:"subject"`
+				Start       struct{ DateTime, TimeZone string } `json:"start"`
+				End         struct{ DateTime, TimeZone string } `json:"end"`
+				Location    string                              `json:"location"`
+				BodyPreview string                              `json:"body_preview"`
+			} `json:"event"`
+			ContentWarning string `json:"content_warning"`
+		}
+		if err := json.Unmarshal([]byte(content), &payload); err == nil {
+			var builder strings.Builder
+			fmt.Fprintf(&builder, "日程 **%s**\n\n- 时间：%s — %s（%s）\n- 地点：%s\n- 日程 ID：`%s`\n\n%s", payload.Event.Subject, payload.Event.Start.DateTime, payload.Event.End.DateTime, payload.Event.Start.TimeZone, valueOrDefault(payload.Event.Location, "未填写"), payload.Event.ID, payload.Event.BodyPreview)
+			appendMCPContentWarning(&builder, payload.ContentWarning)
+			return builder.String()
+		}
+	}
 	if strings.HasSuffix(toolName, "_list_files") {
 		var payload struct {
 			Directory string `json:"directory"`
@@ -242,6 +401,19 @@ func formatMCPResult(toolName, content string) string {
 		}
 	}
 	return "MCP 办公工具返回：\n\n" + content
+}
+
+func appendMCPContentWarning(builder *strings.Builder, warning string) {
+	if warning = strings.TrimSpace(warning); warning != "" {
+		builder.WriteString("\n\n> 安全提示：" + warning)
+	}
+}
+
+func valueOrDefault(value, fallback string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func hasWritingIntent(query string) bool {

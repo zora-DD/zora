@@ -251,7 +251,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		payload, _ := json.Marshal(chat.StreamEvent{Type: "error", Content: userError(err)})
 		_, _ = fmt.Fprintf(w, "event: error\ndata: %s\n\n", payload)
 		flusher.Flush()
-		s.logger.Error("agent run failed", "error", err, "conversation_id", r.PathValue("conversationID"))
+		s.logger.Error("Agent 执行失败", "错误", err, "会话ID", r.PathValue("conversationID"))
 	}
 }
 
@@ -508,7 +508,7 @@ func (s *Server) problem(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	}
 	if status >= 500 {
-		s.logger.Error("request failed", "error", err)
+		s.logger.Error("请求处理失败", "错误", err)
 	}
 	writeJSON(w, status, map[string]any{"error": userError(err)})
 }
@@ -521,12 +521,12 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:")
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				s.logger.Error("panic", "value", recovered, "stack", string(debug.Stack()))
+				s.logger.Error("请求处理发生未恢复异常", "异常", recovered, "调用栈", string(debug.Stack()))
 				if !strings.HasPrefix(r.URL.Path, "/api/conversations/") || !strings.HasSuffix(r.URL.Path, "/messages") {
 					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "服务器内部错误"})
 				}
 			}
-			s.logger.Info("request", "method", r.Method, "path", r.URL.Path, "duration", time.Since(started))
+			s.logger.Info("请求完成", "方法", r.Method, "路径", r.URL.Path, "耗时", time.Since(started))
 		}()
 		next.ServeHTTP(w, r)
 	})

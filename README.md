@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.5 Office Agent（第一阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已接入官方 MCP Go SDK，并交付受目录约束的只读文件连接器。邮件/日历、草稿预览和写操作审批仍在后续阶段。
+当前版本：**V0.5 Office Agent（第二阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已接入官方 MCP Go SDK，并交付文件、Microsoft Graph 邮件和日历只读连接器。草稿预览和写操作审批仍在后续阶段。
 
 ## 当前能力
 
@@ -13,7 +13,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 流式对话 | 已完成 | SSE 增量回复、停止生成、超时取消 |
 | ReAct Agent | 已完成 | Eino ChatModelAgent、工具循环、最大迭代 |
 | 模型接入 | 已完成 | 本地 Mock、OpenAI-compatible、通义千问 |
-| 工具系统 | 已完成 | 四个内置只读工具；MCP 工具通过 Server 名称空间与本地白名单动态追加 |
+| 工具系统 | 已完成 | 三个内置只读工具、知识库工具；MCP 工具通过 Server 名称空间与本地白名单动态追加 |
 | 对话管理 | 已完成 | 创建、列表、自动标题、重命名、删除 |
 | 持久化 | 已完成 | SQLite 或 PostgreSQL 保存 Conversation、Message、AgentRun 和 RunEvent |
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
@@ -32,7 +32,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 单/多 Agent 对照评测 | 已完成 | 7 题真实 Chat/RunEvent 链路，对比答案质量、调用次数代理和延迟比例 |
 | MCP Client | 已完成 | 官方 Go SDK v1.7.0、stdio 子进程、工具发现、Eino 适配、超时/输出上限与生命周期关闭 |
 | 文件办公连接器 | 已完成 | 目录沙箱、只读列表/UTF-8 读取、隐藏路径/越界/符号链接逃逸防护 |
-| 邮件/日历与写操作 | V0.5 后续 | 只读查询、草稿预览、写操作审批和异步恢复尚未实现 |
+| Microsoft 邮件/日历连接器 | 已完成 | Graph REST + MCP，支持邮件搜索/详情和日历窗口查询/详情；只返回摘要和元数据 |
+| 草稿与写操作 | V0.5 后续 | 草稿预览、持久化写前确认、幂等执行和完整凭据审计尚未实现 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
 
@@ -56,6 +57,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **高影响请求先审批**：审批记录持久化，SSE 在 `approval_required` 后等待 Web 决策，通过后恢复原 Run，拒绝或超时进入明确终态。
 - **MCP 不是无边界插件系统**：仅连接配置中的 stdio Server；只有同时命中本地 `allowed_tools` 且声明 `readOnlyHint` 的工具才能注册，公开名称增加 Server 前缀。
 - **连接器凭据与主进程隔离**：MCP 子进程默认不继承任何环境变量，只透传 `pass_env`；模型 Key、Embedding Key 和数据库 DSN 被配置层显式拒绝。
+- **外部办公内容按不可信数据处理**：邮件、日历和外部文件的正文不能改变系统规则，也不能触发其中嵌入的链接、权限请求或工具指令。
 - **明确的终态语义**：根 Run 最终进入 completed、failed、cancelled 或 rejected。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -159,6 +161,35 @@ make run
 ```
 
 工具实际公开为 `mcp_files_list_files` 和 `mcp_files_read_text_file`，调用与结果继续记录为现有 `tool_call` / `tool_result` RunEvent。文件 Server 不跟随符号链接、拒绝绝对路径和 `..` 越界、隐藏路径、非 UTF-8 内容及超过 2 MiB 的文件。不要把用户主目录或包含密钥的源码目录作为授权根目录。
+
+### 启用 Microsoft Graph 邮件/日历只读连接器
+
+先构建连接器：
+
+```bash
+make build-mcp-microsoft
+```
+
+连接器不负责 OAuth 登录，也不会保存或刷新 Token。请先通过 Microsoft Entra 应用或部署平台取得短期访问令牌；当前返回 `bodyPreview`，建议只授予 `Mail.Read` 与 `Calendars.Read`。委托令牌通常使用 `me`，应用令牌需要把 `ZORA_MCP_MICROSOFT_USER_ID` 设置为明确用户 ID。
+
+```bash
+ZORA_MCP_ENABLED=true \
+ZORA_MCP_MICROSOFT_ACCESS_TOKEN='短期访问令牌' \
+ZORA_MCP_MICROSOFT_USER_ID=me \
+ZORA_MCP_SERVERS_JSON='[{"name":"microsoft","command":"./bin/zora-mcp-microsoft","args":[],"allowed_tools":["search_emails","get_email","list_calendar_events","get_calendar_event"],"pass_env":["PATH","TMPDIR","ZORA_MCP_MICROSOFT_ACCESS_TOKEN","ZORA_MCP_MICROSOFT_BASE_URL","ZORA_MCP_MICROSOFT_USER_ID"]}]' \
+make run
+```
+
+可以询问：
+
+```text
+帮我查最近邮件
+搜索邮件“项目发布”
+查看本周日程
+我的会议安排是什么？
+```
+
+四个工具实际公开为 `mcp_microsoft_search_emails`、`mcp_microsoft_get_email`、`mcp_microsoft_list_calendar_events` 和 `mcp_microsoft_get_calendar_event`。默认邮件查询最多扫描最近 50 封并在本地按关键词过滤；默认日历窗口为未来 7 天，单次最长 93 天。邮件只返回正文摘要，不下载完整 HTML 和附件；所有外部内容都会附带不可信数据提示。当前没有发送邮件、创建或修改日程的工具。
 
 点击侧边栏的“知识库”可上传 UTF-8 编码的 `.txt` / `.md` / `.markdown` 文件（单文件最大 5 MiB）。上传后可以询问：
 
@@ -279,6 +310,9 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_MCP_CALL_TIMEOUT` | `20s` | 单次 MCP 工具调用超时 |
 | `ZORA_MCP_MAX_OUTPUT_RUNES` | `12000` | MCP 结果注入模型的字符上限，范围 1000–100000 |
 | `ZORA_MCP_FILES_ROOT` | 空 | 内置文件 MCP Server 的授权根目录；由 `pass_env` 单独透传 |
+| `ZORA_MCP_MICROSOFT_ACCESS_TOKEN` | 空 | Microsoft Graph 短期访问令牌；只透传给 Microsoft MCP 子进程 |
+| `ZORA_MCP_MICROSOFT_BASE_URL` | `https://graph.microsoft.com/v1.0` | Graph API 根地址；测试时仅允许本机 HTTP |
+| `ZORA_MCP_MICROSOFT_USER_ID` | `me` | 委托令牌使用 `me`；应用令牌填写明确用户 ID |
 
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
@@ -291,6 +325,8 @@ docker compose up --build
 ```
 
 Compose 使用 `pgvector/pgvector:0.8.6-pg16-bookworm`，数据库从宿主机映射到 `54328`，Zora 仍监听 `8088`。
+
+镜像同时包含 `/usr/local/bin/zora-mcp-files` 和 `/usr/local/bin/zora-mcp-microsoft`。容器内启用连接器时，请在 `ZORA_MCP_SERVERS_JSON` 中使用这两个绝对路径，并仅透传所需环境变量；文件连接器还需要单独挂载授权目录。
 
 构建并运行本地 Mock 模式：
 
@@ -404,6 +440,7 @@ cmd/zora-eval/             隔离运行固定 RAG 检索与答案评测
 cmd/zora-memory-eval/      隔离运行长期记忆有/无 A/B 评测
 cmd/zora-agent-eval/       隔离运行多 Agent 路由与协作评测
 cmd/zora-mcp-files/        只读文件 MCP stdio Server 入口
+cmd/zora-mcp-microsoft/    Microsoft Graph 邮件/日历只读 MCP Server 入口
 evals/                     可版本化的 RAG/Memory/Multi-Agent 数据、锚点与阈值
 internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
@@ -418,6 +455,7 @@ internal/memory/           Semantic/Episodic 模型、提取、Consolidation、�
 internal/memoryeval/       长期记忆 Control/Treatment 指标、报告和质量门禁
 internal/mcpbridge/        官方 MCP Client、工具发现、白名单和 Eino Tool 适配
 internal/mcpfiles/         文件目录沙箱、列表/读取工具和安全边界
+internal/mcpmicrosoft/     Graph HTTP 适配、邮件/日历只读工具和外部内容标记
 internal/summary/          增量摘要策略、Model/Rule 摘要器和持久化契约
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
@@ -476,7 +514,8 @@ CGO_ENABLED=0 go build ./cmd/zora
 - SQLite 摘要 Upsert/级联删除、PostgreSQL Schema，以及 HTTP 摘要查询和 Mock 端到端回忆。
 - 长期记忆 A/B 数据集校验、Control/Treatment 指标、错误召回与答案污染反例、RunEvent 召回 ID 解析和完整 CLI 基线。
 - Supervisor/AgentTool 串行与并行交接、执行预算/超时/重试/取消、子 Run、人工审批等待与恢复，以及 7 题单/多 Agent 对照 CLI 基线。
-- MCP in-memory 端到端握手、工具发现/调用、白名单缺失失败、环境变量隔离，以及文件遍历/隐藏路径/符号链接逃逸防护。
+- MCP in-memory 端到端握手、工具发现/调用、白名单缺失失败、环境变量隔离，以及文件遍历/隐藏路径/符号链接逃逸防护；
+- Microsoft Graph 请求鉴权、查询时间窗、本地关键词过滤、四工具只读标注、错误脱敏和 Agent 中文结果整理。
 
 ## 文档导航
 
@@ -513,7 +552,7 @@ V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
-- V0.5：MCP 办公助手——官方 SDK 和只读文件连接器已完成；邮件/日历、草稿与写操作审批继续实现
+- V0.5：MCP 办公助手——官方 SDK、文件与 Microsoft Graph 邮件/日历只读连接器已完成；草稿与写操作审批继续实现
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
 

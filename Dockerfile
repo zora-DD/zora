@@ -4,7 +4,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/zora ./cmd/zora
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/zora ./cmd/zora \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/zora-mcp-files ./cmd/zora-mcp-files \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/zora-mcp-microsoft ./cmd/zora-mcp-microsoft
 
 FROM alpine:3.23
 
@@ -16,6 +18,8 @@ RUN apk add --no-cache ca-certificates tzdata \
 
 WORKDIR /app
 COPY --from=build /out/zora /usr/local/bin/zora
+COPY --from=build /out/zora-mcp-files /usr/local/bin/zora-mcp-files
+COPY --from=build /out/zora-mcp-microsoft /usr/local/bin/zora-mcp-microsoft
 
 USER zora
 ENV ZORA_ADDR=:8088 \

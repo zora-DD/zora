@@ -1,4 +1,4 @@
-.PHONY: run run-postgres build-mcp-files postgres-up postgres-down test-postgres eval-rag eval-memory eval-agents test fmt vet check
+.PHONY: run run-postgres build-mcp-files build-mcp-microsoft build-mcp-connectors postgres-up postgres-down test-postgres eval-rag eval-memory eval-agents test fmt vet check
 
 run:
 	go run ./cmd/zora
@@ -11,6 +11,12 @@ run-postgres:
 build-mcp-files:
 	mkdir -p ./bin
 	go build -o ./bin/zora-mcp-files ./cmd/zora-mcp-files
+
+build-mcp-microsoft:
+	mkdir -p ./bin
+	go build -o ./bin/zora-mcp-microsoft ./cmd/zora-mcp-microsoft
+
+build-mcp-connectors: build-mcp-files build-mcp-microsoft
 
 postgres-up:
 	docker compose up -d postgres

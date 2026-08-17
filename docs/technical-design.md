@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.5 Office Agent 第一阶段（官方 MCP Client 与只读文件连接器）
+> 适用版本：V0.5 Office Agent 第二阶段（文件与 Microsoft Graph 只读连接器）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -28,7 +28,8 @@ cmd/
 ├── zora-eval/main.go          固定 RAG 检索与答案评测命令
 ├── zora-memory-eval/main.go   长期记忆 Control/Treatment 评测命令
 ├── zora-agent-eval/main.go    多 Agent 路由与协作评测命令
-└── zora-mcp-files/main.go     只读文件 MCP stdio Server
+├── zora-mcp-files/main.go     只读文件 MCP stdio Server
+└── zora-mcp-microsoft/main.go Microsoft Graph 邮件/日历只读 MCP Server
 
 evals/
 ├── knowledge.json             RAG 语料、问题、事实锚点和阈值
@@ -53,6 +54,7 @@ internal/
 ├── summary/                   会话增量摘要、Model/Rule 摘要器与 Store 契约
 ├── mcpbridge/                 MCP Client、发现/白名单与 Eino Tool 适配
 ├── mcpfiles/                  文件目录沙箱与只读 MCP Tools
+├── mcpmicrosoft/              Graph HTTP、邮件/日历工具和外部内容安全标记
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
 ```
@@ -73,6 +75,8 @@ flowchart TD
     Main --> MCPBridge["mcpbridge"]
     MCPBridge --> MCPServer["MCP stdio Server"]
     MCPServer --> MCPFiles["mcpfiles"]
+    MCPServer --> MCPMicrosoft["mcpmicrosoft"]
+    MCPMicrosoft --> Graph["Microsoft Graph"]
     MemoryEval["cmd/zora-memory-eval"] --> MemoryAB["memoryeval"]
     MemoryEval --> Chat
     MemoryEval --> Memory
@@ -126,16 +130,17 @@ flowchart TD
 2. 根据 `ZORA_STORE_PROVIDER` 打开 SQLite 或 PostgreSQL；
 3. SQLite 启用 WAL/busy timeout；PostgreSQL 初始化连接池、pgvector 类型和幂等迁移；
 4. 构造时间、计算器和项目状态工具；
-5. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder；
-6. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
-7. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
-8. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
-9. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
-10. 创建 Eino Runner；多 Agent 模式包装受控 AgentTool，并开启内部 Agent 事件透传；
-11. 按配置创建 Model/Rule Summarizer 和 Summary Service；
-12. 多 Agent 审批模式不为 off 时创建 Approval Service；
-13. 创建 Chat Service，按开关接入 Memory Capture/Recall、会话摘要和审批，再创建 HTTP Handler；
-14. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
+5. 启用 MCP 时启动白名单中的 stdio Server，握手、发现只读工具并建立生命周期管理；
+6. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder；
+7. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
+8. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
+9. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
+10. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
+11. 创建 Eino Runner；多 Agent 模式包装受控 AgentTool，并开启内部 Agent 事件透传；
+12. 按配置创建 Model/Rule Summarizer 和 Summary Service；
+13. 多 Agent 审批模式不为 off 时创建 Approval Service；
+14. 创建 Chat Service，按开关接入 Memory Capture/Recall、会话摘要和审批，再创建 HTTP Handler；
+15. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
 
@@ -178,10 +183,20 @@ flowchart TD
 | `ZORA_SUMMARY_TRIGGER_MESSAGES` | `20` | 否 | 未摘要消息触发阈值，范围 4–500 |
 | `ZORA_SUMMARY_KEEP_RECENT` | `12` | 否 | 保留原文的最近消息数，至少 2 且小于触发阈值 |
 | `ZORA_SUMMARY_MAX_RUNES` | `4000` | 否 | 摘要 Unicode 字符上限，范围 500–20000 |
+| `ZORA_MCP_ENABLED` | `false` | 否 | 是否连接 `ZORA_MCP_SERVERS_JSON` 中的 MCP stdio Server |
+| `ZORA_MCP_SERVERS_JSON` | 空 | MCP 开启时必填 | Server 名称、命令、参数、工具白名单和环境变量白名单 |
+| `ZORA_MCP_CONNECT_TIMEOUT` | `10s` | 否 | 单个 MCP Server 启动、握手和工具发现超时 |
+| `ZORA_MCP_CALL_TIMEOUT` | `20s` | 否 | 单次 MCP 工具调用超时 |
+| `ZORA_MCP_MAX_OUTPUT_RUNES` | `12000` | 否 | 注入模型的 MCP 结果字符上限 |
+| `ZORA_MCP_FILES_ROOT` | 空 | 文件连接器必填 | 文件 Server 唯一授权根目录 |
+| `ZORA_MCP_MICROSOFT_ACCESS_TOKEN` | 空 | Microsoft 连接器必填 | Graph 短期访问令牌，只透传给连接器子进程 |
+| `ZORA_MCP_MICROSOFT_BASE_URL` | Graph v1.0 | 否 | Graph API 根地址；非测试场景必须 HTTPS |
+| `ZORA_MCP_MICROSOFT_USER_ID` | `me` | 否 | 委托令牌使用 `me`；应用令牌填写明确用户 ID |
 
 配置原则：
 
 - 密钥只通过环境变量传入；
+- MCP 子进程只继承 `pass_env`，配置层禁止透传模型 Key、Embedding Key 和数据库 DSN；
 - 启动时校验 Provider 和 API Key 组合；
 - BaseURL 会移除末尾 `/`，降低路径拼接差异；
 - Mock 模式固定模型名为 `zora-mock`，保证测试结果可解释。
@@ -321,7 +336,7 @@ AgentTool 外层由 `controlledAgentTool` 统一治理。`Runtime.Execute` 为�
 |---|---|---|
 | `zora_supervisor` | 三个 AgentTool | 读取主对话上下文，决定直接回答或交接，最终只输出一次答案 |
 | `research_agent` | `current_time`、`calculator`、`project_status` | 只接收 request，负责核验和分析 |
-| `document_agent` | `knowledge_search`；启用后追加 MCP 文件只读工具 | 只接收 request，负责知识库证据和授权办公文件读取 |
+| `document_agent` | `knowledge_search`；启用后追加 MCP 文件、邮件和日历只读工具 | 只接收 request，负责知识库证据和授权办公数据读取 |
 | `writer_agent` | 无底层工具 | 只使用 request 中的任务和证据，不补造事实 |
 
 复合“根据文档写作”任务采用 `document_agent → writer_agent` 串行交接。Eino 会透传子 Agent 的流式事件；Runtime 只累计根 Agent 的文本为最终回答，子 Agent 文本统一转成单条 `agent_output`。这避免专家草稿和 Supervisor 定稿被重复拼接，同时保留调试证据。
@@ -999,6 +1014,9 @@ DELETE /api/memories/{memoryID}
 - 删除长期记忆时明确由用户确认；来源字段不能通过用户编辑接口伪造。
 - 记忆提取 Prompt 将聊天内容声明为不可信数据；Service 再次拒绝密码、令牌、银行卡和证件标签，并限制候选数。
 - 召回正文作为不可信 JSON 数据注入独立 System Message，限制 6,000 字符；审计和 SSE 只暴露 ID/计数/分数，不复制正文。
+- MCP Server 必须同时通过部署白名单和 `readOnlyHint` 门禁；子进程只继承显式 `pass_env`，主模型 Key、Embedding Key 和数据库 DSN 禁止透传。
+- Graph Token 不落库、不写日志、不进入 ToolResult；邮件/日历只返回元数据和正文摘要，不下载 HTML 或附件。
+- 系统 Prompt 与 Graph ToolResult 都把外部内容标为不可信数据，明确禁止执行其中的工具指令、链接或权限请求。
 
 ### 上线前必须补充
 
@@ -1031,11 +1049,12 @@ DELETE /api/memories/{memoryID}
 | 层级 | 当前覆盖 |
 |---|---|
 | 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分、弱相关硬负例和人工修正保护；会话摘要阈值、窗口、序号间隔、JSON 解析、敏感信息过滤和安全注入 |
-| Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta；Supervisor 单专家和 Document→Writer 串行协作；专家输出与最终回答隔离 |
+| Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta；Supervisor 单专家和 Document→Writer 串行协作；MCP 文件/邮件意图路由和中文结果整理；专家输出与最终回答隔离 |
 | Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD；ConversationSummary Upsert、消息范围、级联删除和 PostgreSQL Schema |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
 | Memory A/B 测试 | 严格数据集校验；Control/Treatment 事实覆盖；意外召回与答案污染反例；RunEvent 召回 ID 解析；完整 CLI 基线 |
 | Multi-Agent 评测测试 | 严格数据集校验；路由序列、意外专家和答案完成指标；协作事件闭环；完整 Chat/RunEvent CLI 基线 |
+| MCP/Graph 测试 | in-memory MCP 握手、只读标注、白名单和环境隔离；纯内存 HTTP 验证 Graph Bearer Token、查询窗口、关键词过滤、错误脱敏和不可信内容警告 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
 | HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404、自动提取/召回，以及摘要触发、查询和 Mock 上下文作答 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
@@ -1073,7 +1092,7 @@ make run-postgres
 
 ### Docker
 
-Dockerfile 使用 Go 构建阶段产出静态二进制，最终镜像只包含 Alpine、CA 证书、时区数据和 Zora。容器以非 root 用户运行，`/app/data` 为持久卷。
+Dockerfile 使用 Go 构建阶段产出 Zora、文件 MCP 和 Microsoft MCP 三个静态二进制；最终镜像只包含 Alpine、CA 证书、时区数据和这些二进制。容器以非 root 用户运行，`/app/data` 为持久卷。
 
 生产部署注意：
 
@@ -1120,7 +1139,7 @@ flowchart LR
 
 ### 17.4 V0.5 Office Agent
 
-第一阶段已用官方 MCP Go SDK v1.7.0 打通一条可运行链路：
+第二阶段已用官方 MCP Go SDK v1.7.0 打通文件和 Microsoft Graph 两类只读链路：
 
 ```mermaid
 sequenceDiagram
@@ -1148,9 +1167,24 @@ sequenceDiagram
 
 内置 `zora-mcp-files` 提供 `list_files` 和 `read_text_file`。Server 启动时将授权根目录绝对化并解析符号链接；每次访问再次执行 `Clean → Join → EvalSymlinks → Rel`，拒绝绝对路径、父目录越界、隐藏路径和指向根目录外的链接。列表最多 500 项且不跟随符号链接；读取仅接受普通 UTF-8 文件，单文件最大 2 MiB，返回字符最多 50,000。根目录属于部署权限边界，推荐只挂载专门的办公资料目录。
 
-当前调用继续复用已有 `tool_call` / `tool_result` RunEvent，因此无需新增 MCP 专属数据库表。`GET /api/info` 只公开 `mcp_enabled`、`mcp_tool_count` 和总工具数，不返回命令、参数、根目录或环境变量。in-memory MCP 端到端测试覆盖握手、发现、Schema 适配和调用；文件测试覆盖隐藏路径、`..` 与符号链接逃逸。
+内置 `zora-mcp-microsoft` 提供四个工具：
 
-后续仍需接入邮件和日历的只读 OAuth 连接器，再设计“先生成不可执行草稿 → 用户确认 → 持久化异步任务 → 幂等写入”的状态机。当前多 Agent 的通用审批门禁不能直接视为办公写操作已安全落地。
+接口路径、`$select`/`$top` 和时间窗参数遵循 Microsoft Graph 官方的[邮件列表接口](https://learn.microsoft.com/zh-cn/graph/api/user-list-messages?view=graph-rest-1.0)与[日历视图接口](https://learn.microsoft.com/zh-cn/graph/api/calendar-list-calendarview?view=graph-rest-1.0)。
+
+| 工具 | Graph 请求 | 输出边界 |
+|---|---|---|
+| `search_emails` | `GET /me/messages` 或 `/users/{id}/messages` | 最近邮件的主题、发件人、时间、正文摘要、已读/附件标记；最多返回 50 条 |
+| `get_email` | `GET /me/messages/{id}` | 单封邮件元数据、收件人和正文摘要；不返回完整 HTML/附件 |
+| `list_calendar_events` | `GET /me/calendar/calendarView` | 指定时间窗内日程；默认未来 7 天，最长 93 天 |
+| `get_calendar_event` | `GET /me/events/{id}` | 单个日程的时间、地点、组织者、参与者和正文摘要 |
+
+Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，响应最多读取 2 MiB。用户输入的 ID 会执行长度/换行校验并按路径转义；查询上限固定，关键词在有限返回集内本地大小写不敏感过滤。Graph 非 2xx 响应会提取错误码和最多 300 字符消息并转为中文错误，任何错误都不会包含访问令牌。
+
+连接器不实现 OAuth 登录与刷新：部署平台负责取得短期令牌，并通过 `pass_env` 只注入 Microsoft 子进程。当前读取正文摘要，建议使用 `Mail.Read` 和 `Calendars.Read`；委托令牌访问 `/me`，应用令牌必须配置明确的 User ID。工具输出含 `content_warning`，系统 Prompt 也把邮件、日历和外部文件声明为不可信数据。
+
+当前调用继续复用已有 `tool_call` / `tool_result` RunEvent，因此无需新增 MCP 专属数据库表。`GET /api/info` 只公开 `mcp_enabled`、`mcp_tool_count` 和总工具数，不返回命令、参数、根目录或环境变量。in-memory MCP 端到端测试覆盖握手、发现、Schema 适配和调用；文件测试覆盖隐藏路径、`..` 与符号链接逃逸；Graph 使用纯内存 HTTP Transport 验证鉴权、查询、四工具只读标注与错误脱敏。由于当前开发环境没有 Microsoft 租户凭据，真实账号集成验收仍待专用测试租户完成。
+
+后续需要设计“先生成不可执行草稿 → 用户确认 → 持久化异步任务 → 幂等写入”的状态机，并补齐 OAuth 登录/刷新、Secret 托管和真实租户集成测试。当前多 Agent 的通用审批门禁不能直接视为办公写操作已安全落地。
 
 ## 18. 维护约定
 

@@ -40,7 +40,7 @@ type applicationStore interface {
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	if err := run(logger); err != nil {
-		logger.Error("zora stopped", "error", err)
+		logger.Error("Zora 已停止", "错误", err)
 		os.Exit(1)
 	}
 }
@@ -129,7 +129,7 @@ func run(logger *slog.Logger) error {
 	}
 	var runtime *agentruntime.Runtime
 	if cfg.MultiAgentEnabled {
-		// Supervisor 只看得到三个专业 Agent；MCP 文件工具归 Document，不向 Research 扩权。
+		// Supervisor 只看得到三个专业 Agent；文件、邮件、日历等 MCP 只读工具归 Document，不向 Research 扩权。
 		runtime, err = agentruntime.NewMultiAgentWithModel(context.Background(), cfg, agentruntime.SpecialistToolset{
 			Research: registeredTools,
 			Document: append([]tool.BaseTool{knowledgeTool}, mcpTools...),
@@ -201,12 +201,12 @@ func run(logger *slog.Logger) error {
 	serveErrors := make(chan error, 1)
 	// HTTP 服务放入 goroutine，主 goroutine 同时监听系统信号和异常退出。
 	go func() {
-		logger.Info("zora is ready", "addr", cfg.Addr, "store", cfg.StoreProvider,
-			"provider", cfg.Provider, "model", cfg.Model,
-			"embedding_provider", cfg.EmbeddingProvider, "embedding_model", embedder.Name(),
-			"memory_auto_capture", cfg.MemoryAutoCapture, "memory_recall", cfg.MemoryRecallEnabled,
-			"conversation_summary", cfg.SummaryEnabled, "multi_agent", cfg.MultiAgentEnabled,
-			"mcp_enabled", cfg.MCPEnabled, "mcp_tools", mcpToolCount)
+		logger.Info("Zora 已就绪", "监听地址", cfg.Addr, "存储", cfg.StoreProvider,
+			"模型提供方", cfg.Provider, "模型", cfg.Model,
+			"向量提供方", cfg.EmbeddingProvider, "向量模型", embedder.Name(),
+			"自动记忆", cfg.MemoryAutoCapture, "记忆召回", cfg.MemoryRecallEnabled,
+			"会话摘要", cfg.SummaryEnabled, "多Agent", cfg.MultiAgentEnabled,
+			"MCP已启用", cfg.MCPEnabled, "MCP工具数", mcpToolCount)
 		serveErrors <- server.ListenAndServe()
 	}()
 
@@ -214,7 +214,7 @@ func run(logger *slog.Logger) error {
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case sig := <-signals:
-		logger.Info("shutting down", "signal", sig.String())
+		logger.Info("正在关闭服务", "信号", sig.String())
 	case err := <-serveErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
 			return err

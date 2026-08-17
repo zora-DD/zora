@@ -4,7 +4,7 @@
 
 ## 1. 边界
 
-Zora 将系统划分为十三个边界：
+Zora 将系统划分为十四个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
@@ -19,6 +19,7 @@ Zora 将系统划分为十三个边界：
 11. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
 12. `mcpbridge`：官方 MCP Client、stdio 生命周期、工具发现/白名单和 Eino 适配。
 13. `mcpfiles`：独立文件连接器的授权目录、路径校验和只读工具实现。
+14. `mcpmicrosoft`：独立 Microsoft Graph 连接器的 Token 边界、邮件/日历只读查询和外部内容安全标记。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -166,7 +167,7 @@ SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_
 ```text
 Supervisor
 ├── Research Agent  → current_time / calculator / project_status
-├── Document Agent  → knowledge_search / MCP 文件只读工具（启用时）
+├── Document Agent  → knowledge_search / MCP 文件、邮件、日历只读工具（启用时）
 └── Writer Agent    → 无底层工具，只消费任务与证据
 ```
 
@@ -191,19 +192,24 @@ Web 将交接事件显示为带 `child_run_id` 的专业 Agent Trace，并显示
 
 ## 9. V0.5 MCP 办公连接器架构
 
-第一阶段只实现可验证的文件读取闭环：
+第二阶段已形成文件与 Microsoft Graph 两类只读连接器：
 
 ```text
 Zora 主进程
 └── mcpbridge.Manager
     └── CommandTransport（独立最小环境）
-        └── zora-mcp-files 子进程
-            ├── list_files
-            └── read_text_file
+        ├── zora-mcp-files 子进程
+        │   ├── list_files
+        │   └── read_text_file
+        └── zora-mcp-microsoft 子进程
+            ├── search_emails / get_email
+            └── list_calendar_events / get_calendar_event
 ```
 
 启动时，`mcpbridge` 按配置逐个启动 stdio Server，执行 MCP 握手和分页工具发现。一个工具必须同时出现在部署者提供的 `allowed_tools` 中，并由 Server 声明 `readOnlyHint=true`；之后才会以 `mcp_{server}_{tool}` 名称进入 Eino。主进程不经过 Shell，子进程也不默认继承环境；模型 Key、Embedding Key 与数据库 DSN 不能透传。
 
 文件连接器在独立进程中固定授权根目录，每次请求重新解析实际路径。绝对路径、父目录逃逸、隐藏路径和逃逸符号链接都会被拒绝；只读取普通 UTF-8 文本。MCP ToolCall 仍通过既有 Runtime，因此无需旁路即可得到 SSE Trace 和持久化 RunEvent。
 
-邮件和日历将各自作为独立 MCP Server，使用各自最小 OAuth Scope。未来写操作不能直接复用只读适配器：必须先生成草稿并持久化参数摘要，再经人工决定和幂等任务执行，避免“模型产生 ToolCall”直接等于外部副作用。
+Microsoft 连接器使用 Graph REST 统一查询邮件和日历。OAuth 登录、刷新和 Secret 保存不进入连接器：部署平台只向子进程注入短期 Token，委托访问使用 `me`，应用访问必须指定用户 ID。四个工具仅返回元数据和正文摘要，不下载邮件附件；默认日历窗口为 7 天、最长 93 天。外部内容始终附带不可信数据提示，系统 Prompt 也要求忽略其中的工具指令、链接和权限请求。
+
+未来写操作不能直接复用只读适配器：必须先生成草稿并持久化参数摘要，再经人工决定和幂等任务执行，避免“模型产生 ToolCall”直接等于外部副作用。
