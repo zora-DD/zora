@@ -15,6 +15,7 @@ const (
 	RunCompleted = "completed"
 	RunFailed    = "failed"
 	RunCancelled = "cancelled"
+	RunRejected  = "rejected"
 )
 
 // Conversation is a durable chat thread.
@@ -49,6 +50,22 @@ type AgentRun struct {
 	Error              string     `json:"error,omitempty"`
 	StartedAt          time.Time  `json:"started_at"`
 	CompletedAt        *time.Time `json:"completed_at,omitempty"`
+}
+
+// AgentTaskRun 记录根 Run 下的一次专业 Agent 交接。
+// 它和 RunEvent 分开存储：前者提供当前状态和耗时查询，后者保留不可变事件时间线。
+type AgentTaskRun struct {
+	ID            string     `json:"id"`
+	ParentRunID   string     `json:"parent_run_id"`
+	AgentName     string     `json:"agent_name"`
+	ToolCallID    string     `json:"tool_call_id"`
+	Task          string     `json:"task"`
+	Status        string     `json:"status"`
+	Attempt       int        `json:"attempt"`
+	OutputPreview string     `json:"output_preview,omitempty"`
+	Error         string     `json:"error,omitempty"`
+	StartedAt     time.Time  `json:"started_at"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`
 }
 
 // RunEvent is an append-only audit event produced while an agent runs.

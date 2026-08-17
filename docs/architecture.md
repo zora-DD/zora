@@ -157,7 +157,7 @@ SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_
 
 `make eval-memory` 在隔离数据库中让每个问题分别走关闭/开启召回的完整 Chat 链路，并从 RunEvent 核验实际注入 ID。默认基线覆盖三个正向问题和两个负例，门禁预期召回、错误召回、事实覆盖增益和答案污染；当前全部通过。后续先扩充真实模型样本，再用同一门禁决定是否增加 Memory 向量检索。
 
-## 8. V0.4 多 Agent 第一阶段架构
+## 8. V0.4 多 Agent 架构
 
 当前多 Agent 由 `ZORA_MULTI_AGENT_ENABLED=true` 显式开启：
 
@@ -174,12 +174,15 @@ Supervisor
 
 ```text
 agent_handoff_started(target, request)
+  → 创建 AgentTaskRun(child_run_id)
   → 子 Agent tool_call/tool_result
   → agent_output(agent, deliverable)
   → agent_handoff_completed(target, result)
   → Supervisor 最终 delta
 ```
 
-Web 将交接事件显示为专业 Agent Trace；Chat 把非 delta 事件写入同一个顶层 Run。`make eval-agents` 在隔离 SQLite 中完整经过 Chat、Eino AgentTool 和 RunEvent，当前 6 题得到路由准确率 1、意外专家调用率 0、答案完成率 1。
+每个根 Run 都会创建独立执行状态：最多交接次数、最大并行度、专业 Agent 独立超时和有限重试。Eino ToolNode 会并行执行同一轮的多个独立 AgentTool；Document → Writer 这类依赖链仍串行。Context 取消会停止排队和执行中的子任务，未完成的 `agent_task_runs` 补写 failed/cancelled 终态。
 
-仍未实现父子 AgentRun、独立子任务预算/超时/重试、并行执行、审批和单/多 Agent 收益对照，因此当前只是 V0.4 第一阶段。
+高影响请求可由 `off/risky/all` 策略触发 `approval_requests`。Chat 发出 `approval_required` 后等待 Web 通过独立 HTTP API 提交决定；approved 恢复同一 SSE，rejected/expired 结束根 Run。当前等待通道在进程内，审批记录本身在 SQLite/PostgreSQL 持久化。
+
+Web 将交接事件显示为带 `child_run_id` 的专业 Agent Trace，并显示审批卡片。`make eval-agents` 在隔离 SQLite 中完整经过 Chat、Eino AgentTool 和 RunEvent，当前 7 题得到路由准确率 1、意外专家调用率 0、答案完成率 1；单 Agent Control 质量 0.785714，多 Agent Treatment 质量 1，质量增益 0.214286，调用次数代理比 2。真实模型仍需采集 Token Usage 并扩充业务样本。

@@ -27,6 +27,9 @@ type Store interface {
 
 	CreateRun(ctx context.Context, run domain.AgentRun) error
 	FinishRun(ctx context.Context, id, status, assistantMessageID, errorMessage string, completedAt time.Time) error
+	CreateAgentTaskRun(ctx context.Context, run domain.AgentTaskRun) error
+	FinishAgentTaskRun(ctx context.Context, id, status, outputPreview, errorMessage string, completedAt time.Time) error
+	ListAgentTaskRuns(ctx context.Context, parentRunID string) ([]domain.AgentTaskRun, error)
 	AppendRunEvent(ctx context.Context, event domain.RunEvent) (domain.RunEvent, error)
 	ListRunEvents(ctx context.Context, runID string) ([]domain.RunEvent, error)
 }

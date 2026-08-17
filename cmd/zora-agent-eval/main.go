@@ -110,18 +110,30 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	agentRuntime, err := agentruntime.NewMultiAgentWithModel(ctx, cfg, agentruntime.SpecialistToolset{
+	multiRuntime, err := agentruntime.NewMultiAgentWithModel(ctx, cfg, agentruntime.SpecialistToolset{
 		Research: researchTools,
 		Document: []tool.BaseTool{knowledgeTool},
 	}, chatModel)
 	if err != nil {
 		return err
 	}
-	answerer := chatAnswerer{service: chat.NewService(database, agentRuntime)}
-	report, err := agentseval.Evaluate(ctx, answerer, dataset)
+	allTools := append(append([]tool.BaseTool{}, researchTools...), knowledgeTool)
+	singleRuntime, err := agentruntime.NewWithModel(ctx, cfg, allTools, chatModel)
 	if err != nil {
 		return err
 	}
+	multiAnswerer := chatAnswerer{service: chat.NewService(database, multiRuntime), title: "多 Agent 评测"}
+	singleAnswerer := chatAnswerer{service: chat.NewService(database, singleRuntime), title: "单 Agent 对照评测"}
+	report, err := agentseval.Evaluate(ctx, multiAnswerer, dataset)
+	if err != nil {
+		return err
+	}
+	comparison, err := agentseval.EvaluateComparison(ctx, singleAnswerer, multiAnswerer, dataset)
+	if err != nil {
+		return err
+	}
+	report.Comparison = &comparison
+	report.Passed = report.Passed && comparison.Passed
 	report.Provider = cfg.Provider
 	report.Model = cfg.Model
 	encoder := json.NewEncoder(output)
@@ -135,10 +147,13 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	return nil
 }
 
-type chatAnswerer struct{ service *chat.Service }
+type chatAnswerer struct {
+	service *chat.Service
+	title   string
+}
 
 func (a chatAnswerer) Answer(ctx context.Context, question string) (agentseval.GeneratedAnswer, error) {
-	conversation, err := a.service.CreateConversation(ctx, "多 Agent 路由评测")
+	conversation, err := a.service.CreateConversation(ctx, a.title)
 	if err != nil {
 		return agentseval.GeneratedAnswer{}, err
 	}

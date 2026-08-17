@@ -81,6 +81,115 @@ func Evaluate(ctx context.Context, answerer Answerer, dataset Dataset) (Report, 
 	return report, nil
 }
 
+// EvaluateComparison 对同一数据集运行单 Agent Control 与多 Agent Treatment。
+// invocations 使用“根 Agent + 专业 Agent 交接数”作为稳定的成本代理；真实 Token 成本仍需线上采集。
+func EvaluateComparison(ctx context.Context, control, treatment Answerer, dataset Dataset) (ComparisonReport, error) {
+	if control == nil || treatment == nil {
+		return ComparisonReport{}, fmt.Errorf("单 Agent 和多 Agent 评测答案生成器不能为空")
+	}
+	if err := dataset.Validate(); err != nil {
+		return ComparisonReport{}, err
+	}
+	maximumLatencyRatio := dataset.MaximumLatencyRatio
+	if maximumLatencyRatio == 0 {
+		maximumLatencyRatio = 100
+	}
+	maximumInvocationRatio := dataset.MaximumInvocationRatio
+	if maximumInvocationRatio == 0 {
+		maximumInvocationRatio = 10
+	}
+	report := ComparisonReport{
+		ControlName: "single-agent", TreatmentName: "multi-agent",
+		Thresholds: ComparisonThresholds{
+			MinimumQualityGain:     dataset.MinimumQualityGain,
+			MaximumLatencyRatio:    maximumLatencyRatio,
+			MaximumInvocationRatio: maximumInvocationRatio,
+		},
+		Cases: make([]ComparisonCaseResult, 0, len(dataset.Cases)),
+	}
+	var controlQuality, treatmentQuality float64
+	var controlLatency, treatmentLatency float64
+	var controlInvocations, treatmentInvocations int
+	for _, item := range dataset.Cases {
+		if err := ctx.Err(); err != nil {
+			return ComparisonReport{}, err
+		}
+		controlStart := time.Now()
+		controlAnswer, err := control.Answer(ctx, item.Question)
+		controlCaseLatency := float64(time.Since(controlStart).Microseconds()) / 1000
+		if err != nil {
+			return ComparisonReport{}, fmt.Errorf("Control 问题 %s 执行失败：%w", item.ID, err)
+		}
+		treatmentStart := time.Now()
+		treatmentAnswer, err := treatment.Answer(ctx, item.Question)
+		treatmentCaseLatency := float64(time.Since(treatmentStart).Microseconds()) / 1000
+		if err != nil {
+			return ComparisonReport{}, fmt.Errorf("Treatment 问题 %s 执行失败：%w", item.ID, err)
+		}
+		controlCaseQuality := answerQuality(controlAnswer.Content, item.ExpectedAnswerContains)
+		treatmentCaseQuality := answerQuality(treatmentAnswer.Content, item.ExpectedAnswerContains)
+		controlCaseInvocations := 1 + len(controlAnswer.Handoffs)
+		treatmentCaseInvocations := 1 + len(treatmentAnswer.Handoffs)
+		controlQuality += controlCaseQuality
+		treatmentQuality += treatmentCaseQuality
+		controlLatency += controlCaseLatency
+		treatmentLatency += treatmentCaseLatency
+		controlInvocations += controlCaseInvocations
+		treatmentInvocations += treatmentCaseInvocations
+		report.Cases = append(report.Cases, ComparisonCaseResult{
+			ID: item.ID, ControlQuality: controlCaseQuality, TreatmentQuality: treatmentCaseQuality,
+			ControlLatencyMS: round(controlCaseLatency), TreatmentLatencyMS: round(treatmentCaseLatency),
+			ControlInvocations: controlCaseInvocations, TreatmentInvocations: treatmentCaseInvocations,
+		})
+	}
+	caseCount := float64(len(dataset.Cases))
+	controlAverageQuality := controlQuality / caseCount
+	treatmentAverageQuality := treatmentQuality / caseCount
+	controlAverageLatency := controlLatency / caseCount
+	treatmentAverageLatency := treatmentLatency / caseCount
+	controlAverageInvocations := float64(controlInvocations) / caseCount
+	treatmentAverageInvocations := float64(treatmentInvocations) / caseCount
+	report.Metrics = ComparisonMetrics{
+		ControlQuality: round(controlAverageQuality), TreatmentQuality: round(treatmentAverageQuality),
+		QualityGain:             round(treatmentAverageQuality - controlAverageQuality),
+		ControlAverageLatencyMS: round(controlAverageLatency), TreatmentAverageLatencyMS: round(treatmentAverageLatency),
+		LatencyRatio:              safeRatio(treatmentAverageLatency, controlAverageLatency),
+		ControlAverageInvocations: round(controlAverageInvocations), TreatmentAverageInvocations: round(treatmentAverageInvocations),
+		InvocationRatio: safeRatio(treatmentAverageInvocations, controlAverageInvocations),
+	}
+	report.Passed = report.Metrics.QualityGain >= dataset.MinimumQualityGain &&
+		report.Metrics.LatencyRatio <= maximumLatencyRatio &&
+		report.Metrics.InvocationRatio <= maximumInvocationRatio
+	return report, nil
+}
+
+func answerQuality(content string, anchors []string) float64 {
+	if len(anchors) == 0 {
+		if strings.TrimSpace(content) == "" {
+			return 0
+		}
+		return 1
+	}
+	matched := 0
+	for _, anchor := range anchors {
+		if strings.Contains(content, anchor) {
+			matched++
+		}
+	}
+	return ratio(matched, len(anchors))
+}
+
+func safeRatio(numerator, denominator float64) float64 {
+	if denominator <= 0 {
+		if numerator <= 0 {
+			return 1
+		}
+		// JSON 不支持 Inf；使用足够大的有限值表达“基线为零而实验组非零”。
+		return 1_000_000_000
+	}
+	return round(numerator / denominator)
+}
+
 func ratio(numerator, denominator int) float64 {
 	if denominator == 0 {
 		return 0

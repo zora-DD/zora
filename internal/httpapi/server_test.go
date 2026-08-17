@@ -17,10 +17,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudwego/eino/components/tool"
+
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/agenttools"
+	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
+	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store/sqlite"
@@ -93,6 +97,104 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		if strings.HasPrefix(line, "data: ") && !json.Valid([]byte(strings.TrimPrefix(line, "data: "))) {
 			t.Fatalf("invalid SSE JSON: %s", line)
 		}
+	}
+}
+
+func TestMultiAgentApprovalResumesSSEAndPersistsChildRun(t *testing.T) {
+	database, err := sqlite.Open(filepath.Join(t.TempDir(), "approval-api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	researchTools, err := agenttools.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	knowledgeService := newTestKnowledgeService(t, database)
+	knowledgeTool, err := knowledge.NewSearchTool(knowledgeService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Provider: "mock", Model: "zora-mock", Instruction: "请使用中文回答。",
+		RequestTimeout: 3 * time.Second, MaxIterations: 8,
+		MultiAgentMaxHandoffs: 4, MultiAgentMaxParallel: 2,
+		MultiAgentSpecialistTimeout: time.Second,
+	}
+	chatModel, err := agentruntime.NewChatModel(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := agentruntime.NewMultiAgentWithModel(context.Background(), cfg, agentruntime.SpecialistToolset{
+		Research: researchTools, Document: []tool.BaseTool{knowledgeTool},
+	}, chatModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvalService, err := approval.NewService(database, approval.Options{Mode: approval.ModeRisky, Timeout: 2 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatService := chat.NewService(database, runtime, chat.WithApprovalGate(approvalService))
+	memoryService := newTestMemoryService(t, database)
+	handler, err := New(chatService, knowledgeService, memoryService,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second,
+		WithApprovalService(approvalService))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := chatService.CreateConversation(context.Background(), "审批测试")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversation.ID+"/messages",
+		strings.NewReader(`{"content":"请写一份发布通知并发送给团队"}`))
+	request.Header.Set("Content-Type", "application/json")
+	stream := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(stream, request)
+		close(done)
+	}()
+
+	var pending approval.Approval
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		items, listErr := approvalService.List(context.Background(), approval.StatusPending, 10)
+		if listErr != nil {
+			t.Fatal(listErr)
+		}
+		if len(items) > 0 {
+			pending = items[0]
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if pending.ID == "" {
+		t.Fatal("未观察到待审批记录")
+	}
+	decision := httptest.NewRequest(http.MethodPost, "/api/approvals/"+pending.ID+"/decision",
+		strings.NewReader(`{"decision":"approved","reason":"测试批准"}`))
+	decision.Header.Set("Content-Type", "application/json")
+	decided := httptest.NewRecorder()
+	handler.ServeHTTP(decided, decision)
+	if decided.Code != http.StatusOK || !strings.Contains(decided.Body.String(), `"status":"approved"`) {
+		t.Fatalf("decision status = %d, body = %s", decided.Code, decided.Body.String())
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("审批通过后原 SSE 未恢复")
+	}
+	if body := stream.Body.String(); !strings.Contains(body, "event: approval_required") ||
+		!strings.Contains(body, "event: approval_approved") || !strings.Contains(body, "event: agent_handoff_started") ||
+		!strings.Contains(body, `"child_run_id":"task_`) || !strings.Contains(body, "event: done") {
+		t.Fatalf("unexpected approval SSE:\n%s", body)
+	}
+	runs, err := chatService.ListAgentTaskRuns(context.Background(), pending.RunID)
+	if err != nil || len(runs) != 1 || runs[0].Status != domain.RunCompleted {
+		t.Fatalf("child runs = %+v, %v", runs, err)
 	}
 }
 

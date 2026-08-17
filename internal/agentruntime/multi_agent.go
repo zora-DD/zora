@@ -62,10 +62,17 @@ func NewMultiAgentWithModel(ctx context.Context, cfg config.Config, tools Specia
 	}
 
 	// AgentTool 默认只传递结构化 request，不共享主会话全部历史，实现最小上下文隔离。
-	specialistTools := []tool.BaseTool{
+	specialistTools := make([]tool.BaseTool, 0, 3)
+	for _, base := range []tool.BaseTool{
 		adk.NewAgentTool(ctx, research),
 		adk.NewAgentTool(ctx, document),
 		adk.NewAgentTool(ctx, writer),
+	} {
+		controlled, wrapErr := newControlledAgentTool(ctx, base)
+		if wrapErr != nil {
+			return nil, wrapErr
+		}
+		specialistTools = append(specialistTools, controlled)
 	}
 	supervisor, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
 		Name:        SupervisorAgentName,
@@ -79,6 +86,7 @@ func NewMultiAgentWithModel(ctx context.Context, cfg config.Config, tools Specia
 - writer_agent：起草、改写、润色和总结。
 你不能直接调用 knowledge_search 等底层工具；需要私有资料时必须调用 document_agent。
 “根据上传文档写作”应先调用 document_agent 获取证据，再把任务和证据交给 writer_agent。
+彼此独立的子任务应在同一轮同时调用多个专业 Agent；存在证据依赖的任务必须串行交接。
 不得编造专家执行结果；最终只向用户输出一次汇总后的中文答案。`,
 		Model:         chatModel,
 		MaxIterations: cfg.MaxIterations,

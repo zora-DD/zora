@@ -41,6 +41,37 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 CREATE INDEX IF NOT EXISTS idx_runs_conversation_started
     ON agent_runs(conversation_id, started_at);
 
+CREATE TABLE IF NOT EXISTS agent_task_runs (
+    id TEXT PRIMARY KEY,
+    parent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    agent_name TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt > 0),
+    output_preview TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    UNIQUE(parent_run_id, tool_call_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_task_runs_parent_started
+    ON agent_task_runs(parent_run_id, started_at);
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+    trigger_reason TEXT NOT NULL,
+    decision_reason TEXT NOT NULL DEFAULT '',
+    requested_at TIMESTAMPTZ NOT NULL,
+    decided_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_approval_requests_status_requested
+    ON approval_requests(status, requested_at DESC);
+
 CREATE TABLE IF NOT EXISTS run_events (
     sequence BIGSERIAL PRIMARY KEY,
     id TEXT NOT NULL UNIQUE,
@@ -130,4 +161,5 @@ INSERT INTO zora_schema_versions(version) VALUES (1) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (2) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (3) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (4) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (5) ON CONFLICT DO NOTHING;
 `

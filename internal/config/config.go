@@ -17,19 +17,25 @@ const defaultInstruction = `你是 Zora，一个可靠、简洁的中文 AI 助�
 
 // Config 汇总服务启动所需的全部配置，避免业务代码直接读取环境变量。
 type Config struct {
-	Addr              string        // HTTP 监听地址，例如 :8088。
-	DataDir           string        // SQLite 等本地持久化文件的根目录。
-	StoreProvider     string        // sqlite 或 postgres；默认 sqlite 保持零依赖体验。
-	PostgresDSN       string        // PostgreSQL 连接串，只允许通过环境变量注入。
-	PostgresMaxConns  int           // PostgreSQL 连接池最大连接数。
-	Provider          string        // mock 或 openai；openai 兼容通义千问等接口。
-	Model             string        // 发送给模型服务的模型名称。
-	APIKey            string        // 仅从环境变量读取，禁止写入仓库。
-	BaseURL           string        // OpenAI-compatible API 地址；留空时使用适配器默认值。
-	Instruction       string        // Agent 的系统指令。
-	RequestTimeout    time.Duration // 单次模型请求和整条消息链路的超时上限。
-	MaxIterations     int           // ReAct 最大循环次数，防止模型无限调用工具。
-	MultiAgentEnabled bool          // 是否启用 Supervisor + 专业 Agent；默认关闭以控制模型成本。
+	Addr                        string        // HTTP 监听地址，例如 :8088。
+	DataDir                     string        // SQLite 等本地持久化文件的根目录。
+	StoreProvider               string        // sqlite 或 postgres；默认 sqlite 保持零依赖体验。
+	PostgresDSN                 string        // PostgreSQL 连接串，只允许通过环境变量注入。
+	PostgresMaxConns            int           // PostgreSQL 连接池最大连接数。
+	Provider                    string        // mock 或 openai；openai 兼容通义千问等接口。
+	Model                       string        // 发送给模型服务的模型名称。
+	APIKey                      string        // 仅从环境变量读取，禁止写入仓库。
+	BaseURL                     string        // OpenAI-compatible API 地址；留空时使用适配器默认值。
+	Instruction                 string        // Agent 的系统指令。
+	RequestTimeout              time.Duration // 单次模型请求和整条消息链路的超时上限。
+	MaxIterations               int           // ReAct 最大循环次数，防止模型无限调用工具。
+	MultiAgentEnabled           bool          // 是否启用 Supervisor + 专业 Agent；默认关闭以控制模型成本。
+	MultiAgentMaxHandoffs       int           // 单轮最多允许的专业 Agent 交接次数，避免失控循环。
+	MultiAgentMaxParallel       int           // 单轮专业 Agent 的最大并行数，限制瞬时模型请求压力。
+	MultiAgentSpecialistTimeout time.Duration // 每次专业 Agent 调用的独立超时时间。
+	MultiAgentRetryCount        int           // 专业 Agent 失败后的最大重试次数，不包含首次执行。
+	MultiAgentApprovalMode      string        // off、risky 或 all；控制人工审批触发范围。
+	MultiAgentApprovalTimeout   time.Duration // 等待人工审批的最长时间。
 
 	EmbeddingProvider   string // hash 用于本地开发，openai 用于真实语义向量。
 	EmbeddingModel      string // Embedding 模型名，如 text-embedding-v4。
@@ -71,6 +77,30 @@ func Load() (Config, error) {
 	multiAgentEnabled, err := strconv.ParseBool(env("ZORA_MULTI_AGENT_ENABLED", "false"))
 	if err != nil {
 		return Config{}, fmt.Errorf("ZORA_MULTI_AGENT_ENABLED 必须是 true 或 false")
+	}
+	multiAgentMaxHandoffs, err := positiveInt("ZORA_MULTI_AGENT_MAX_HANDOFFS", "6")
+	if err != nil || multiAgentMaxHandoffs > 20 {
+		return Config{}, fmt.Errorf("ZORA_MULTI_AGENT_MAX_HANDOFFS 必须在 1 到 20 之间")
+	}
+	multiAgentMaxParallel, err := positiveInt("ZORA_MULTI_AGENT_MAX_PARALLEL", "3")
+	if err != nil || multiAgentMaxParallel > 10 {
+		return Config{}, fmt.Errorf("ZORA_MULTI_AGENT_MAX_PARALLEL 必须在 1 到 10 之间")
+	}
+	multiAgentSpecialistTimeout, err := time.ParseDuration(env("ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT", "30s"))
+	if err != nil || multiAgentSpecialistTimeout <= 0 {
+		return Config{}, fmt.Errorf("ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT 必须是大于 0 的时间长度，例如 30s")
+	}
+	multiAgentRetryCount, err := nonNegativeInt("ZORA_MULTI_AGENT_RETRY_COUNT", "1")
+	if err != nil || multiAgentRetryCount > 3 {
+		return Config{}, fmt.Errorf("ZORA_MULTI_AGENT_RETRY_COUNT 必须在 0 到 3 之间")
+	}
+	multiAgentApprovalMode := strings.ToLower(env("ZORA_MULTI_AGENT_APPROVAL_MODE", "risky"))
+	if multiAgentApprovalMode != "off" && multiAgentApprovalMode != "risky" && multiAgentApprovalMode != "all" {
+		return Config{}, fmt.Errorf("ZORA_MULTI_AGENT_APPROVAL_MODE 仅支持 off、risky 或 all")
+	}
+	multiAgentApprovalTimeout, err := time.ParseDuration(env("ZORA_MULTI_AGENT_APPROVAL_TIMEOUT", "60s"))
+	if err != nil || multiAgentApprovalTimeout <= 0 {
+		return Config{}, fmt.Errorf("ZORA_MULTI_AGENT_APPROVAL_TIMEOUT 必须是大于 0 的时间长度，例如 60s")
 	}
 	chunkSize, err := positiveInt("ZORA_KNOWLEDGE_CHUNK_SIZE", "800")
 	if err != nil || chunkSize < 100 {
@@ -126,19 +156,25 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Addr:              env("ZORA_ADDR", ":8088"),
-		DataDir:           env("ZORA_DATA_DIR", "./data"),
-		StoreProvider:     strings.ToLower(env("ZORA_STORE_PROVIDER", "sqlite")),
-		PostgresDSN:       strings.TrimSpace(os.Getenv("ZORA_POSTGRES_DSN")),
-		PostgresMaxConns:  postgresMaxConns,
-		Provider:          strings.ToLower(env("ZORA_MODEL_PROVIDER", "mock")),
-		Model:             env("ZORA_MODEL", "qwen-plus"),
-		APIKey:            strings.TrimSpace(os.Getenv("ZORA_API_KEY")),
-		BaseURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("ZORA_BASE_URL")), "/"),
-		Instruction:       env("ZORA_SYSTEM_PROMPT", defaultInstruction),
-		RequestTimeout:    timeout,
-		MaxIterations:     maxIterations,
-		MultiAgentEnabled: multiAgentEnabled,
+		Addr:                        env("ZORA_ADDR", ":8088"),
+		DataDir:                     env("ZORA_DATA_DIR", "./data"),
+		StoreProvider:               strings.ToLower(env("ZORA_STORE_PROVIDER", "sqlite")),
+		PostgresDSN:                 strings.TrimSpace(os.Getenv("ZORA_POSTGRES_DSN")),
+		PostgresMaxConns:            postgresMaxConns,
+		Provider:                    strings.ToLower(env("ZORA_MODEL_PROVIDER", "mock")),
+		Model:                       env("ZORA_MODEL", "qwen-plus"),
+		APIKey:                      strings.TrimSpace(os.Getenv("ZORA_API_KEY")),
+		BaseURL:                     strings.TrimRight(strings.TrimSpace(os.Getenv("ZORA_BASE_URL")), "/"),
+		Instruction:                 env("ZORA_SYSTEM_PROMPT", defaultInstruction),
+		RequestTimeout:              timeout,
+		MaxIterations:               maxIterations,
+		MultiAgentEnabled:           multiAgentEnabled,
+		MultiAgentMaxHandoffs:       multiAgentMaxHandoffs,
+		MultiAgentMaxParallel:       multiAgentMaxParallel,
+		MultiAgentSpecialistTimeout: multiAgentSpecialistTimeout,
+		MultiAgentRetryCount:        multiAgentRetryCount,
+		MultiAgentApprovalMode:      multiAgentApprovalMode,
+		MultiAgentApprovalTimeout:   multiAgentApprovalTimeout,
 
 		EmbeddingProvider:   embeddingProvider,
 		EmbeddingModel:      env("ZORA_EMBEDDING_MODEL", "text-embedding-v4"),

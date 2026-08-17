@@ -45,6 +45,31 @@ func TestEvaluateRejectsUnexpectedAgent(t *testing.T) {
 	}
 }
 
+func TestEvaluateComparisonMeasuresQualityCostAndLatency(t *testing.T) {
+	t.Parallel()
+	dataset := Dataset{
+		Name: "comparison", MinimumQualityGain: 0.5,
+		MaximumLatencyRatio: 100, MaximumInvocationRatio: 2,
+		Cases: []Case{{
+			ID: "writing", Question: "写通知",
+			ExpectedAnswerContains: []string{"事实", "草稿"},
+		}},
+	}
+	control := answererStub{answers: map[string]GeneratedAnswer{
+		"写通知": {Content: "只有事实"},
+	}}
+	treatment := answererStub{answers: map[string]GeneratedAnswer{
+		"写通知": {Content: "事实与草稿", Handoffs: []string{"writer_agent"}},
+	}}
+	report, err := EvaluateComparison(context.Background(), control, treatment, dataset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Passed || report.Metrics.QualityGain != 0.5 || report.Metrics.InvocationRatio != 2 {
+		t.Fatalf("unexpected comparison: %+v", report)
+	}
+}
+
 func TestLoadDatasetUsesStrictJSON(t *testing.T) {
 	t.Parallel()
 	_, err := LoadDataset(strings.NewReader(`{"name":"bad","minimum_route_accuracy":1,"maximum_unexpected_agent_rate":0,"minimum_answer_completion":1,"unknown":true,"cases":[]}`))

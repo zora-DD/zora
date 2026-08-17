@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.4 Multi-Agent 第一阶段（Supervisor、专业 Agent、协作审计与路由门禁）
+> 适用版本：V0.4 Multi-Agent（执行治理、父子 Run、审批与对照评测）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -42,7 +42,8 @@ internal/
 │   └── postgres/              pgx、pgvector、FTS 和迁移
 ├── agenttools/                Eino Tool 及安全执行逻辑
 ├── agentruntime/              Eino/模型适配与统一事件
-├── agentseval/                多 Agent 路由/答案指标与门禁
+├── agentseval/                多 Agent 路由与单/多 Agent 对照门禁
+├── approval/                  Human-in-the-loop 策略、等待/恢复和 Store 契约
 ├── knowledge/                 分块、Embedding、混合检索与 Agent Tool
 ├── rageval/                   检索指标、答案引用/忠实度指标与门禁
 ├── memory/                    Semantic/Episodic 模型、校验和 CRUD 用例
@@ -123,10 +124,11 @@ flowchart TD
 7. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
 8. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
 9. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
-10. 创建 Eino Runner；多 Agent 模式开启内部 Agent 事件透传；
+10. 创建 Eino Runner；多 Agent 模式包装受控 AgentTool，并开启内部 Agent 事件透传；
 11. 按配置创建 Model/Rule Summarizer 和 Summary Service；
-12. 创建 Chat Service，按开关接入 Memory Capture/Recall 与会话摘要，再创建 HTTP Handler；
-13. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
+12. 多 Agent 审批模式不为 off 时创建 Approval Service；
+13. 创建 Chat Service，按开关接入 Memory Capture/Recall、会话摘要和审批，再创建 HTTP Handler；
+14. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
 
@@ -147,6 +149,12 @@ flowchart TD
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 否 | 整次消息请求与模型客户端超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | 否 | ReAct 最大迭代，允许范围 1–50 |
 | `ZORA_MULTI_AGENT_ENABLED` | `false` | 否 | 是否启用 Supervisor 与 Research/Document/Writer；默认关闭以控制模型成本 |
+| `ZORA_MULTI_AGENT_MAX_HANDOFFS` | `6` | 否 | 单轮最多专业 Agent 交接次数，范围 1–20 |
+| `ZORA_MULTI_AGENT_MAX_PARALLEL` | `3` | 否 | 单轮专业 Agent 最大并行数，范围 1–10 |
+| `ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT` | `30s` | 否 | 单次专业 Agent 独立超时 |
+| `ZORA_MULTI_AGENT_RETRY_COUNT` | `1` | 否 | 专业 Agent 失败后的重试次数，范围 0–3 |
+| `ZORA_MULTI_AGENT_APPROVAL_MODE` | `risky` | 否 | `off`、`risky` 或 `all`；仅多 Agent 模式接入审批 |
+| `ZORA_MULTI_AGENT_APPROVAL_TIMEOUT` | `60s` | 否 | 等待人工决定的最长时间，应小于整条请求超时 |
 | `ZORA_EMBEDDING_PROVIDER` | `hash` | 否 | `hash` 或 `openai` |
 | `ZORA_EMBEDDING_MODEL` | `text-embedding-v4` | openai Embedding 需要 | Embedding 模型名 |
 | `ZORA_EMBEDDING_API_KEY` | 复用 Chat Key | openai Embedding 需要 | 可独立的 Embedding Key |
@@ -267,6 +275,8 @@ Eino 负责 ReAct 循环：模型生成 ToolCall → ToolNode 执行 → ToolRes
 
 `agentruntime.NewMultiAgentWithModel` 则创建一个根 `zora_supervisor` 和三个 Eino ChatModelAgent，并通过 `adk.NewAgentTool` 把专家暴露给 Supervisor。项目没有采用共享完整上下文的 Agent Transfer：AgentTool 默认只发送 `{"request":"..."}`，专业 Agent 看不到主会话全部历史；需要的事实和证据必须由 Supervisor 显式交接。
 
+AgentTool 外层由 `controlledAgentTool` 统一治理。`Runtime.Execute` 为每个根 Run 注入独立 `executionState`：交接计数受 Mutex 保护，并行信号量限制瞬时专业模型请求，每次调用使用独立 `context.WithTimeout`，根 Context 取消立即停止，其他失败最多按配置重试。零值配置会落到安全默认值，线上环境变量在启动时严格校验。
+
 ### 6.2 Provider
 
 #### Mock
@@ -308,6 +318,24 @@ Eino 负责 ReAct 循环：模型生成 ToolCall → ToolNode 执行 → ToolRes
 | `writer_agent` | 无底层工具 | 只使用 request 中的任务和证据，不补造事实 |
 
 复合“根据文档写作”任务采用 `document_agent → writer_agent` 串行交接。Eino 会透传子 Agent 的流式事件；Runtime 只累计根 Agent 的文本为最终回答，子 Agent 文本统一转成单条 `agent_output`。这避免专家草稿和 Supervisor 定稿被重复拼接，同时保留调试证据。
+
+彼此独立的子任务由 Supervisor 在同一 Assistant 消息中返回多个 AgentTool Call；Eino ToolNode 默认并行执行。Chat 收到每个 `agent_handoff_started` 时创建一条 `agent_task_runs`，把 `child_run_id` 写入 RunEvent/SSE；完成时保存最多 1,000 字符输出摘要，根执行失败或取消时补写所有未完成子 Run 的终态。
+
+### 6.5 Human-in-the-loop 审批
+
+只有多 Agent 模式且审批策略不为 `off` 时，启动流程才向 Chat/HTTP 注入 `approval.Service`。`risky` 用保守的高影响动作词触发，`all` 审批每个请求。
+
+```text
+保存 User Message / 创建 AgentRun
+  → 创建 pending ApprovalRequest
+  → SSE approval_required（原请求等待）
+  → POST decision
+     ├─ approved：唤醒等待通道，原 SSE 继续执行 Runtime
+     ├─ rejected：保存用户可见停止消息，AgentRun=rejected
+     └─ timeout/cancel：Approval=expired，AgentRun=cancelled
+```
+
+审批决定使用独立 HTTP 请求，不受同一 Conversation 的 Send 锁阻塞。数据库用 `WHERE status='pending'` 保证一次性决策；重复决定返回中文错误。审批记录可跨重启查询，但当前进程内等待通道不能跨重启恢复，这是 V0.5 异步任务化前的明确限制。
 
 ## 7. 工具设计
 
@@ -367,12 +395,12 @@ SQL 子查询先按 sequence 倒序取最近 N 条，外层再升序输出。结
 
 ### 8.4 Store 替换策略
 
-应用层依赖 `store.Store`、`knowledge.Store`、`memory.Store` 与 `summary.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/Document/Memory/Summary 语义；`cmd/zora` 只在启动组装阶段选择实现。
+应用层依赖 `store.Store`、`knowledge.Store`、`memory.Store`、`summary.Store` 与 `approval.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/ChildRun/Approval/Document/Memory/Summary 语义；`cmd/zora` 只在启动组装阶段选择实现。
 
 PostgreSQL 已处理：
 
 - pgxpool 连接池和启动连通性检查；
-- `Conversation`、`Message`、`AgentRun`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory`、`ConversationSummary` 的关系与约束；
+- `Conversation`、`Message`、`AgentRun`、`AgentTaskRun`、`ApprovalRequest`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory`、`ConversationSummary` 的关系与约束；
 - advisory transaction lock 串行化多实例 DDL；
 - pgvector 类型注册、固定维度校验、HNSW cosine index；
 - 基于统一 tokenizer 词项的 `tsvector` generated column 和 GIN index。
@@ -598,9 +626,9 @@ recency = exp(-ln(2) * age / 90 days)
 
 `cmd/zora-agent-eval` 每次创建临时 SQLite，根据 `evals/agents.json` 摄取固定文档，再组装与线上相同的 Supervisor、三个 AgentTool、Chat Service 和 RunEvent Store。每题使用独立 Conversation，答案完成后从实际 RunEvent 提取 `agent_handoff_started` 顺序，并强制校验每次交接同时存在相同 ToolCall ID 的 `agent_handoff_completed` 和目标专家的 `agent_output`；因此仅让模型输出专家名称不能通过门禁。
 
-指标包括：完整路由序列准确率、实际调用中不属于预期序列的意外专家调用率、非空且包含预期事实锚点的答案完成率，以及只报告不设门禁的平均延迟。默认 6 题覆盖 Document、Research、Writer 单专家路由，`document_agent → writer_agent` 串行协作，直接回答，以及“Go 的文档注释规范”这种包含“文档”词但不应查询用户知识库的硬负例。默认 Mock 基线三项质量指标分别为 1、0、1。
+指标包括：完整路由序列准确率、实际调用中不属于预期序列的意外专家调用率、非空且包含预期事实锚点的答案完成率和平均延迟。默认 7 题增加 Research + Writer 同轮并行，原有 Document/Research/Writer 单专家、`document_agent → writer_agent` 串行、直接回答和“文档”硬负例继续保留。默认 Mock 路由三项质量指标分别为 1、0、1。
 
-该评测只证明路由和协作链路符合标注，不证明多 Agent 相对单 Agent 有质量收益。后续必须在同一复合任务集上增加单 Agent Control、Token/成本和耗时统计，才能满足 V0.4 总体验收条件。
+同一命令还组装拥有全部底层工具的单 Agent Control 和 Supervisor Treatment，逐题完整经过 `chat.Send`。质量按答案事实锚点覆盖比例计算；成本使用“根 Agent + 专业 Agent 交接数”作为确定性调用次数代理；耗时记录两组真实执行时间。当前 Control 质量 0.785714、Treatment 质量 1、增益 0.214286，平均调用次数 1 对 2、比例 2；延迟比例按运行环境实时输出并受宽松上限门禁。调用次数不是 Token 成本，接真实 Provider 后仍需从 ResponseMeta 补充 Usage。
 
 ## 9. 并发、取消与错误处理
 
@@ -626,11 +654,15 @@ Browser Abort / HTTP Disconnect / Deadline
           Eino Runner / Model
 ```
 
+多 Agent 模式在 Runtime 内继续把根 Context 传给执行状态、并行信号量、专业 Agent 独立超时和 AgentTool；等待信号量或执行中的子任务都能响应取消。超时只重试专业 Agent，自身不会额外消耗交接次数。
+
 ### 9.3 失败终态
 
 - 普通执行错误：`failed`；
 - `context.Canceled` 或 `context.DeadlineExceeded`：`cancelled`；
+- 人工审批拒绝：`rejected`；审批等待超时：`cancelled`；
 - 使用 `context.WithoutCancel` 加三秒超时补写终态；
+- 未完成的专业 Agent 子 Run 同步补写 failed/cancelled；
 - 详细错误写日志和 Run，SSE 尝试发送用户可读 error 事件。
 
 ## 10. HTTP API
@@ -782,6 +814,26 @@ GET /api/runs/{runID}/events
 
 返回按 sequence 正序排列的持久事件。SSE delta 不在此接口中逐条返回。
 
+### 10.9.1 查询专业 Agent 子 Run
+
+```http
+GET /api/runs/{runID}/children
+```
+
+返回 `{"runs":[...]}`，每项包含 `parent_run_id`、`agent_name`、`tool_call_id`、`task`、`status`、`attempt`、`output_preview/error` 和开始/完成时间。列表按开始时间正序排列。
+
+### 10.9.2 查询和决定人工审批
+
+```http
+GET /api/approvals?status=pending&limit=100
+POST /api/approvals/{approvalID}/decision
+Content-Type: application/json
+
+{"decision":"approved","reason":"确认继续"}
+```
+
+接口只在多 Agent 且审批模式不为 `off` 时注册。`status` 可选 pending/approved/rejected/expired；`decision` 只允许 approved/rejected。决定成功返回完整审批记录并唤醒同进程中等待的原 SSE；审批不存在返回 404，重复决定返回 400。
+
 ### 10.10 上传知识文档
 
 ```http
@@ -895,14 +947,16 @@ DELETE /api/memories/{memoryID}
 | 事件 | 关键字段 | 是否持久化 | 说明 |
 |---|---|---|---|
 | `start` | `run_id`, `message` | 以 run_started 表示 | 用户消息已保存、Run 已创建 |
+| `approval_required` | `approval` | 是 | 高影响请求已暂停，等待人工决定 |
+| `approval_approved/rejected/expired` | `approval` | 是 | 审批终态；approved 后继续执行，其余结束 Run |
 | `tool_call` | `tool_name`, `tool_call_id`, `arguments` | 是 | 模型请求调用工具 |
 | `tool_result` | `tool_name`, `tool_call_id`, `content` | 是 | 工具返回结果 |
-| `agent_handoff_started` | `tool_name`, `tool_call_id`, `arguments` | 是 | Supervisor 将结构化任务交给专业 Agent |
+| `agent_handoff_started` | `tool_name`, `tool_call_id`, `child_run_id`, `arguments` | 是 | Supervisor 交接任务并创建子 Run |
 | `agent_output` | `agent_name`, `content` | 是 | 专家中间交付物，仅进入 Trace/审计 |
-| `agent_handoff_completed` | `tool_name`, `tool_call_id`, `content` | 是 | 专家执行完成，结果已回填 Supervisor |
+| `agent_handoff_completed` | `tool_name`, `tool_call_id`, `child_run_id`, `content` | 是 | 专家完成，子 Run 进入终态并回填 Supervisor |
 | `delta` | `content` | 否 | 文本增量，只用于实时展示 |
 | `done` | `message`, `memory`, `memory_recalled`, `summary` | 以 model_output/run_completed 表示 | 回答和 Run 已落库；附带自动记忆计数、注入数量和本轮摘要更新统计 |
-| `error` | `content` | 以 failed/cancelled 表示 | 执行失败或取消 |
+| `error` | `content` | 以 failed/cancelled 表示 | 执行失败或取消；审批拒绝/过期会返回用户可见 `done` |
 
 客户端不能只依赖连接关闭判断成功，必须以 `done` 为成功终点，以 `error` 为失败终点。
 
@@ -915,6 +969,7 @@ DELETE /api/memories/{memoryID}
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用和专业 Agent 协作均以可折叠 Trace 展示；专家中间输出不会进入最终回答气泡；
+- 协作 Trace 展示子 Run ID；审批卡片可批准或拒绝，状态更新后保留在消息中；
 - 模型文本先进行 HTML 转义，再做有限 Markdown 渲染；
 - 响应式侧边栏适配移动端；
 - 静态资源由 Go 二进制内嵌，未知前端路由回退到 `index.html`。
@@ -1054,9 +1109,7 @@ flowchart LR
 
 ### 17.3 V0.4 Multi-Agent
 
-当前已实现 Supervisor 通过 Agent-as-Tool 调用 Research、Document、Writer Agent；每个子 Agent 使用最小 request 上下文和独立工具权限，协作事件进入 SSE/RunEvent，固定 6 题路由门禁通过。`ZORA_MULTI_AGENT_ENABLED` 默认关闭，避免真实模型产生意外成本。
-
-剩余目标包括：独立子 AgentRun 与 `parent_run_id`、每个子任务的调用/Token/时间预算、超时与有限重试、并行任务、Human-in-the-loop，以及单 Agent Control 与多 Agent Treatment 的质量/成本/耗时对照。只有数据证明收益覆盖代价后，才考虑默认开启。
+当前已实现 Supervisor 通过 Agent-as-Tool 调用 Research、Document、Writer Agent；每个子 Agent 使用最小 request 上下文和独立工具权限。独立任务可并行，依赖任务串行；每个根 Run 限制交接、并行、专家超时和重试，取消贯穿子任务。`agent_task_runs`、协作 RunEvent、SSE/Web Trace 形成父子审计链，`approval_requests` 支持高影响请求等待、批准恢复、拒绝和过期。固定 7 题路由门禁及单/多 Agent Control/Treatment 对照通过。`ZORA_MULTI_AGENT_ENABLED` 仍默认关闭，因为 Mock 质量增益 0.214286 的同时调用次数代理增加到 2 倍；真实场景必须补采 Token Usage 并使用业务数据复验。V0.4 主链路完成。
 
 ### 17.4 V0.5 Office Agent
 

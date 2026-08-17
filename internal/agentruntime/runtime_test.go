@@ -118,6 +118,43 @@ func TestMultiAgentRoutesCalculationToResearchAgent(t *testing.T) {
 	}
 }
 
+func TestMultiAgentIssuesIndependentTasksInParallel(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	researchTools, err := agenttools.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewMultiAgentWithModel(ctx, config.Config{
+		Provider: "mock", Model: "zora-mock", Instruction: "请使用中文回答。",
+		RequestTimeout: time.Second, MaxIterations: 8,
+		MultiAgentMaxHandoffs: 4, MultiAgentMaxParallel: 2,
+		MultiAgentSpecialistTimeout: time.Second,
+	}, SpecialistToolset{Research: researchTools}, newMockModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var handoffs []string
+	answer, err := runtime.Execute(ctx, []*schema.Message{
+		schema.UserMessage("请同时计算 6*7，并且写一条结果通知"),
+	}, func(event Event) error {
+		if event.Type == "agent_handoff_started" {
+			handoffs = append(handoffs, event.ToolName)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(handoffs, ",") != ResearchAgentName+","+WriterAgentName {
+		t.Fatalf("parallel handoffs = %v", handoffs)
+	}
+	if !strings.Contains(answer, "42") || !strings.Contains(answer, "写作专家草稿") {
+		t.Fatalf("unexpected parallel answer: %q", answer)
+	}
+}
+
 type staticKnowledgeTool struct{}
 
 func (staticKnowledgeTool) Info(context.Context) (*schema.ToolInfo, error) {

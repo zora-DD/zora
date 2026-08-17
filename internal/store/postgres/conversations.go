@@ -167,6 +167,58 @@ WHERE id = $5`, status, assistantMessageID, errorMessage, normalizeTime(complete
 	return affected("完成执行记录", tag, err)
 }
 
+func (p *Postgres) CreateAgentTaskRun(ctx context.Context, run domain.AgentTaskRun) error {
+	_, err := p.pool.Exec(ctx, `
+INSERT INTO agent_task_runs(
+    id, parent_run_id, agent_name, tool_call_id, task, status, attempt, started_at
+) VALUES($1, $2, $3, $4, $5, $6, $7, $8)`,
+		run.ID, run.ParentRunID, run.AgentName, run.ToolCallID, run.Task,
+		run.Status, run.Attempt, normalizeTime(run.StartedAt))
+	if err != nil {
+		return fmt.Errorf("创建专业 Agent 执行记录失败：%w", err)
+	}
+	return nil
+}
+
+func (p *Postgres) FinishAgentTaskRun(ctx context.Context, id, status, outputPreview, errorMessage string, completedAt time.Time) error {
+	tag, err := p.pool.Exec(ctx, `
+UPDATE agent_task_runs
+SET status = $1, output_preview = $2, error = $3, completed_at = $4
+WHERE id = $5`, status, outputPreview, errorMessage, normalizeTime(completedAt), id)
+	return affected("完成专业 Agent 执行记录", tag, err)
+}
+
+func (p *Postgres) ListAgentTaskRuns(ctx context.Context, parentRunID string) ([]domain.AgentTaskRun, error) {
+	rows, err := p.pool.Query(ctx, `
+SELECT id, parent_run_id, agent_name, tool_call_id, task, status, attempt,
+       output_preview, error, started_at, completed_at
+FROM agent_task_runs WHERE parent_run_id = $1 ORDER BY started_at ASC, id ASC`, parentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("查询专业 Agent 执行记录失败：%w", err)
+	}
+	defer rows.Close()
+	runs := make([]domain.AgentTaskRun, 0)
+	for rows.Next() {
+		var run domain.AgentTaskRun
+		if err := rows.Scan(
+			&run.ID, &run.ParentRunID, &run.AgentName, &run.ToolCallID, &run.Task,
+			&run.Status, &run.Attempt, &run.OutputPreview, &run.Error, &run.StartedAt, &run.CompletedAt,
+		); err != nil {
+			return nil, fmt.Errorf("读取专业 Agent 执行记录失败：%w", err)
+		}
+		run.StartedAt = normalizeTime(run.StartedAt)
+		if run.CompletedAt != nil {
+			completedAt := normalizeTime(*run.CompletedAt)
+			run.CompletedAt = &completedAt
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历专业 Agent 执行记录失败：%w", err)
+	}
+	return runs, nil
+}
+
 func (p *Postgres) AppendRunEvent(ctx context.Context, event domain.RunEvent) (domain.RunEvent, error) {
 	payload, err := json.Marshal(event.Payload)
 	if err != nil {

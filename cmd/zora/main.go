@@ -16,6 +16,7 @@ import (
 
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/agenttools"
+	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/httpapi"
@@ -31,6 +32,7 @@ type applicationStore interface {
 	store.Store
 	knowledge.Store
 	memory.Store
+	approval.Store
 	summary.Store
 }
 
@@ -111,6 +113,16 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	chatOptions := []chat.Option{chat.WithMemoryCapturer(memoryService)}
+	var approvalService *approval.Service
+	if cfg.MultiAgentEnabled && cfg.MultiAgentApprovalMode != approval.ModeOff {
+		approvalService, err = approval.NewService(database, approval.Options{
+			Mode: cfg.MultiAgentApprovalMode, Timeout: cfg.MultiAgentApprovalTimeout,
+		})
+		if err != nil {
+			return err
+		}
+		chatOptions = append(chatOptions, chat.WithApprovalGate(approvalService))
+	}
 	if cfg.MemoryRecallEnabled {
 		chatOptions = append(chatOptions, chat.WithMemoryRecaller(memoryService))
 	}
@@ -136,7 +148,11 @@ func run(logger *slog.Logger) error {
 		chatOptions = append(chatOptions, chat.WithConversationSummarizer(summaryService))
 	}
 	chatService := chat.NewService(database, runtime, chatOptions...)
-	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout)
+	httpOptions := make([]httpapi.Option, 0, 1)
+	if approvalService != nil {
+		httpOptions = append(httpOptions, httpapi.WithApprovalService(approvalService))
+	}
+	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout, httpOptions...)
 	if err != nil {
 		return err
 	}

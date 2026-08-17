@@ -1,9 +1,12 @@
 {
   "name": "zora-multi-agent-routing-v1",
-  "description": "覆盖单专家、文档到写作的串行协作、直接回答和相似词硬负例。",
+  "description": "覆盖单专家、并行子任务、文档到写作的串行协作、直接回答和相似词硬负例，并比较单 Agent 与多 Agent。",
   "minimum_route_accuracy": 1.0,
   "maximum_unexpected_agent_rate": 0.0,
   "minimum_answer_completion": 1.0,
+  "minimum_quality_gain": 0.15,
+  "maximum_latency_ratio": 100.0,
+  "maximum_invocation_ratio": 2.5,
   "documents": [
     {
       "name": "蓝鲸项目发布计划.md",
@@ -34,6 +37,12 @@
       "question": "根据我上传的蓝鲸项目发布计划，写一份项目发布通知",
       "expected_agents": ["document_agent", "writer_agent"],
       "expected_answer_contains": ["写作专家草稿", "2026 年 9 月 18 日"]
+    },
+    {
+      "id": "parallel-research-writer",
+      "question": "请同时计算 6*7，并且写一条结果通知",
+      "expected_agents": ["research_agent", "writer_agent"],
+      "expected_answer_contains": ["42", "写作专家草稿"]
     },
     {
       "id": "direct-greeting",

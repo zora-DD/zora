@@ -298,6 +298,20 @@ button { color: inherit; }
 .trace-item.done summary::before { content: "✓"; color: var(--green); }
 .trace-item summary span { margin-left: auto; color: var(--muted-2); font-size: 9px; }
 .trace-body { padding: 9px 11px 11px; border-top: 1px solid var(--line); color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; line-height: 1.6; white-space: pre-wrap; }
+.approval-slot:empty { display: none; }
+.approval-card { margin: 0 0 14px; padding: 13px 14px; border: 1px solid rgba(255,190,92,.3); border-radius: 12px; background: rgba(255,174,68,.07); }
+.approval-card strong, .approval-card p, .approval-card small { display: block; }
+.approval-card strong { color: #f0d29e; font-size: 12px; }
+.approval-card p { margin: 6px 0 0; color: var(--muted); font-size: 10px; line-height: 1.6; }
+.approval-card small { margin-top: 7px; color: var(--muted-2); font-size: 9px; }
+.approval-card.approved { border-color: rgba(75,211,159,.28); background: rgba(75,211,159,.06); }
+.approval-card.approved strong { color: var(--green); }
+.approval-card.rejected, .approval-card.expired { border-color: rgba(255,107,125,.25); background: rgba(255,107,125,.06); }
+.approval-card.rejected strong, .approval-card.expired strong { color: var(--danger); }
+.approval-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 11px; }
+.approval-actions button { padding: 7px 11px; border: 0; border-radius: 8px; background: var(--accent); color: white; font-size: 10px; cursor: pointer; }
+.approval-actions button.secondary { border: 1px solid var(--line-strong); background: transparent; color: var(--muted); }
+.approval-actions button:disabled { opacity: .5; cursor: wait; }
 
 .composer-wrap { z-index: 6; padding: 12px max(20px, calc((100% - 790px) / 2)) 13px; background: linear-gradient(transparent, var(--bg) 28%); }
 .composer { padding: 11px 12px 9px 15px; border: 1px solid var(--line-strong); border-radius: 18px; background: rgba(27,28,33,.96); box-shadow: 0 16px 50px rgba(0,0,0,.25); transition: border-color .15s ease, box-shadow .15s ease; }

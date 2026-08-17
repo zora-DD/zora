@@ -14,6 +14,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/zhiruo/zora/internal/agentruntime"
+	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/id"
 	"github.com/zhiruo/zora/internal/memory"
@@ -31,11 +32,13 @@ type StreamEvent struct {
 	Content        string                `json:"content,omitempty"`
 	ToolName       string                `json:"tool_name,omitempty"`
 	ToolCallID     string                `json:"tool_call_id,omitempty"`
+	ChildRunID     string                `json:"child_run_id,omitempty"`
 	Arguments      string                `json:"arguments,omitempty"`
 	Message        *domain.Message       `json:"message,omitempty"`
 	Memory         *memory.CaptureResult `json:"memory,omitempty"`
 	MemoryRecalled int                   `json:"memory_recalled,omitempty"`
 	Summary        *summary.UpdateResult `json:"summary,omitempty"`
+	Approval       *approval.Approval    `json:"approval,omitempty"`
 }
 
 // Service 是会话用例边界，负责执行顺序、状态落库和同会话并发控制。
@@ -45,6 +48,7 @@ type Service struct {
 	memory       memoryCapturer
 	memoryRecall memoryRecaller
 	summary      conversationSummarizer
+	approval     *approval.Service
 	locksMu      sync.Mutex
 	locks        map[string]*sync.Mutex
 }
@@ -77,6 +81,10 @@ func WithConversationSummarizer(summarizer conversationSummarizer) Option {
 	return func(service *Service) { service.summary = summarizer }
 }
 
+func WithApprovalGate(gate *approval.Service) Option {
+	return func(service *Service) { service.approval = gate }
+}
+
 func NewService(store store.Store, runtime *agentruntime.Runtime, options ...Option) *Service {
 	service := &Service{store: store, runtime: runtime, locks: make(map[string]*sync.Mutex)}
 	for _, option := range options {
@@ -91,6 +99,7 @@ func (s *Service) AgentName() string         { return s.runtime.AgentName() }
 func (s *Service) MultiAgentEnabled() bool   { return s.runtime.MultiAgentEnabled() }
 func (s *Service) MemoryRecallEnabled() bool { return s.memoryRecall != nil }
 func (s *Service) SummaryEnabled() bool      { return s.summary != nil }
+func (s *Service) ApprovalEnabled() bool     { return s.approval != nil && s.approval.Enabled() }
 
 func (s *Service) CreateConversation(ctx context.Context, title string) (domain.Conversation, error) {
 	title = strings.TrimSpace(title)
@@ -139,6 +148,10 @@ func (s *Service) ListMessages(ctx context.Context, conversationID string) ([]do
 
 func (s *Service) ListRunEvents(ctx context.Context, runID string) ([]domain.RunEvent, error) {
 	return s.store.ListRunEvents(ctx, runID)
+}
+
+func (s *Service) ListAgentTaskRuns(ctx context.Context, runID string) ([]domain.AgentTaskRun, error) {
+	return s.store.ListAgentTaskRuns(ctx, runID)
 }
 
 func (s *Service) GetConversationSummary(ctx context.Context, conversationID string) (summary.Summary, error) {
@@ -202,6 +215,37 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 	if err := emit(StreamEvent{Type: "start", RunID: run.ID, Message: &userMessage}); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
+	if s.ApprovalEnabled() {
+		item, approvalErr := s.approval.Request(ctx, approval.RequestInput{
+			RunID: run.ID, ConversationID: conversationID,
+			UserMessageID: userMessage.ID, Content: content,
+		})
+		if approvalErr != nil {
+			return s.failRun(ctx, run.ID, approvalErr)
+		}
+		if item != nil {
+			if err := s.appendEvent(ctx, run.ID, "approval_required", s.runtime.AgentName(), "", approvalAuditPayload(*item)); err != nil {
+				return s.failRun(ctx, run.ID, err)
+			}
+			if err := emit(StreamEvent{Type: "approval_required", RunID: run.ID, Approval: item}); err != nil {
+				return s.failRun(ctx, run.ID, err)
+			}
+			decision, waitErr := s.approval.Wait(ctx, item.ID)
+			if waitErr != nil {
+				return s.failRun(ctx, run.ID, waitErr)
+			}
+			eventType := "approval_" + decision.Status
+			if err := s.appendEvent(ctx, run.ID, eventType, s.runtime.AgentName(), "", approvalAuditPayload(decision)); err != nil {
+				return s.failRun(ctx, run.ID, err)
+			}
+			if decision.Status != approval.StatusApproved {
+				return s.stopAfterApproval(ctx, run, decision, emit)
+			}
+			if err := emit(StreamEvent{Type: eventType, RunID: run.ID, Approval: &decision}); err != nil {
+				return s.failRun(ctx, run.ID, err)
+			}
+		}
+	}
 
 	// 摘要触发前至少读取完整阈值窗口，避免自定义阈值大于默认 40 条时漏掉未摘要历史。
 	historyLimit := 40
@@ -244,8 +288,36 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		}
 	}
 
+	childRuns := make(map[string]domain.AgentTaskRun)
+	finishedChildRuns := make(map[string]bool)
 	answer, err := s.runtime.Execute(ctx, history, func(event agentruntime.Event) error {
 		payload := map[string]any{}
+		var childRunID string
+		if event.Type == "agent_handoff_started" {
+			child := domain.AgentTaskRun{
+				ID: id.New("task"), ParentRunID: run.ID, AgentName: event.ToolName,
+				ToolCallID: event.ToolCallID, Task: taskFromArguments(event.Arguments),
+				Status: domain.RunRunning, Attempt: 1, StartedAt: time.Now().UTC(),
+			}
+			if err := s.store.CreateAgentTaskRun(ctx, child); err != nil {
+				return err
+			}
+			childRuns[event.ToolCallID] = child
+			childRunID = child.ID
+			payload["child_run_id"] = child.ID
+		}
+		if event.Type == "agent_handoff_completed" {
+			if child, ok := childRuns[event.ToolCallID]; ok {
+				childRunID = child.ID
+				payload["child_run_id"] = child.ID
+				if err := s.store.FinishAgentTaskRun(
+					ctx, child.ID, domain.RunCompleted, truncateText(event.Content, 1_000), "", time.Now().UTC(),
+				); err != nil {
+					return err
+				}
+				finishedChildRuns[child.ID] = true
+			}
+		}
 		if event.Content != "" {
 			payload["content"] = event.Content
 		}
@@ -264,10 +336,11 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		return emit(StreamEvent{
 			Type: event.Type, RunID: run.ID, AgentName: event.AgentName,
 			Content: event.Content, ToolName: event.ToolName,
-			ToolCallID: event.ToolCallID, Arguments: event.Arguments,
+			ToolCallID: event.ToolCallID, ChildRunID: childRunID, Arguments: event.Arguments,
 		})
 	})
 	if err != nil {
+		s.finishActiveChildRuns(ctx, childRuns, finishedChildRuns, err)
 		return s.failRun(ctx, run.ID, err)
 	}
 
@@ -331,6 +404,79 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		Type: "done", RunID: run.ID, Message: &assistantMessage,
 		Memory: captureResult, MemoryRecalled: recalledCount, Summary: summaryResult,
 	})
+}
+
+func (s *Service) finishActiveChildRuns(ctx context.Context, runs map[string]domain.AgentTaskRun, finished map[string]bool, cause error) {
+	status := domain.RunFailed
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		status = domain.RunCancelled
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	for _, run := range runs {
+		if finished[run.ID] {
+			continue
+		}
+		_ = s.store.FinishAgentTaskRun(persistCtx, run.ID, status, "", cause.Error(), time.Now().UTC())
+	}
+}
+
+func (s *Service) stopAfterApproval(ctx context.Context, run domain.AgentRun, item approval.Approval, emit func(StreamEvent) error) error {
+	status := domain.RunRejected
+	content := "人工审批未通过，本次执行已停止。"
+	if item.Status == approval.StatusExpired {
+		status = domain.RunCancelled
+		content = "等待人工审批超时，本次执行已取消。"
+	}
+	assistantMessage, err := s.store.AddMessage(ctx, domain.Message{
+		ID: id.New("msg"), ConversationID: run.ConversationID,
+		Role: domain.RoleAssistant, Content: content, CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+	if err := s.appendEvent(ctx, run.ID, "model_output", s.runtime.AgentName(), "", map[string]any{
+		"assistant_message_id": assistantMessage.ID, "characters": utf8.RuneCountInString(content),
+	}); err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+	if err := s.appendEvent(ctx, run.ID, "run_"+status, s.runtime.AgentName(), "", map[string]any{
+		"assistant_message_id": assistantMessage.ID, "approval_id": item.ID,
+	}); err != nil {
+		return s.failRun(ctx, run.ID, err)
+	}
+	if err := s.store.FinishRun(ctx, run.ID, status, assistantMessage.ID, "", time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := emit(StreamEvent{Type: "approval_" + item.Status, RunID: run.ID, Approval: &item}); err != nil {
+		return err
+	}
+	return emit(StreamEvent{Type: "done", RunID: run.ID, Message: &assistantMessage})
+}
+
+func approvalAuditPayload(item approval.Approval) map[string]any {
+	return map[string]any{
+		"approval_id": item.ID, "status": item.Status,
+		"trigger_reason": item.TriggerReason, "decision_reason": item.DecisionReason,
+	}
+}
+
+func taskFromArguments(arguments string) string {
+	var input struct {
+		Request string `json:"request"`
+	}
+	if err := json.Unmarshal([]byte(arguments), &input); err == nil && strings.TrimSpace(input.Request) != "" {
+		return truncateText(strings.TrimSpace(input.Request), 2_000)
+	}
+	return truncateText(strings.TrimSpace(arguments), 2_000)
+}
+
+func truncateText(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
 }
 
 func (s *Service) failRun(ctx context.Context, runID string, cause error) error {

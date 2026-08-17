@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
@@ -94,6 +95,67 @@ func TestConversationLifecycle(t *testing.T) {
 	}
 	if _, err := database.GetConversation(ctx, conversation.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("get deleted conversation error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestAgentTaskRunLifecycle(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "agent-task-run.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	conversation := domain.Conversation{ID: "conv_task", Title: "父子 Run 测试", CreatedAt: now, UpdatedAt: now}
+	if err := database.CreateConversation(ctx, conversation); err != nil {
+		t.Fatal(err)
+	}
+	message, err := database.AddMessage(ctx, domain.Message{
+		ID: "msg_task", ConversationID: conversation.ID, Role: domain.RoleUser,
+		Content: "查询文档", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := domain.AgentRun{
+		ID: "run_task", ConversationID: conversation.ID, UserMessageID: message.ID,
+		Status: domain.RunRunning, Model: "zora-mock", StartedAt: now,
+	}
+	if err := database.CreateRun(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	child := domain.AgentTaskRun{
+		ID: "task_1", ParentRunID: root.ID, AgentName: "document_agent",
+		ToolCallID: "call_1", Task: "查询发布日期", Status: domain.RunRunning,
+		Attempt: 1, StartedAt: now.Add(time.Millisecond),
+	}
+	if err := database.CreateAgentTaskRun(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	completedAt := now.Add(time.Second)
+	if err := database.FinishAgentTaskRun(ctx, child.ID, domain.RunCompleted, "发布日期为 9 月 18 日", "", completedAt); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := database.ListAgentTaskRuns(ctx, root.ID)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("child runs = %+v, %v", runs, err)
+	}
+	if runs[0].Status != domain.RunCompleted || runs[0].OutputPreview == "" || runs[0].CompletedAt == nil {
+		t.Fatalf("unexpected child run: %+v", runs[0])
+	}
+	approvalItem := approval.Approval{
+		ID: "approval_1", RunID: root.ID, ConversationID: conversation.ID,
+		UserMessageID: message.ID, Status: approval.StatusPending,
+		TriggerReason: "测试高影响操作", RequestedAt: now,
+	}
+	if err := database.CreateApproval(ctx, approvalItem); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := database.ResolveApproval(ctx, approvalItem.ID, approval.StatusApproved, "已确认", completedAt)
+	if err != nil || resolved.Status != approval.StatusApproved || resolved.DecidedAt == nil {
+		t.Fatalf("resolved approval = %+v, %v", resolved, err)
 	}
 }
 

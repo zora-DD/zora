@@ -38,6 +38,7 @@ type Runtime struct {
 	provider    string
 	agentName   string
 	specialists map[string]struct{}
+	limits      ExecutionLimits
 }
 
 // NewChatModel 根据配置创建可复用的模型实例。主 Agent 与记忆提取器共享同一模型配置，
@@ -116,11 +117,18 @@ func newRuntime(ctx context.Context, cfg config.Config, rootAgent adk.Agent, spe
 		provider:    cfg.Provider,
 		agentName:   rootAgent.Name(ctx),
 		specialists: specialists,
+		limits: ExecutionLimits{
+			MaxHandoffs: cfg.MultiAgentMaxHandoffs, MaxParallel: cfg.MultiAgentMaxParallel,
+			SpecialistTimeout: cfg.MultiAgentSpecialistTimeout, RetryCount: cfg.MultiAgentRetryCount,
+		},
 	}
 }
 
 // Execute 执行一次完整请求，并把模型增量、工具调用和工具结果实时向上层转发。
 func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit func(Event) error) (string, error) {
+	if r.MultiAgentEnabled() {
+		ctx = withExecutionState(ctx, r.limits)
+	}
 	iterator := r.runner.Run(ctx, history)
 	var answer strings.Builder
 

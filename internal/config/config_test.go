@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadKnowledgeDefaults(t *testing.T) {
 	clearEnvironment(t)
@@ -31,6 +34,12 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	}
 	if cfg.MultiAgentEnabled {
 		t.Fatal("multi-agent should be opt-in by default")
+	}
+	if cfg.MultiAgentMaxHandoffs != 6 || cfg.MultiAgentMaxParallel != 3 || cfg.MultiAgentSpecialistTimeout != 30*time.Second || cfg.MultiAgentRetryCount != 1 {
+		t.Fatalf("unexpected multi-agent execution defaults: %+v", cfg)
+	}
+	if cfg.MultiAgentApprovalMode != "risky" || cfg.MultiAgentApprovalTimeout != time.Minute {
+		t.Fatalf("unexpected multi-agent approval defaults: %+v", cfg)
 	}
 }
 
@@ -107,7 +116,9 @@ func clearEnvironment(t *testing.T) {
 	for _, key := range []string{
 		"ZORA_ADDR", "ZORA_DATA_DIR", "ZORA_MODEL_PROVIDER", "ZORA_MODEL", "ZORA_API_KEY",
 		"ZORA_BASE_URL", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
-		"ZORA_MULTI_AGENT_ENABLED",
+		"ZORA_MULTI_AGENT_ENABLED", "ZORA_MULTI_AGENT_MAX_HANDOFFS", "ZORA_MULTI_AGENT_MAX_PARALLEL",
+		"ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT", "ZORA_MULTI_AGENT_RETRY_COUNT",
+		"ZORA_MULTI_AGENT_APPROVAL_MODE", "ZORA_MULTI_AGENT_APPROVAL_TIMEOUT",
 		"ZORA_STORE_PROVIDER", "ZORA_POSTGRES_DSN", "ZORA_POSTGRES_MAX_CONNS",
 		"ZORA_EMBEDDING_PROVIDER", "ZORA_EMBEDDING_MODEL", "ZORA_EMBEDDING_API_KEY",
 		"ZORA_EMBEDDING_BASE_URL", "ZORA_EMBEDDING_DIMENSIONS", "ZORA_KNOWLEDGE_CHUNK_SIZE",

@@ -9,6 +9,7 @@ const state = {
 	memoryAutoCapture: false,
 	memoryRecall: false,
   multiAgent: false,
+  humanApproval: false,
   editingMemoryID: null,
   busy: false,
   controller: null,
@@ -88,6 +89,7 @@ async function initialize() {
     ]);
     elements.runtimeModel.textContent = info.model;
     state.multiAgent = Boolean(info.multi_agent);
+    state.humanApproval = Boolean(info.human_approval);
     elements.runtimeProvider.textContent = `${info.provider} · ${info.version}${state.multiAgent ? " · 多 Agent" : ""}`;
     state.conversations = result.conversations || [];
     state.documents = knowledgeResult.documents || [];
@@ -528,6 +530,7 @@ function handleAgentEvent(type, event) {
 		name: `协作：${agentDisplayName(event.tool_name)}`,
 		key: event.tool_name,
 		id: event.tool_call_id,
+		childRunID: event.child_run_id,
 		arguments: prettyJSON(event.arguments),
 		result: "专业 Agent 正在处理…",
 		done: false,
@@ -547,13 +550,22 @@ function handleAgentEvent(type, event) {
       break;
     }
 	case "agent_handoff_completed": {
-	  const trace = [...state.draft.traces].reverse().find(item => !item.done && item.key === event.tool_name);
+	  const trace = [...state.draft.traces].reverse().find(item => !item.done && (item.id === event.tool_call_id || item.key === event.tool_name));
 	  if (trace) {
 		trace.result = event.content || trace.result;
+		trace.childRunID = event.child_run_id || trace.childRunID;
 		trace.done = true;
 	  }
 	  break;
 	}
+    case "approval_required":
+      state.draft.approval = event.approval;
+      break;
+    case "approval_approved":
+    case "approval_rejected":
+    case "approval_expired":
+      if (event.approval) state.draft.approval = event.approval;
+      break;
     case "done":
       if (event.message) {
         const traces = state.draft.traces;
@@ -645,7 +657,8 @@ function renderMessages() {
     if (message.role === "user") {
       article.innerHTML = `<div class="message-content"><div class="message-meta">你</div><div class="bubble"></div></div>`;
     } else {
-      article.innerHTML = `<div class="avatar">Z</div><div class="message-content"><div class="message-meta">Zora · Agent</div><div class="trace-list"></div><div class="bubble"></div></div>`;
+      article.innerHTML = `<div class="avatar">Z</div><div class="message-content"><div class="message-meta">Zora · Agent</div><div class="approval-slot"></div><div class="trace-list"></div><div class="bubble"></div></div>`;
+      renderApproval(article.querySelector(".approval-slot"), message.approval);
       renderTraces(article.querySelector(".trace-list"), message.traces || []);
     }
     const bubble = article.querySelector(".bubble");
@@ -659,6 +672,59 @@ function renderMessages() {
   }
 }
 
+function renderApproval(container, approval) {
+  if (!approval) return;
+  const card = document.createElement("section");
+  card.className = `approval-card ${approval.status}`;
+  const title = document.createElement("strong");
+  title.textContent = approval.status === "pending" ? "等待人工确认" : approvalStatusText(approval.status);
+  const reason = document.createElement("p");
+  reason.textContent = approval.trigger_reason || "该操作需要人工确认后才能继续。";
+  card.append(title, reason);
+  if (approval.status === "pending") {
+    const actions = document.createElement("div");
+    actions.className = "approval-actions";
+    const reject = document.createElement("button");
+    reject.type = "button";
+    reject.className = "secondary";
+    reject.textContent = "拒绝";
+    const approve = document.createElement("button");
+    approve.type = "button";
+    approve.textContent = "批准并继续";
+    reject.addEventListener("click", () => decideApproval(approval.id, "rejected", [approve, reject]));
+    approve.addEventListener("click", () => decideApproval(approval.id, "approved", [approve, reject]));
+    actions.append(reject, approve);
+    card.append(actions);
+  } else if (approval.decision_reason) {
+    const decisionReason = document.createElement("small");
+    decisionReason.textContent = `说明：${approval.decision_reason}`;
+    card.append(decisionReason);
+  }
+  container.append(card);
+}
+
+async function decideApproval(approvalID, decision, buttons) {
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    const item = await api(`/api/approvals/${approvalID}/decision`, {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    });
+    if (state.draft?.approval?.id === approvalID) {
+      state.draft.approval = item;
+      renderMessages();
+      scrollToBottom();
+    }
+  } catch (error) {
+    buttons.forEach(button => { button.disabled = false; });
+    notify(error.message);
+  }
+}
+
+function approvalStatusText(status) {
+  return ({ approved: "已批准，继续执行", rejected: "审批未通过", expired: "审批已超时" })[status] || "审批状态已更新";
+}
+
 function renderTraces(container, traces) {
   for (const trace of traces) {
     const details = document.createElement("details");
@@ -670,7 +736,8 @@ function renderTraces(container, traces) {
     summary.append(status);
     const body = document.createElement("div");
     body.className = "trace-body";
-    body.textContent = `输入\n${trace.arguments || "{}"}\n\n输出\n${trace.result || ""}`;
+    const runLine = trace.childRunID ? `子 Run\n${trace.childRunID}\n\n` : "";
+    body.textContent = `${runLine}输入\n${trace.arguments || "{}"}\n\n输出\n${trace.result || ""}`;
     details.append(summary, body);
     container.append(details);
   }

@@ -48,20 +48,20 @@
 
 当前验证结果：已建立独立 `memories` 表和 `memory.Service`，区分 semantic/episodic，保存稳定 `memory_key`、来源会话/消息、重要性、人工修正标记和可选过期时间；SQLite 与 PostgreSQL 保持相同 Store 契约。回答成功后，真实模型使用抗指令注入的中文结构化 Prompt 提取候选，本地 Mock 使用保守规则；Service 按 Kind + Memory Key 创建、跳过重复或更新冲突，并拒绝覆盖人工修正。新请求执行前以词项相关性 65% + 重要性 20% + 90 天半衰期时效性 15% 联合排序，非总览问题还需达到 0.20 最低主题相关性；过门槛的 Top-K 记忆以不可信 JSON 数据注入独立 System Message，总正文上限 6,000 字符。长对话按实际未摘要消息数触发增量摘要，`conversation_summaries` 保存覆盖序号，最近窗口继续保留原文；原始消息不会删除。`make eval-memory` 在隔离数据库中让同一问题通过 Control/Treatment 完整 Chat 链路，并从 RunEvent 核对实际注入 ID。默认 5 题基线达到预期召回率 1、错误召回率 0、Treatment 事实覆盖率 1、Control 事实覆盖率 0、覆盖增益 1、答案污染率 0。基线曾发现“Go 并发模型”被个人语言记忆污染，新增最低主题相关性后通过，证明门禁能够驱动实现修正。V0.3 主链路已完成。
 
-## V0.4 Multi-Agent — 第一阶段已完成
+## V0.4 Multi-Agent — 已完成
 
 - [x] Supervisor + Research / Document / Writer Agents
 - [x] 子 Agent 上下文隔离和结构化交接
 - [x] 专家工具权限隔离、协作 SSE/RunEvent 与 Web Trace
 - [x] 固定路由评测：准确率、意外专家调用、答案完成率和硬负例
-- [ ] 并行任务、预算、超时、重试和取消
-- [ ] 父子 Run 链路与可视化
-- [ ] Human-in-the-loop 审批节点
-- [ ] 单 Agent / 多 Agent 的质量、成本和耗时对比
+- [x] 并行任务、预算、超时、重试和取消
+- [x] 父子 Run 链路与可视化
+- [x] Human-in-the-loop 审批节点
+- [x] 单 Agent / 多 Agent 的质量、成本和耗时对比
 
 验收条件：至少一个基准任务能证明多 Agent 带来可量化收益，否则保持单 Agent。
 
-当前验证结果：`ZORA_MULTI_AGENT_ENABLED` 默认关闭，显式开启后由 `zora_supervisor` 通过 Eino AgentTool 调用研究、文档和写作专家。研究专家仅持有时间、计算器和项目状态工具，文档专家仅持有 `knowledge_search`，写作专家无底层工具；AgentTool 默认只传递 Supervisor 构造的 `request`，不共享主会话完整历史。Runtime 将专家输出作为审计事件，不拼接进最终答案；Web 可展示协作开始、专家交付物和协作完成。`make eval-agents` 使用隔离 SQLite 和完整 Chat/RunEvent 链路，默认 6 题覆盖单专家、`document → writer` 串行协作、直接回答和文档相似词硬负例，当前路由准确率 1、意外专家调用率 0、答案完成率 1。该结果只证明路由基线，不证明多 Agent 优于单 Agent，因此 V0.4 尚未整体完成。
+当前验证结果：`ZORA_MULTI_AGENT_ENABLED` 默认关闭，显式开启后由 `zora_supervisor` 通过 Eino AgentTool 调用研究、文档和写作专家。研究专家仅持有时间、计算器和项目状态工具，文档专家仅持有 `knowledge_search`，写作专家无底层工具；AgentTool 默认只传递 Supervisor 构造的 `request`，不共享主会话完整历史。Runtime 对每个根 Run 注入独立的交接次数、并行度、专家超时和重试预算，Context 取消继续下传；独立子任务由 Eino ToolNode 并行执行，证据依赖任务保持串行。每次交接同步创建 `agent_task_runs` 子 Run，SSE/Web Trace 暴露 `child_run_id`。`risky/all/off` 审批策略把高影响请求持久化为 `approval_requests`，Web 可批准或拒绝，批准后恢复原 SSE，拒绝/超时进入明确终态。`make eval-agents` 使用隔离 SQLite 和完整 Chat/RunEvent 链路，默认 7 题路由准确率 1、意外专家调用率 0、答案完成率 1；同题单 Agent Control 质量 0.785714，多 Agent Treatment 质量 1，质量增益 0.214286，调用次数代理比 2，延迟比例随环境输出并受宽松上限门禁。该结论只适用于确定性 Mock 小样本，真实 Provider 仍需扩充业务集和 Token Usage。V0.4 主链路已完成。
 
 ## V0.5 Office Agent
 

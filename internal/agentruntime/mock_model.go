@@ -42,6 +42,14 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	// 新版 Eino 会通过调用级 Option 注入工具，不能只读取 WithTools 保存的字段。
 	availableTools := model.GetCommonOptions(&model.Options{Tools: m.tools}, opts...).Tools
 	if last.Role == schema.Tool {
+		if trailing := trailingToolMessages(input); len(trailing) > 1 {
+			var combined strings.Builder
+			combined.WriteString("多 Agent 并行结果：\n\n")
+			for _, result := range trailing {
+				fmt.Fprintf(&combined, "### %s\n%s\n\n", agentDisplayNameForMock(result.ToolName), result.Content)
+			}
+			return schema.AssistantMessage(strings.TrimSpace(combined.String()), nil), nil
+		}
 		prefix := "工具返回"
 		switch last.ToolName {
 		case DocumentAgentName:
@@ -78,6 +86,11 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 		return schema.AssistantMessage("根据这段对话的历史摘要：\n\n"+conversationSummary, nil), nil
 	case hasMemoryQuestionIntent(lower) && len(memoryFacts) > 0:
 		return schema.AssistantMessage("根据长期记忆，我找到了这些相关信息：\n\n- "+strings.Join(memoryFacts, "\n- "), nil), nil
+	case hasParallelSpecialistIntent(lower) && hasTool(availableTools, ResearchAgentName) && hasTool(availableTools, WriterAgentName):
+		return m.toolCalls([]namedToolCall{
+			{name: ResearchAgentName, arguments: fmt.Sprintf(`{"request":%q}`, query)},
+			{name: WriterAgentName, arguments: fmt.Sprintf(`{"request":%q}`, query)},
+		}), nil
 	case hasDocumentRetrievalIntent(lower) && hasWritingIntent(lower) && hasTool(availableTools, DocumentAgentName):
 		return m.toolCall(DocumentAgentName, fmt.Sprintf(`{"request":%q}`, query)), nil
 	case hasWritingIntent(lower) && hasTool(availableTools, WriterAgentName):
@@ -138,6 +151,10 @@ func hasWritingIntent(query string) bool {
 
 func hasResearchIntent(query string) bool {
 	return containsAny(query, "调研", "研究一下", "分析一下", "对比", "比较", "项目状态", "项目能力", "roadmap", "功能", "计算", "算一下", "几点", "当前时间")
+}
+
+func hasParallelSpecialistIntent(query string) bool {
+	return containsAny(query, "同时", "分别", "并且") && hasResearchIntent(query) && hasWritingIntent(query)
 }
 
 func formatWriterDraft(task string) string {
@@ -255,15 +272,45 @@ func (m *mockModel) Stream(ctx context.Context, input []*schema.Message, opts ..
 }
 
 func (m *mockModel) toolCall(name, arguments string) *schema.Message {
-	id := fmt.Sprintf("mock_call_%d", m.counter.Add(1))
-	return schema.AssistantMessage("", []schema.ToolCall{{
-		ID:   id,
-		Type: "function",
-		Function: schema.FunctionCall{
-			Name:      name,
-			Arguments: arguments,
-		},
-	}})
+	return m.toolCalls([]namedToolCall{{name: name, arguments: arguments}})
+}
+
+type namedToolCall struct {
+	name      string
+	arguments string
+}
+
+func (m *mockModel) toolCalls(calls []namedToolCall) *schema.Message {
+	toolCalls := make([]schema.ToolCall, 0, len(calls))
+	for _, call := range calls {
+		id := fmt.Sprintf("mock_call_%d", m.counter.Add(1))
+		toolCalls = append(toolCalls, schema.ToolCall{
+			ID: id, Type: "function",
+			Function: schema.FunctionCall{Name: call.name, Arguments: call.arguments},
+		})
+	}
+	return schema.AssistantMessage("", toolCalls)
+}
+
+func trailingToolMessages(input []*schema.Message) []*schema.Message {
+	start := len(input)
+	for start > 0 && input[start-1].Role == schema.Tool {
+		start--
+	}
+	return input[start:]
+}
+
+func agentDisplayNameForMock(name string) string {
+	switch name {
+	case ResearchAgentName:
+		return "研究专家"
+	case DocumentAgentName:
+		return "文档专家"
+	case WriterAgentName:
+		return "写作专家"
+	default:
+		return name
+	}
 }
 
 func hasTool(tools []*schema.ToolInfo, name string) bool {

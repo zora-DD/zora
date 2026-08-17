@@ -91,10 +91,12 @@ func Build() ([]tool.BaseTool, error) {
 					"会话增量摘要与上下文压缩",
 					"长期记忆有/无 A/B 评测与质量门禁",
 					"可选 Supervisor 与研究/文档/写作专业 Agent",
-					"专业 Agent 工具隔离、结构化交接与协作事件审计",
-					"多 Agent 固定路由评测与质量门禁",
+					"专业 Agent 工具隔离、串并行交接与协作事件审计",
+					"多 Agent 交接/并行预算、超时、重试和取消",
+					"父子 Run、人工审批与 Web 恢复执行",
+					"单 Agent / 多 Agent 质量、调用成本代理和耗时对照门禁",
 				},
-				NextMilestone: "V0.4 子 Agent 预算、超时、重试与父子 Run 链路",
+				NextMilestone: "V0.5 MCP 办公连接器、草稿预览与写操作审计",
 			}, nil
 		},
 	)

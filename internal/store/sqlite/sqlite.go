@@ -55,6 +55,35 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_conversation_started
     ON agent_runs(conversation_id, started_at);
+CREATE TABLE IF NOT EXISTS agent_task_runs (
+    id TEXT PRIMARY KEY,
+    parent_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    agent_name TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    task TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt INTEGER NOT NULL DEFAULT 1 CHECK (attempt > 0),
+    output_preview TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(parent_run_id, tool_call_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_task_runs_parent_started
+    ON agent_task_runs(parent_run_id, started_at);
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+    trigger_reason TEXT NOT NULL,
+    decision_reason TEXT NOT NULL DEFAULT '',
+    requested_at TEXT NOT NULL,
+    decided_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approval_requests_status_requested
+    ON approval_requests(status, requested_at DESC);
 CREATE TABLE IF NOT EXISTS run_events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
@@ -360,6 +389,59 @@ UPDATE agent_runs
 SET status = ?, assistant_message_id = NULLIF(?, ''), error = ?, completed_at = ?
 WHERE id = ?`, status, assistantMessageID, errorMessage, formatTime(completedAt), id)
 	return affected("完成执行记录", result, err)
+}
+
+func (s *SQLite) CreateAgentTaskRun(ctx context.Context, run domain.AgentTaskRun) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO agent_task_runs(
+    id, parent_run_id, agent_name, tool_call_id, task, status, attempt, started_at
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.ParentRunID, run.AgentName, run.ToolCallID, run.Task,
+		run.Status, run.Attempt, formatTime(run.StartedAt))
+	return wrap("创建专业 Agent 执行记录", err)
+}
+
+func (s *SQLite) FinishAgentTaskRun(ctx context.Context, id, status, outputPreview, errorMessage string, completedAt time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+UPDATE agent_task_runs
+SET status = ?, output_preview = ?, error = ?, completed_at = ?
+WHERE id = ?`, status, outputPreview, errorMessage, formatTime(completedAt), id)
+	return affected("完成专业 Agent 执行记录", result, err)
+}
+
+func (s *SQLite) ListAgentTaskRuns(ctx context.Context, parentRunID string) ([]domain.AgentTaskRun, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, parent_run_id, agent_name, tool_call_id, task, status, attempt,
+       output_preview, error, started_at, completed_at
+FROM agent_task_runs WHERE parent_run_id = ? ORDER BY started_at ASC, id ASC`, parentRunID)
+	if err != nil {
+		return nil, fmt.Errorf("查询专业 Agent 执行记录失败：%w", err)
+	}
+	defer rows.Close()
+	runs := make([]domain.AgentTaskRun, 0)
+	for rows.Next() {
+		var run domain.AgentTaskRun
+		var startedAt string
+		var completedAt sql.NullString
+		if err := rows.Scan(
+			&run.ID, &run.ParentRunID, &run.AgentName, &run.ToolCallID, &run.Task,
+			&run.Status, &run.Attempt, &run.OutputPreview, &run.Error, &startedAt, &completedAt,
+		); err != nil {
+			return nil, fmt.Errorf("读取专业 Agent 执行记录失败：%w", err)
+		}
+		if run.StartedAt, err = parseTime(startedAt); err != nil {
+			return nil, err
+		}
+		if completedAt.Valid {
+			parsed, parseErr := parseTime(completedAt.String)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			run.CompletedAt = &parsed
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
 }
 
 func (s *SQLite) AppendRunEvent(ctx context.Context, event domain.RunEvent) (domain.RunEvent, error) {

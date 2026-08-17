@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.4 Multi-Agent（第一阶段）**。V0.1 Agent Core 已完成，V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.3 已交付可追溯、可由用户控制、可通过 A/B 数据验证收益的长期记忆；V0.4 已打通可配置 Supervisor、专业 Agent、工具隔离、协作审计和路由评测。
+当前版本：**V0.4 Multi-Agent**。V0.1 Agent Core 已完成，V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.3 已交付可追溯、可由用户控制、可通过 A/B 数据验证收益的长期记忆；V0.4 已完成 Supervisor、专业 Agent、并行与执行保险丝、父子 Run、人工审批和单/多 Agent 对照评测。
 
 ## 当前能力
 
@@ -27,8 +27,9 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 记忆召回与注入 | 已完成 | 词项相关性 + 重要性 + 时效性联合评分、Top-K 安全上下文和 Run 审计 |
 | 会话摘要与上下文压缩 | 已完成 | 阈值触发、增量摘要、最近消息窗口、安全上下文注入、双数据库持久化和审计 |
 | 记忆 A/B 评估 | 已完成 | 隔离数据库、完整 Chat 链路 Control/Treatment、召回率、错误注入、事实覆盖、延迟和质量门禁 |
-| 多 Agent 路由与协作 | V0.4 第一阶段已完成 | 可选 Supervisor、Research/Document/Writer Agent、上下文隔离、串行交接、Web Trace 和固定路由门禁 |
-| 多 Agent 生产治理 | V0.4 进行中 | 子任务预算/超时/重试、父子 Run、审批节点及单/多 Agent 收益对比 |
+| 多 Agent 路由与协作 | 已完成 | 可选 Supervisor、Research/Document/Writer Agent、上下文隔离、串行依赖与并行独立任务 |
+| 多 Agent 生产治理 | 已完成 | 按根 Run 隔离的交接/并行预算、专家超时与有限重试、取消传播、父子 Run 和人工审批 |
+| 单/多 Agent 对照评测 | 已完成 | 7 题真实 Chat/RunEvent 链路，对比答案质量、调用次数代理和延迟比例 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
@@ -48,8 +49,10 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **记忆收益可回归**：固定数据集让同一问题分别通过关闭/开启召回的完整 Chat 链路，门禁预期召回、错误注入、事实覆盖增益和答案污染，而不是只评估检索函数。
 - **长对话不会只靠截断**：较早消息增量压缩进 `conversation_summaries`，最近窗口保留原文；摘要读取或生成失败时自动退化为最近消息，不推翻正常回答。
 - **多 Agent 不是角色 Prompt 展示**：Supervisor 通过 Eino AgentTool 调用研究、文档和写作专家；专家只收到结构化 request，底层工具按职责隔离，协作开始/输出/完成均进入 RunEvent。
-- **专家路由可回归**：固定 6 题覆盖单专家、文档到写作的串行协作、直接回答和“文档”相似词硬负例，门禁路由准确率、意外专家调用和答案完成率。
-- **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
+- **专家路由与收益可回归**：固定 7 题覆盖单专家、串行依赖、并行任务、直接回答和硬负例；同题运行单 Agent Control 与多 Agent Treatment，门禁质量增益、调用次数代理和延迟比例。
+- **多 Agent 有执行保险丝**：交接次数、并行度、专家超时和重试都按根 Run 隔离；专业 Agent 另存子 Run，失败和取消有明确终态。
+- **高影响请求先审批**：审批记录持久化，SSE 在 `approval_required` 后等待 Web 决策，通过后恢复原 Run，拒绝或超时进入明确终态。
+- **明确的终态语义**：根 Run 最终进入 completed、failed、cancelled 或 rejected。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
 - **为面试深度设计**：可以讨论框架隔离、流式 ToolCall、并发、取消、RAG 评估、Memory 生命周期和 Multi-Agent 收益。
@@ -114,7 +117,9 @@ Web 对话中会显示“协作：研究专家/文档专家/写作专家”轨�
 make eval-agents
 ```
 
-评测命令使用隔离 SQLite 和真实 `chat.Send → Eino AgentTool → RunEvent` 链路。默认 6 题基线的路由准确率为 1、意外专家调用率为 0、答案完成率为 1；真实模型仍应使用业务样本重新验证。
+独立任务可以并行交接，例如“同时计算 6*7，并写一条结果通知”；文档取证再写作仍保持串行。默认 `risky` 审批模式会在“发送给、发布到、删除、部署到”等高影响请求前显示审批卡片，批准后原 SSE 继续执行。
+
+评测命令使用隔离 SQLite 和真实 `chat.Send → Eino AgentTool → RunEvent` 链路。默认 7 题基线路由准确率 1、意外专家调用率 0、答案完成率 1；单 Agent Control 质量 0.785714，多 Agent Treatment 质量 1，质量增益 0.214286，调用次数代理比 2。耗时比例随机器波动，报告会输出并按宽松上限门禁；真实模型仍应使用业务样本和真实 Token Usage 重新验证。
 
 可以尝试：
 
@@ -215,6 +220,12 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 单次 Agent 请求超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | ReAct 最大迭代，范围 1–50 |
 | `ZORA_MULTI_AGENT_ENABLED` | `false` | 是否启用 Supervisor 与三个专业 Agent；默认关闭以控制成本 |
+| `ZORA_MULTI_AGENT_MAX_HANDOFFS` | `6` | 单轮最多专业 Agent 交接次数，范围 1–20 |
+| `ZORA_MULTI_AGENT_MAX_PARALLEL` | `3` | 单轮专业 Agent 最大并行数，范围 1–10 |
+| `ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT` | `30s` | 每次专业 Agent 调用的独立超时 |
+| `ZORA_MULTI_AGENT_RETRY_COUNT` | `1` | 专业 Agent 失败后的重试次数，范围 0–3 |
+| `ZORA_MULTI_AGENT_APPROVAL_MODE` | `risky` | `off`、`risky` 或 `all`；仅启用多 Agent 时接入审批闸门 |
+| `ZORA_MULTI_AGENT_APPROVAL_TIMEOUT` | `60s` | 等待人工审批的最长时间 |
 | `ZORA_EMBEDDING_PROVIDER` | `hash` | `hash` 或 `openai` |
 | `ZORA_EMBEDDING_MODEL` | `text-embedding-v4` | 真实 Embedding 模型名 |
 | `ZORA_EMBEDDING_API_KEY` | 复用 `ZORA_API_KEY` | Embedding 独立密钥 |
@@ -330,6 +341,9 @@ sequenceDiagram
 | `GET` | `/api/conversations/{id}/summary` | 查询当前增量会话摘要及覆盖范围 |
 | `POST` | `/api/conversations/{id}/messages` | 发送消息并接收 SSE |
 | `GET` | `/api/runs/{id}/events` | 查询持久执行事件 |
+| `GET` | `/api/runs/{id}/children` | 查询根 Run 下的专业 Agent 子 Run、状态和输出摘要 |
+| `GET` | `/api/approvals` | 审批开启时查询记录，可通过 `status` 和 `limit` 筛选 |
+| `POST` | `/api/approvals/{id}/decision` | 审批开启时提交 `approved` 或 `rejected` 决定并恢复等待中的 Run |
 | `GET` | `/api/knowledge/documents` | 查询已索引文档 |
 | `POST` | `/api/knowledge/documents` | multipart 上传 TXT/Markdown 并同步索引 |
 | `DELETE` | `/api/knowledge/documents/{id}` | 删除文档及其分块 |
@@ -341,7 +355,7 @@ sequenceDiagram
 | `PUT` | `/api/memories/{id}` | 完整更新内容、类型、重要性和过期时间 |
 | `DELETE` | `/api/memories/{id}` | 用户删除长期记忆 |
 
-SSE 事件：`start`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`delta`、`done`、`error`。其中 `agent_output` 是专家中间交付物，只显示在协作 Trace，不拼入最终回答。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
+SSE 事件：`start`、`approval_required`、`approval_approved/rejected/expired`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`delta`、`done`、`error`。交接事件包含 `child_run_id`；`agent_output` 只显示在协作 Trace，不拼入最终回答。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
 
 完整请求、响应和事件契约见 [项目技术文档](docs/technical-design.md)。
 
@@ -357,8 +371,9 @@ internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
 internal/id/               随机业务 ID
 internal/agentruntime/     Eino Runtime、模型适配和事件转换
-internal/agentseval/       专家路由、意外调用、答案完成指标和质量门禁
+internal/agentseval/       专家路由与单/多 Agent 质量、成本代理、耗时对照门禁
 internal/agenttools/       只读工具和安全计算器
+internal/approval/         人工审批策略、等待/恢复和持久化契约
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/rageval/          检索指标、答案引用/忠实度指标和门禁
 internal/memory/           Semantic/Episodic 模型、提取、Consolidation、联合召回和用户 CRUD
@@ -420,7 +435,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - 增量摘要阈值、最近窗口、序号间隔、结构化模型输出、敏感信息过滤和安全上下文注入；
 - SQLite 摘要 Upsert/级联删除、PostgreSQL Schema，以及 HTTP 摘要查询和 Mock 端到端回忆。
 - 长期记忆 A/B 数据集校验、Control/Treatment 指标、错误召回与答案污染反例、RunEvent 召回 ID 解析和完整 CLI 基线。
-- Supervisor/AgentTool 串行交接、子 Agent 输出与根答案隔离、工具权限分组、协作审计闭环，以及 6 题多 Agent 路由 CLI 基线。
+- Supervisor/AgentTool 串行与并行交接、执行预算/超时/重试/取消、子 Run、人工审批等待与恢复，以及 7 题单/多 Agent 对照 CLI 基线。
 
 ## 文档导航
 
@@ -441,7 +456,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 ### 为什么多 Agent 默认关闭？
 
-V0.4 第一阶段已实现 Supervisor 与专业 Agent，但一次任务可能产生多次模型调用。默认关闭可以避免用户接入真实模型后意外增加成本；使用 `ZORA_MULTI_AGENT_ENABLED=true` 显式开启，并通过 `make eval-agents` 验证路由。是否默认启用仍需后续单 Agent/多 Agent 质量、Token、成本和耗时对比决定。
+V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对照。当前 Mock 小样本中质量从 0.785714 提升到 1，但调用次数代理增加到 2 倍，这不足以证明真实模型场景普遍划算。默认关闭可以避免意外成本；使用 `ZORA_MULTI_AGENT_ENABLED=true` 显式开启，并通过 `make eval-agents` 在自己的业务集上复验。
 
 ### 为什么工具结果没有全部写进下一轮历史？
 
@@ -456,7 +471,7 @@ V0.4 第一阶段已实现 Supervisor 与专业 Agent，但一次任务可能产
 - V0.1：Agent Core——已完成
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
-- V0.4：多 Agent——Supervisor、专业 Agent、工具隔离、协作审计和路由门禁已完成；治理与收益对比进行中
+- V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
 - V0.5：MCP 办公助手
 
 详见 [docs/roadmap.md](docs/roadmap.md)。

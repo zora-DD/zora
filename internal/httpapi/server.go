@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
@@ -31,15 +32,25 @@ type Server struct {
 	chat           *chat.Service
 	knowledge      *knowledge.Service
 	memory         *memory.Service
+	approval       *approval.Service
 	logger         *slog.Logger
 	requestTimeout time.Duration
 }
 
-func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryService *memory.Service, logger *slog.Logger, requestTimeout time.Duration) (http.Handler, error) {
+type Option func(*Server)
+
+func WithApprovalService(service *approval.Service) Option {
+	return func(server *Server) { server.approval = service }
+}
+
+func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryService *memory.Service, logger *slog.Logger, requestTimeout time.Duration, options ...Option) (http.Handler, error) {
 	if chatService == nil || knowledgeService == nil || memoryService == nil {
 		return nil, fmt.Errorf("对话、知识库和长期记忆服务不能为空")
 	}
 	server := &Server{chat: chatService, knowledge: knowledgeService, memory: memoryService, logger: logger, requestTimeout: requestTimeout}
+	for _, option := range options {
+		option(server)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", server.health)
 	mux.HandleFunc("GET /api/info", server.info)
@@ -51,6 +62,11 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	mux.HandleFunc("DELETE /api/conversations/{conversationID}", server.deleteConversation)
 	mux.HandleFunc("POST /api/conversations/{conversationID}/messages", server.sendMessage)
 	mux.HandleFunc("GET /api/runs/{runID}/events", server.listRunEvents)
+	mux.HandleFunc("GET /api/runs/{runID}/children", server.listAgentTaskRuns)
+	if server.approval != nil && server.approval.Enabled() {
+		mux.HandleFunc("GET /api/approvals", server.listApprovals)
+		mux.HandleFunc("POST /api/approvals/{approvalID}/decision", server.decideApproval)
+	}
 	mux.HandleFunc("GET /api/knowledge/documents", server.listKnowledgeDocuments)
 	mux.HandleFunc("POST /api/knowledge/documents", server.uploadKnowledgeDocument)
 	mux.HandleFunc("DELETE /api/knowledge/documents/{documentID}", server.deleteKnowledgeDocument)
@@ -93,6 +109,9 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.chat.MultiAgentEnabled() {
 		capabilities = append(capabilities, "supervisor", "specialist-agents", "agent-handoff-audit")
 	}
+	if s.chat.ApprovalEnabled() {
+		capabilities = append(capabilities, "human-approval")
+	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
@@ -100,6 +119,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"name": "Zora", "version": "0.4.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
+		"human_approval":       s.chat.ApprovalEnabled(),
 		"embedding_model":      s.knowledge.EmbeddingModel(),
 		"retrieval_backend":    s.knowledge.RetrievalBackend(),
 		"memory_auto_capture":  s.memory.AutoCaptureEnabled(),
@@ -226,6 +246,42 @@ func (s *Server) listRunEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+func (s *Server) listAgentTaskRuns(w http.ResponseWriter, r *http.Request) {
+	runs, err := s.chat.ListAgentTaskRuns(r.Context(), r.PathValue("runID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+}
+
+func (s *Server) listApprovals(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	items, err := s.approval.List(r.Context(), strings.TrimSpace(r.URL.Query().Get("status")), limit)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"approvals": items})
+}
+
+func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		s.problem(w, err)
+		return
+	}
+	item, err := s.approval.Decide(r.Context(), r.PathValue("approvalID"), strings.ToLower(strings.TrimSpace(input.Decision)), input.Reason)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (s *Server) listKnowledgeDocuments(w http.ResponseWriter, r *http.Request) {
