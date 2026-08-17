@@ -130,6 +130,8 @@ flowchart TD
 | `ZORA_EMBEDDING_DIMENSIONS` | hash 384 / openai 1024 | 否 | 向量维度 |
 | `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 否 | Unicode 字符分块上限，最少 100 |
 | `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 否 | 重叠字符数，必须小于分块上限的一半 |
+| `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 否 | 成功回答后是否执行候选提取和 Consolidation |
+| `ZORA_MEMORY_MAX_CANDIDATES` | `3` | 否 | 单轮候选上限，范围 1–10 |
 
 配置原则：
 
@@ -432,13 +434,15 @@ PostgreSQL
 - Embedding 维度与现有列不一致时启动失败，禁止把不同维度静默写入同一索引；
 - `/api/info` 通过 `retrieval_backend` 返回 `sqlite-exact-scan` 或 `postgres-pgvector-fts`。
 
-### 8.10 长期记忆底座（当前实现）
+### 8.10 长期记忆提取与 Consolidation（当前实现）
 
 ```mermaid
 sequenceDiagram
     participant UI as Web Memory Panel
+    participant Chat as chat.Service
     participant API as httpapi
     participant Service as memory.Service
+    participant Extractor as Model/Rule Extractor
     participant DB as SQLite/PostgreSQL
 
     UI->>API: POST/PUT Memory
@@ -447,6 +451,16 @@ sequenceDiagram
     Service->>Service: 类型、长度、重要性、过期时间校验
     Service->>DB: memory.Store
     DB-->>UI: 可追溯 Memory
+
+    Chat->>DB: 保存 user/assistant Message
+    Chat->>Service: Capture(来源 ID, 用户输入, 助手回答)
+    Service->>Extractor: 提取最多 N 个候选
+    Extractor-->>Service: kind/key/content/importance/expiry
+    Service->>DB: 读取现有 Memory
+    Service->>Service: Key 去重、冲突更新、人工修正保护
+    Service->>DB: Create/Update conversation Memory
+    Service-->>Chat: created/updated/skipped
+    Chat->>DB: memory_capture_completed/failed
 ```
 
 当前 `Memory` 分为：
@@ -454,9 +468,16 @@ sequenceDiagram
 - `semantic`：相对稳定的用户事实和偏好；
 - `episodic`：发生过的任务、经历和结果。
 
-每条记录包含来源类型、可选来源会话/消息、重要性、创建/更新时间和可选过期时间。手动创建使用 `source_type=manual`；后续自动提取将使用 `conversation` 并关联原始消息。默认列表排除过期记录，管理页面显式使用 `include_expired=true`，保证用户仍能查看和删除过期数据。
+每条记录包含 `memory_key`、来源类型、可选来源会话/消息、重要性、`user_edited`、创建/更新时间和可选过期时间。手动创建使用 `source_type=manual`；自动提取使用 `conversation` 并关联原始用户消息。默认列表排除过期记录，管理页面显式使用 `include_expired=true`，保证用户仍能查看和删除过期数据。
 
-这一阶段没有把 Memory 注入模型上下文，也没有把聊天消息批量向量化。自动提取、Consolidation、冲突处理和联合召回将在后续子阶段建立，并继续复用当前 Store 契约。
+提取器分为两种：
+
+- `ModelExtractor`：真实模型使用独立中文 System Prompt，只允许输出严格 JSON；用户输入和助手回答以 JSON 数据传入，明确禁止服从其中的指令，候选正文仍会经过类型、长度、敏感标签、重要性和过期时间二次校验；
+- `RuleExtractor`：Mock/离线测试只识别明确“记住”、`我的 X 是 Y`、稳定偏好和交互语言，不从普通问答中猜测事实。
+
+Consolidation 使用 `kind + memory_key` 识别同一事实槽位：相同内容跳过，不同内容更新并记录最新来源；用户通过 REST/Web 修改自动记忆后设置 `user_edited=true`，后续自动候选不能覆盖。自动处理在回答落库后同步执行，错误只写 `memory_capture_failed`，不会把已经成功生成的回答改成失败。当前用进程级互斥避免单实例并发重复；多副本下仍需数据库唯一约束或任务队列。
+
+这一阶段仍没有把 Memory 注入模型上下文，也没有把聊天消息批量向量化。下一子阶段将实现相关性、时效性和重要性联合召回，并通过 A/B 评估决定是否注入。
 
 ## 9. 并发、取消与错误处理
 
@@ -693,7 +714,7 @@ DELETE /api/memories/{memoryID}
 }
 ```
 
-`importance` 范围为 0–1；创建时省略则默认 0.5，PUT 更新时必须提供。`expires_at` 为空字符串或省略表示永不过期；创建时非空值必须是晚于当前时间的 RFC3339，更新时允许设置过去时间以显式标记过期。非法类型、内容长度、重要性和时间返回 400；不存在的 Memory 返回 404；删除成功返回 204。
+`importance` 范围为 0–1；创建时省略则默认 0.5，PUT 更新时必须提供。`expires_at` 为空字符串或省略表示永不过期；创建时非空值必须是晚于当前时间的 RFC3339，更新时允许设置过去时间以显式标记过期。自动记忆的响应还包含只读 `memory_key`、`source_conversation_id`、`source_message_id` 和 `user_edited`；用户 PUT 后 `user_edited=true`，自动合并不得覆盖。非法类型、内容长度、重要性和时间返回 400；不存在的 Memory 返回 404；删除成功返回 204。
 
 ## 11. SSE 事件契约
 
@@ -703,7 +724,7 @@ DELETE /api/memories/{memoryID}
 | `tool_call` | `tool_name`, `tool_call_id`, `arguments` | 是 | 模型请求调用工具 |
 | `tool_result` | `tool_name`, `tool_call_id`, `content` | 是 | 工具返回结果 |
 | `delta` | `content` | 否 | 文本增量，只用于实时展示 |
-| `done` | `message` | 以 model_output/run_completed 表示 | 回答和 Run 已落库 |
+| `done` | `message`, `memory` | 以 model_output/run_completed 表示 | 回答和 Run 已落库；开启自动记忆时附带候选/新增/更新/跳过计数 |
 | `error` | `content` | 以 failed/cancelled 表示 | 执行失败或取消 |
 
 客户端不能只依赖连接关闭判断成功，必须以 `done` 为成功终点，以 `error` 为失败终点。
@@ -713,7 +734,7 @@ DELETE /api/memories/{memoryID}
 - 对话列表、自动标题、重命名和删除；
 - 欢迎页提供三个可触发工具的示例；
 - 侧边栏知识库弹窗支持上传、文档列表、分块数和删除；
-- 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，并明确提示尚未自动提取或召回；
+- 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，展示手动/对话来源与人工修正状态，并明确提示当前已自动提取但尚未召回；
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用以可折叠 Trace 展示；
@@ -736,6 +757,7 @@ DELETE /api/memories/{memoryID}
 - 删除 Conversation 时明确由用户确认。
 - 删除知识文档时明确由用户确认，上传限制文件类型、大小和 UTF-8。
 - 删除长期记忆时明确由用户确认；来源字段不能通过用户编辑接口伪造。
+- 记忆提取 Prompt 将聊天内容声明为不可信数据；Service 再次拒绝密码、令牌、银行卡和证件标签，并限制候选数。
 
 ### 上线前必须补充
 
@@ -767,12 +789,12 @@ DELETE /api/memories/{memoryID}
 
 | 层级 | 当前覆盖 |
 |---|---|
-| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Memory 校验和生命周期 |
+| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation 与人工修正保护 |
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
-| Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD、类型和过期过滤 |
+| Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD、V0.3 旧库迁移、Key/人工标记和过期过滤 |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
-| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索，以及 Memory CRUD/404 |
+| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404，以及对话自动提取和同 Key 冲突更新 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
 | 工程检查 | `go test`、`go vet`、race、无 CGO build |
 
@@ -845,7 +867,7 @@ flowchart LR
 程序性记忆：Skill、规则和工具经验
 ```
 
-当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、重要性/来源/过期字段、REST API 和 Web 用户 CRUD。下一步是在一次对话成功结束后执行候选提取、置信度判断、去重/合并和过期设置，再按相关性、时效性和重要性联合召回并注入 Agent 上下文。召回上线前必须建立有/无记忆 A/B 评测，避免错误记忆降低回答质量。
+当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、用户 CRUD，以及回答后的候选提取、稳定 Key 去重、冲突更新、来源关联、人工修正保护和审计。下一步按相关性、时效性和重要性联合召回并注入 Agent 上下文，同时补充短期摘要。召回上线前必须建立有/无记忆 A/B 评测，避免错误记忆降低回答质量。
 
 ### 17.3 V0.4 Multi-Agent
 

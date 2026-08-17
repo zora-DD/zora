@@ -18,12 +18,14 @@ const (
 )
 
 // Memory 是经过筛选后的长期信息，不等同于原始聊天消息。
-// Source 字段用于解释记忆来源；自动提取阶段会关联到具体会话和消息。
+// Source 字段用于解释记忆来源；自动提取会关联到具体会话和用户消息。
 type Memory struct {
 	ID                   string     `json:"id"`
 	Kind                 string     `json:"kind"`
+	MemoryKey            string     `json:"memory_key,omitempty"`
 	Content              string     `json:"content"`
 	Importance           float64    `json:"importance"`
+	UserEdited           bool       `json:"user_edited"`
 	SourceType           string     `json:"source_type"`
 	SourceConversationID string     `json:"source_conversation_id,omitempty"`
 	SourceMessageID      string     `json:"source_message_id,omitempty"`
@@ -42,6 +44,7 @@ type ListFilter struct {
 type Store interface {
 	CreateMemory(ctx context.Context, item Memory) error
 	GetMemory(ctx context.Context, id string) (Memory, error)
+	GetMemoryByKey(ctx context.Context, kind, memoryKey string) (Memory, error)
 	ListMemories(ctx context.Context, filter ListFilter) ([]Memory, error)
 	UpdateMemory(ctx context.Context, item Memory) error
 	DeleteMemory(ctx context.Context, id string) error
@@ -59,4 +62,39 @@ type ReplaceInput struct {
 	Content    string
 	Importance *float64
 	ExpiresAt  *time.Time
+}
+
+// Candidate 是提取器输出的待审记忆。MemoryKey 表示同一事实槽位，
+// 例如 profile:primary-programming-language；同 Key 的新值会进入冲突合并。
+type Candidate struct {
+	Kind       string
+	MemoryKey  string
+	Content    string
+	Importance float64
+	ExpiresAt  *time.Time
+}
+
+type ExtractionInput struct {
+	UserContent      string
+	AssistantContent string
+}
+
+type Extractor interface {
+	Extract(ctx context.Context, input ExtractionInput) ([]Candidate, error)
+}
+
+type CaptureInput struct {
+	ConversationID   string
+	UserMessageID    string
+	UserContent      string
+	AssistantContent string
+}
+
+// CaptureResult 可直接进入 Run 审计和 SSE，避免把候选内容暴露到执行轨迹中。
+type CaptureResult struct {
+	Enabled    bool `json:"enabled"`
+	Candidates int  `json:"candidates"`
+	Created    int  `json:"created"`
+	Updated    int  `json:"updated"`
+	Skipped    int  `json:"skipped"`
 }

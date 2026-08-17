@@ -6,6 +6,7 @@ const state = {
   messages: [],
   documents: [],
   memories: [],
+  memoryAutoCapture: false,
   editingMemoryID: null,
   busy: false,
   controller: null,
@@ -53,6 +54,7 @@ const elements = {
   cancelMemoryEdit: document.querySelector("#cancelMemoryEdit"),
   memoryList: document.querySelector("#memoryList"),
   memoryCount: document.querySelector("#memoryCount"),
+  memoryDescription: document.querySelector("#memoryDescription"),
   toast: document.querySelector("#toast"),
 };
 
@@ -87,6 +89,10 @@ async function initialize() {
     state.conversations = result.conversations || [];
     state.documents = knowledgeResult.documents || [];
     state.memories = memoryResult.memories || [];
+    state.memoryAutoCapture = Boolean(info.memory_auto_capture);
+    elements.memoryDescription.textContent = state.memoryAutoCapture
+      ? "已开启对话候选提取与去重/冲突合并；自动记忆会标注来源，手动修正后不会再被自动覆盖。当前尚未把记忆召回到模型上下文。"
+      : "自动提取当前已关闭，仅支持手动管理。所有记忆都可设置过期时间，并随时编辑或删除。";
     elements.embeddingModel.textContent = `Embedding: ${info.embedding_model}`;
     renderConversations();
     renderKnowledgeDocuments();
@@ -206,7 +212,9 @@ function renderMemories() {
   if (!state.memories.length) {
     const empty = document.createElement("div");
     empty.className = "document-empty";
-    empty.textContent = "还没有长期记忆。可以先手动添加一条可控记忆。";
+    empty.textContent = state.memoryAutoCapture
+      ? "还没有长期记忆。可以在对话中明确表达稳定偏好，也可以手动添加。"
+      : "还没有长期记忆。可以先手动添加一条可控记忆。";
     elements.memoryList.append(empty);
     return;
   }
@@ -227,8 +235,9 @@ function memoryNode(item) {
   content.textContent = item.content;
   const meta = document.createElement("small");
   const source = item.source_type === "manual" ? "手动创建" : "对话提取";
+  const corrected = item.user_edited && item.source_type === "conversation" ? " · 已人工修正" : "";
   const expiry = item.expires_at ? ` · 过期 ${formatDateTime(item.expires_at)}` : " · 永不过期";
-  meta.textContent = source + expiry;
+  meta.textContent = source + corrected + expiry;
   const actions = document.createElement("div");
   actions.className = "memory-item-actions";
   const edit = document.createElement("button");
@@ -510,6 +519,10 @@ function handleAgentEvent(type, event) {
       if (event.message) {
         const traces = state.draft.traces;
         Object.assign(state.draft, event.message, { traces, streaming: false });
+      }
+      if (event.memory && (event.memory.created > 0 || event.memory.updated > 0)) {
+        // 回答完成后刷新记忆计数；失败不会影响本轮回答展示。
+        refreshMemories().catch(() => {});
       }
       break;
     case "error":

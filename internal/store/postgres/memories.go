@@ -14,10 +14,10 @@ import (
 func (p *Postgres) CreateMemory(ctx context.Context, item memory.Memory) error {
 	_, err := p.pool.Exec(ctx, `
 INSERT INTO memories(
-    id, kind, content, importance, source_type, source_conversation_id,
-    source_message_id, created_at, updated_at, expires_at
-) VALUES($1, $2, $3, $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8, $9, $10)`,
-		item.ID, item.Kind, item.Content, item.Importance, item.SourceType,
+    id, kind, memory_key, content, importance, user_edited, source_type,
+    source_conversation_id, source_message_id, created_at, updated_at, expires_at
+) VALUES($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), NULLIF($9, ''), $10, $11, $12)`,
+		item.ID, item.Kind, item.MemoryKey, item.Content, item.Importance, item.UserEdited, item.SourceType,
 		item.SourceConversationID, item.SourceMessageID,
 		normalizeTime(item.CreatedAt), normalizeTime(item.UpdatedAt), normalizeOptionalTime(item.ExpiresAt),
 	)
@@ -29,7 +29,7 @@ INSERT INTO memories(
 
 func (p *Postgres) GetMemory(ctx context.Context, id string) (memory.Memory, error) {
 	item, err := scanMemory(p.pool.QueryRow(ctx, `
-SELECT id, kind, content, importance, source_type, source_conversation_id,
+SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
        source_message_id, created_at, updated_at, expires_at
 FROM memories WHERE id = $1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -41,9 +41,24 @@ FROM memories WHERE id = $1`, id))
 	return item, nil
 }
 
+func (p *Postgres) GetMemoryByKey(ctx context.Context, kind, memoryKey string) (memory.Memory, error) {
+	item, err := scanMemory(p.pool.QueryRow(ctx, `
+SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
+       source_message_id, created_at, updated_at, expires_at
+FROM memories WHERE kind = $1 AND memory_key = $2
+ORDER BY updated_at DESC LIMIT 1`, kind, memoryKey))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return memory.Memory{}, memory.ErrNotFound
+	}
+	if err != nil {
+		return memory.Memory{}, fmt.Errorf("按 Key 查询长期记忆失败：%w", err)
+	}
+	return item, nil
+}
+
 func (p *Postgres) ListMemories(ctx context.Context, filter memory.ListFilter) ([]memory.Memory, error) {
 	rows, err := p.pool.Query(ctx, `
-SELECT id, kind, content, importance, source_type, source_conversation_id,
+SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
        source_message_id, created_at, updated_at, expires_at
 FROM memories
 WHERE ($1 = '' OR kind = $1)
@@ -72,8 +87,11 @@ LIMIT $3`, filter.Kind, filter.IncludeExpired, filter.Limit)
 func (p *Postgres) UpdateMemory(ctx context.Context, item memory.Memory) error {
 	tag, err := p.pool.Exec(ctx, `
 UPDATE memories
-SET kind = $1, content = $2, importance = $3, updated_at = $4, expires_at = $5
-WHERE id = $6`, item.Kind, item.Content, item.Importance,
+SET kind = $1, memory_key = $2, content = $3, importance = $4, user_edited = $5,
+    source_type = $6, source_conversation_id = NULLIF($7, ''), source_message_id = NULLIF($8, ''),
+    updated_at = $9, expires_at = $10
+WHERE id = $11`, item.Kind, item.MemoryKey, item.Content, item.Importance, item.UserEdited,
+		item.SourceType, item.SourceConversationID, item.SourceMessageID,
 		normalizeTime(item.UpdatedAt), normalizeOptionalTime(item.ExpiresAt), item.ID)
 	if err != nil {
 		return fmt.Errorf("更新长期记忆失败：%w", err)
@@ -100,7 +118,7 @@ func scanMemory(row pgx.Row) (memory.Memory, error) {
 	var sourceConversationID, sourceMessageID *string
 	var expiresAt *time.Time
 	if err := row.Scan(
-		&item.ID, &item.Kind, &item.Content, &item.Importance, &item.SourceType,
+		&item.ID, &item.Kind, &item.MemoryKey, &item.Content, &item.Importance, &item.UserEdited, &item.SourceType,
 		&sourceConversationID, &sourceMessageID, &item.CreatedAt, &item.UpdatedAt, &expiresAt,
 	); err != nil {
 		return memory.Memory{}, err

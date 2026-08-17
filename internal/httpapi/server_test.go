@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -48,11 +49,8 @@ func TestConversationAndAgentSSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	memoryService, err := memory.NewService(database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler, err := New(chat.NewService(database, runtime), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	memoryService := newTestMemoryService(t, database)
+	handler, err := New(chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService)), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +188,9 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
 		t.Fatalf("info body = %s", response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"version":"0.3.0-dev"`) || !strings.Contains(response.Body.String(), `"memory-crud"`) {
+	if !strings.Contains(response.Body.String(), `"version":"0.3.0-dev"`) ||
+		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||
+		!strings.Contains(response.Body.String(), `"memory_auto_capture":true`) {
 		t.Fatalf("info does not report V0.3 memory capability: %s", response.Body.String())
 	}
 }
@@ -251,6 +251,50 @@ func TestMemoryCRUD(t *testing.T) {
 	}
 }
 
+func TestConversationAutomaticallyCapturesAndConsolidatesMemory(t *testing.T) {
+	t.Parallel()
+	handler := newTestHandler(t)
+
+	create := httptest.NewRequest(http.MethodPost, "/api/conversations", strings.NewReader(`{"title":"Memory test"}`))
+	create.Header.Set("Content-Type", "application/json")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	var conversation struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &conversation); err != nil {
+		t.Fatal(err)
+	}
+
+	sendMessage := func(content string) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversation.ID+"/messages",
+			strings.NewReader(`{"content":`+strconv.Quote(content)+`}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("send status = %d, body = %s", response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+	first := sendMessage("我的主要编程语言是 Go。")
+	if !strings.Contains(first, `"memory":{"enabled":true,"candidates":1,"created":1`) {
+		t.Fatalf("first SSE does not include capture result: %s", first)
+	}
+	second := sendMessage("我的主要编程语言是 Java。")
+	if !strings.Contains(second, `"updated":1`) {
+		t.Fatalf("second SSE does not include consolidation result: %s", second)
+	}
+
+	list := httptest.NewRequest(http.MethodGet, "/api/memories?kind=semantic", nil)
+	listed := httptest.NewRecorder()
+	handler.ServeHTTP(listed, list)
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), "用户的主要编程语言是Java。") || strings.Contains(listed.Body.String(), "用户的主要编程语言是Go。") {
+		t.Fatalf("consolidated memories status = %d, body = %s", listed.Code, listed.Body.String())
+	}
+}
+
 func newTestHandler(t *testing.T) http.Handler {
 	t.Helper()
 	database, err := sqlite.Open(filepath.Join(t.TempDir(), "spa.db"))
@@ -275,15 +319,25 @@ func newTestHandler(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	memoryService, err := memory.NewService(database)
-	if err != nil {
-		t.Fatal(err)
-	}
-	handler, err := New(chat.NewService(database, runtime), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	memoryService := newTestMemoryService(t, database)
+	handler, err := New(chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService)), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return handler
+}
+
+func newTestMemoryService(t *testing.T, database *sqlite.SQLite) *memory.Service {
+	t.Helper()
+	extractor, err := memory.NewRuleExtractor(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := memory.NewService(database, memory.WithExtractor(extractor))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
 }
 
 func newTestKnowledgeService(t *testing.T, database *sqlite.SQLite) *knowledge.Service {

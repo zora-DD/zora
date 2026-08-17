@@ -38,8 +38,9 @@ type Runtime struct {
 	provider string
 }
 
-// New 根据配置创建模型，并组装 Eino 的 ReAct Agent。
-func New(ctx context.Context, cfg config.Config, tools []tool.BaseTool) (*Runtime, error) {
+// NewChatModel 根据配置创建可复用的模型实例。主 Agent 与记忆提取器共享同一模型配置，
+// 避免两条链路出现模型名、BaseURL 或超时不一致。
+func NewChatModel(ctx context.Context, cfg config.Config) (model.BaseChatModel, error) {
 	var chatModel model.BaseChatModel
 	switch cfg.Provider {
 	case "mock":
@@ -60,6 +61,23 @@ func New(ctx context.Context, cfg config.Config, tools []tool.BaseTool) (*Runtim
 		chatModel = openAIModel
 	default:
 		return nil, fmt.Errorf("不支持的模型提供方：%q", cfg.Provider)
+	}
+	return chatModel, nil
+}
+
+// New 根据配置创建模型，并组装 Eino 的 ReAct Agent。
+func New(ctx context.Context, cfg config.Config, tools []tool.BaseTool) (*Runtime, error) {
+	chatModel, err := NewChatModel(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return NewWithModel(ctx, cfg, tools, chatModel)
+}
+
+// NewWithModel 使用已创建的模型组装 Agent，供需要共享模型配置的应用启动流程使用。
+func NewWithModel(ctx context.Context, cfg config.Config, tools []tool.BaseTool, chatModel model.BaseChatModel) (*Runtime, error) {
+	if chatModel == nil {
+		return nil, fmt.Errorf("Chat Model 不能为空")
 	}
 
 	// MaxIterations 是 Agent 的保险丝；工具只从显式 allowlist 注入。

@@ -66,21 +66,38 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	memoryService, err := memory.NewService(database)
-	if err != nil {
-		return err
-	}
 	// 知识库检索和时间、计算器一样走统一 Tool 协议，便于后续加入多 Agent 调度。
 	knowledgeTool, err := knowledge.NewSearchTool(knowledgeService)
 	if err != nil {
 		return err
 	}
 	registeredTools = append(registeredTools, knowledgeTool)
-	runtime, err := agentruntime.New(context.Background(), cfg, registeredTools)
+	chatModel, err := agentruntime.NewChatModel(context.Background(), cfg)
 	if err != nil {
 		return err
 	}
-	chatService := chat.NewService(database, runtime)
+	memoryOptions := make([]memory.Option, 0, 1)
+	if cfg.MemoryAutoCapture {
+		var extractor memory.Extractor
+		if cfg.Provider == "mock" {
+			extractor, err = memory.NewRuleExtractor(cfg.MemoryMaxCandidates)
+		} else {
+			extractor, err = memory.NewModelExtractor(chatModel, cfg.MemoryMaxCandidates)
+		}
+		if err != nil {
+			return err
+		}
+		memoryOptions = append(memoryOptions, memory.WithExtractor(extractor))
+	}
+	memoryService, err := memory.NewService(database, memoryOptions...)
+	if err != nil {
+		return err
+	}
+	runtime, err := agentruntime.NewWithModel(context.Background(), cfg, registeredTools, chatModel)
+	if err != nil {
+		return err
+	}
+	chatService := chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService))
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout)
 	if err != nil {
 		return err
@@ -97,7 +114,8 @@ func run(logger *slog.Logger) error {
 	go func() {
 		logger.Info("zora is ready", "addr", cfg.Addr, "store", cfg.StoreProvider,
 			"provider", cfg.Provider, "model", cfg.Model,
-			"embedding_provider", cfg.EmbeddingProvider, "embedding_model", embedder.Name())
+			"embedding_provider", cfg.EmbeddingProvider, "embedding_model", embedder.Name(),
+			"memory_auto_capture", cfg.MemoryAutoCapture)
 		serveErrors <- server.ListenAndServe()
 	}()
 

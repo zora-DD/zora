@@ -23,7 +23,9 @@ func TestSchemaUsesConfiguredVectorDimensions(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS memories",
 		"kind IN ('semantic', 'episodic')",
 		"importance >= 0 AND importance <= 1",
-		"INSERT INTO zora_schema_versions(version) VALUES (2)",
+		"ADD COLUMN IF NOT EXISTS memory_key",
+		"ADD COLUMN IF NOT EXISTS user_edited",
+		"INSERT INTO zora_schema_versions(version) VALUES (3)",
 	} {
 		if !strings.Contains(schema, expected) {
 			t.Fatalf("schema does not contain %q", expected)

@@ -36,6 +36,9 @@ type Config struct {
 	EmbeddingDimensions int    // 入库与查询必须使用相同的向量维度。
 	KnowledgeChunkSize  int    // 按 Unicode 字符计算的分块上限。
 	KnowledgeOverlap    int    // 相邻分块的重叠字符数，避免语义在边界断开。
+
+	MemoryAutoCapture   bool // 是否在回答完成后自动提取长期记忆候选。
+	MemoryMaxCandidates int  // 单轮最多接纳的候选数，限制额外成本和错误放大。
 }
 
 // Load 在启动阶段完成配置校验，让错误尽早暴露，而不是运行到模型调用时才失败。
@@ -71,6 +74,14 @@ func Load() (Config, error) {
 	if err != nil || postgresMaxConns > 100 {
 		return Config{}, fmt.Errorf("ZORA_POSTGRES_MAX_CONNS 必须在 1 到 100 之间")
 	}
+	memoryAutoCapture, err := strconv.ParseBool(env("ZORA_MEMORY_AUTO_CAPTURE", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_AUTO_CAPTURE 必须是 true 或 false")
+	}
+	memoryMaxCandidates, err := positiveInt("ZORA_MEMORY_MAX_CANDIDATES", "3")
+	if err != nil || memoryMaxCandidates > 10 {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_MAX_CANDIDATES 必须在 1 到 10 之间")
+	}
 
 	cfg := Config{
 		Addr:             env("ZORA_ADDR", ":8088"),
@@ -93,6 +104,9 @@ func Load() (Config, error) {
 		EmbeddingDimensions: embeddingDimensions,
 		KnowledgeChunkSize:  chunkSize,
 		KnowledgeOverlap:    chunkOverlap,
+
+		MemoryAutoCapture:   memoryAutoCapture,
+		MemoryMaxCandidates: memoryMaxCandidates,
 	}
 
 	switch cfg.StoreProvider {

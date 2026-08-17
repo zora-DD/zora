@@ -57,8 +57,10 @@ CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK (kind IN ('semantic', 'episodic')),
+    memory_key TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
     importance DOUBLE PRECISION NOT NULL CHECK (importance >= 0 AND importance <= 1),
+    user_edited BOOLEAN NOT NULL DEFAULT FALSE,
     source_type TEXT NOT NULL CHECK (source_type IN ('manual', 'conversation')),
     source_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
     source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
@@ -66,8 +68,13 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ
 );
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_edited BOOLEAN NOT NULL DEFAULT FALSE;
+UPDATE memories SET user_edited = TRUE WHERE source_type = 'manual';
 CREATE INDEX IF NOT EXISTS idx_memories_kind_updated
     ON memories(kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_kind_key
+    ON memories(kind, memory_key);
 CREATE INDEX IF NOT EXISTS idx_memories_expiry
     ON memories(expires_at);
 
@@ -112,4 +119,5 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_search_gin
 
 INSERT INTO zora_schema_versions(version) VALUES (1) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (2) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (3) ON CONFLICT DO NOTHING;
 `

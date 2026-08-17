@@ -11,7 +11,7 @@ Zora 将系统划分为八个边界：
 3. `agentruntime`：Eino ADK 适配，输出与传输协议无关的事件。
 4. `agenttools`：工具 Schema、输入校验和执行代码。
 5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
-6. `memory`：Semantic/Episodic Memory、生命周期校验和用户控制。
+6. `memory`：Semantic/Episodic Memory、候选提取、Consolidation、生命周期校验和用户控制。
 7. `store`：对话、知识库与长期记忆的持久化边界，由 SQLite 或 PostgreSQL 实现。
 8. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
 
@@ -48,11 +48,11 @@ V0.1 直接使用 `ChatModelAgent + Runner`，以获得：
 
 ### RunEvent
 
-采用 append-only 审计：`run_started`、`tool_call`、`tool_result`、`model_output`、`run_completed/failed/cancelled`。流式 token 只发往客户端，不逐 token 落库。
+采用 append-only 审计：`run_started`、`tool_call`、`tool_result`、`model_output`、`memory_capture_completed/failed`、`run_completed/failed/cancelled`。流式 token 只发往客户端，不逐 token 落库。
 
 ### Memory
 
-Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episodic` 经历/事件。每条记录包含来源、重要性、创建/更新时间和可选过期时间；当前支持用户完整 CRUD，尚未自动提取或注入模型上下文。
+Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episodic` 经历/事件。每条记录包含稳定 Key、来源、重要性、人工修正标记、创建/更新时间和可选过期时间。当前支持用户完整 CRUD，以及回答后的自动提取、去重和冲突更新；尚未注入模型上下文。
 
 ## 4. 并发与取消
 
@@ -73,7 +73,7 @@ PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业�
 - API Key 只从环境变量读取。
 - 当前没有任何写入外部系统的工具。
 - 知识文档限制为 UTF-8 TXT/Markdown 且最大 5 MiB，文档删除需要用户确认。
-- 长期记忆内容最多 2,000 字符，类型/重要性/过期时间在 Service 层校验，来源字段不可由用户伪造，删除需要确认。
+- 长期记忆内容最多 2,000 字符，类型/重要性/过期时间在 Service 层校验，来源字段不可由用户伪造，删除需要确认；候选提取 Prompt 隔离不可信聊天数据，Service 二次拒绝明显敏感凭据。
 
 ## 6. V0.2 RAG 当前架构
 
@@ -118,7 +118,8 @@ SQLite 候选召回在 Go 内最多精确扫描 10,000 个 Chunk。PostgreSQL �
 ```text
 internal/memory/
 ├── types.go          Memory/Store 契约
-└── service.go        创建、筛选、完整更新、删除和校验
+├── extractor.go      真实模型结构化提取与本地保守规则
+└── service.go        CRUD、候选校验、Key Consolidation 和人工修正保护
 
 internal/store/sqlite/memories.go
 internal/store/postgres/memories.go
@@ -127,16 +128,16 @@ GET/POST /api/memories
 GET/PUT/DELETE /api/memories/{memoryID}
 ```
 
-SQLite 与 PostgreSQL 都保存 kind、content、importance、source、created/updated/expires_at。默认查询排除过期项；Web 管理面板显式展示全部记录，确保用户仍能清理已过期记忆。
+SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_edited、source、created/updated/expires_at。默认查询排除过期项；Web 管理面板显式展示全部记录，确保用户仍能清理已过期记忆。
 
-长期记忆使用异步 Consolidation，而不是把所有聊天记录向量化：
+长期记忆当前在回答成功落库后执行同步、失败隔离的 Consolidation，而不是把所有聊天记录向量化：
 
 ```text
 对话结束 → 候选事实提取 → 置信度判断 → 去重/合并 → 持久化
 新请求   → 相关性 + 时效性 + 重要性召回 → 注入 Agent 上下文
 ```
 
-下一步将让自动提取的 Memory 关联来源消息，加入置信度、去重/冲突策略与相关性召回；这些能力尚未完成，也不会在当前界面中伪装成已生效。
+自动提取的 Memory 已关联来源用户消息，并按 Kind + Memory Key 跳过重复或更新冲突；用户手动修正会阻止后续自动覆盖。下一步实现相关性 + 时效性 + 重要性召回和上下文注入；这些能力尚未在界面中伪装成已生效。
 
 ## 8. 多 Agent 接入点
 

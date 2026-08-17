@@ -20,6 +20,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if cfg.KnowledgeChunkSize != 800 || cfg.KnowledgeOverlap != 120 {
 		t.Fatalf("unexpected chunk defaults: %+v", cfg)
 	}
+	if !cfg.MemoryAutoCapture || cfg.MemoryMaxCandidates != 3 {
+		t.Fatalf("unexpected memory defaults: %+v", cfg)
+	}
 }
 
 func TestLoadPostgresStoreRequiresDSN(t *testing.T) {
@@ -70,6 +73,7 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_EMBEDDING_PROVIDER", "ZORA_EMBEDDING_MODEL", "ZORA_EMBEDDING_API_KEY",
 		"ZORA_EMBEDDING_BASE_URL", "ZORA_EMBEDDING_DIMENSIONS", "ZORA_KNOWLEDGE_CHUNK_SIZE",
 		"ZORA_KNOWLEDGE_CHUNK_OVERLAP",
+		"ZORA_MEMORY_AUTO_CAPTURE", "ZORA_MEMORY_MAX_CANDIDATES",
 	} {
 		t.Setenv(key, "")
 	}

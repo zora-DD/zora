@@ -86,8 +86,9 @@ func Build() ([]tool.BaseTool, error) {
 					"只读工具", "执行事件审计", "TXT/Markdown 知识库摄取",
 					"向量与 BM25 混合检索", "知识库引用与答案评测",
 					"Semantic/Episodic 长期记忆 Schema", "长期记忆用户管理",
+					"对话记忆候选提取", "基于 Memory Key 的去重与冲突合并",
 				},
-				NextMilestone: "记忆候选提取、Consolidation 与联合召回",
+				NextMilestone: "长期记忆相关性召回、上下文注入与评测",
 			}, nil
 		},
 	)

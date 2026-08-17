@@ -15,6 +15,7 @@ import (
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
 )
 
@@ -22,26 +23,42 @@ const defaultConversationTitle = "新对话"
 
 // StreamEvent 是应用层事件，不直接暴露 Eino 的内部类型。
 type StreamEvent struct {
-	Type       string          `json:"type"`
-	RunID      string          `json:"run_id,omitempty"`
-	AgentName  string          `json:"agent_name,omitempty"`
-	Content    string          `json:"content,omitempty"`
-	ToolName   string          `json:"tool_name,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
-	Arguments  string          `json:"arguments,omitempty"`
-	Message    *domain.Message `json:"message,omitempty"`
+	Type       string                `json:"type"`
+	RunID      string                `json:"run_id,omitempty"`
+	AgentName  string                `json:"agent_name,omitempty"`
+	Content    string                `json:"content,omitempty"`
+	ToolName   string                `json:"tool_name,omitempty"`
+	ToolCallID string                `json:"tool_call_id,omitempty"`
+	Arguments  string                `json:"arguments,omitempty"`
+	Message    *domain.Message       `json:"message,omitempty"`
+	Memory     *memory.CaptureResult `json:"memory,omitempty"`
 }
 
 // Service 是会话用例边界，负责执行顺序、状态落库和同会话并发控制。
 type Service struct {
 	store   store.Store
 	runtime *agentruntime.Runtime
+	memory  memoryCapturer
 	locksMu sync.Mutex
 	locks   map[string]*sync.Mutex
 }
 
-func NewService(store store.Store, runtime *agentruntime.Runtime) *Service {
-	return &Service{store: store, runtime: runtime, locks: make(map[string]*sync.Mutex)}
+type memoryCapturer interface {
+	Capture(ctx context.Context, input memory.CaptureInput) (memory.CaptureResult, error)
+}
+
+type Option func(*Service)
+
+func WithMemoryCapturer(capturer memoryCapturer) Option {
+	return func(service *Service) { service.memory = capturer }
+}
+
+func NewService(store store.Store, runtime *agentruntime.Runtime, options ...Option) *Service {
+	service := &Service{store: store, runtime: runtime, locks: make(map[string]*sync.Mutex)}
+	for _, option := range options {
+		option(service)
+	}
+	return service
 }
 
 func (s *Service) Model() string    { return s.runtime.Model() }
@@ -188,13 +205,32 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 	if err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
-	completedAt := time.Now().UTC()
 	if err := s.appendEvent(ctx, run.ID, "model_output", agentruntime.AgentName, "", map[string]any{
 		"assistant_message_id": assistantMessage.ID,
 		"characters":           utf8.RuneCountInString(answer),
 	}); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
+	var captureResult *memory.CaptureResult
+	if s.memory != nil {
+		result, captureErr := s.memory.Capture(ctx, memory.CaptureInput{
+			ConversationID: conversationID, UserMessageID: userMessage.ID,
+			UserContent: content, AssistantContent: answer,
+		})
+		if captureErr != nil {
+			// 自动记忆是回答后的增强链路，失败只进入审计，不能让已经生成的正常回答失败。
+			_ = s.appendEvent(ctx, run.ID, "memory_capture_failed", agentruntime.AgentName, "", map[string]any{
+				"error": captureErr.Error(),
+			})
+		} else if result.Enabled {
+			captureResult = &result
+			_ = s.appendEvent(ctx, run.ID, "memory_capture_completed", agentruntime.AgentName, "", map[string]any{
+				"candidates": result.Candidates, "created": result.Created,
+				"updated": result.Updated, "skipped": result.Skipped,
+			})
+		}
+	}
+	completedAt := time.Now().UTC()
 	if err := s.appendEvent(ctx, run.ID, "run_completed", agentruntime.AgentName, "", map[string]any{
 		"assistant_message_id": assistantMessage.ID,
 	}); err != nil {
@@ -203,7 +239,7 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 	if err := s.store.FinishRun(ctx, run.ID, domain.RunCompleted, assistantMessage.ID, "", completedAt); err != nil {
 		return err
 	}
-	return emit(StreamEvent{Type: "done", RunID: run.ID, Message: &assistantMessage})
+	return emit(StreamEvent{Type: "done", RunID: run.ID, Message: &assistantMessage, Memory: captureResult})
 }
 
 func (s *Service) failRun(ctx context.Context, runID string, cause error) error {

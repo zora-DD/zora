@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.3 Long-term Memory（可控记忆底座）
+> 文档基线：V0.3 Long-term Memory（自动写入与可控 Consolidation）
 > 最后更新：2026-08-17
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立 Semantic/Episodic Memory Schema、双数据库持久化、REST API 和 Web 用户控制面；自动提取、Consolidation、召回注入和 A/B 评估仍是后续子阶段。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立 Semantic/Episodic Memory Schema、双数据库持久化、REST/Web 用户控制面，以及回答后的候选提取和 Consolidation；相关性召回、上下文注入、短期摘要和 A/B 评估仍是后续子阶段。
 
 ## 2. 背景与问题
 
@@ -75,6 +75,13 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 1. 用户上传文档，系统验证大小和 UTF-8，按内容哈希去重，分块并批量生成向量，最后事务入库。
 2. 对话涉及上传资料时，Agent 调用 `knowledge_search`，系统独立计算向量相似度与 BM25，用 RRF 融合后返回带文档名和分块序号的证据。
 
+长期记忆写入场景增加一条回答后增强链：
+
+1. 回答成功落库后，真实模型结构化提取最多 N 个候选；Mock 使用保守确定性规则。
+2. Memory Service 校验候选并按 `kind + memory_key` 查找同一事实槽位。
+3. 新事实创建、重复内容跳过、冲突值更新；用户手动修正后的记录禁止自动覆盖。
+4. 来源会话/消息写入 Memory，处理计数进入 RunEvent 和 SSE；提取失败不影响已经成功的回答。
+
 ## 5. 业务能力模型
 
 | 能力域 | 当前状态 | 说明 |
@@ -91,7 +98,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | PostgreSQL 知识库 | 已实现 | pgxpool、完整 Store、pgvector HNSW、FTS/GIN、RRF 候选融合 |
 | 生产知识库剩余项 | V0.2 进行中 | 权限、文档版本/PDF、更强语义评测和生产验收 |
 | 长期记忆底座 | 已实现 | Semantic/Episodic Schema、来源/重要性/过期字段、双存储和用户 CRUD |
-| 自动记忆 | V0.3 进行中 | 候选提取、Consolidation、联合召回、上下文注入和 A/B 评估 |
+| 自动记忆写入 | 已实现 | 结构化/规则提取、Memory Key 去重与冲突更新、来源追踪、人工修正保护和审计 |
+| 记忆召回 | V0.3 进行中 | 联合召回、上下文注入、短期摘要和 A/B 评估 |
 | 多 Agent | 规划 V0.4 | Supervisor、专业 Agent、预算和效果对比 |
 | 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
 
@@ -109,7 +117,7 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | Model Provider | 生成回答和工具决策的模型来源 | 由环境配置选择 |
 | KnowledgeDocument | 一份已完成索引的用户文档 | 上传后持续存在，可删除 |
 | KnowledgeChunk | 可检索、可引用的原文片段 | 与文档在同一事务创建，随文档级联删除 |
-| Memory | 经筛选的长期事实、偏好或事件 | 可手动创建、编辑、过期和删除；后续支持从消息提取与合并 |
+| Memory | 经筛选的长期事实、偏好或事件 | 可由对话提取或手动创建、编辑、过期和删除；同 Key 候选执行合并 |
 
 ### 6.2 对象关系
 
@@ -186,8 +194,10 @@ erDiagram
     MEMORY {
         string id PK
         string kind
+        string memory_key
         text content
         float importance
+        bool user_edited
         string source_type
         datetime expires_at
         datetime created_at
@@ -302,15 +312,17 @@ SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embe
 |---|---|---|---|
 | `id` | TEXT | PK | `mem_` 前缀 ID |
 | `kind` | TEXT | CHECK | `semantic` 或 `episodic` |
+| `memory_key` | TEXT | NOT NULL | 自动合并的稳定事实槽位；手动创建可为空 |
 | `content` | TEXT | NOT NULL | 经筛选的记忆正文，最多 2,000 字符 |
 | `importance` | REAL/DOUBLE | CHECK 0–1 | 后续联合召回的重要性信号 |
-| `source_type` | TEXT | CHECK | 当前手动创建为 `manual`，自动提取使用 `conversation` |
+| `user_edited` | BOOLEAN/INTEGER | NOT NULL | 人工修正保护；为真时自动候选不得覆盖 |
+| `source_type` | TEXT | CHECK | 手动创建为 `manual`，自动提取使用 `conversation` |
 | `source_conversation_id` | TEXT | Nullable FK | 来源会话，删除会话时置空 |
 | `source_message_id` | TEXT | Nullable FK | 来源消息，删除消息时置空 |
 | `created_at` / `updated_at` | 时间 | NOT NULL | 生命周期与时效性信号 |
 | `expires_at` | 时间 | Nullable | 可选过期时间；普通列表默认排除过期项 |
 
-来源字段在用户编辑时保持不可变，防止手动记忆伪造为模型自动提取结果。当前没有向量列：在真正确定召回算法、Embedding 迁移和评估方案前，不提前把聊天历史变成不可控的向量副本。
+来源字段在用户编辑时保持不可变，防止手动记忆伪造为模型自动提取结果；编辑会设置 `user_edited=true`，后续自动 Consolidation 必须跳过。当前没有向量列：在真正确定召回算法、Embedding 迁移和评估方案前，不提前把聊天历史变成不可控的向量副本。
 
 ## 8. 技术架构
 
@@ -354,7 +366,7 @@ flowchart LR
 | 能力层 | `internal/agenttools` | 工具 Schema、校验和安全执行 |
 | 知识库应用层 | `internal/knowledge` | 分块、Embedding 适配、混合召回、引用与 Agent Tool |
 | RAG 评测层 | `internal/rageval` | 固定集校验、检索指标、答案引用/忠实度和联合门禁 |
-| 记忆应用层 | `internal/memory` | Semantic/Episodic 模型、输入校验、过期过滤和用户 CRUD |
+| 记忆应用层 | `internal/memory` | Semantic/Episodic 模型、候选提取、Consolidation、输入校验、过期过滤和用户 CRUD |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
@@ -410,9 +422,9 @@ RAG 已把语料、问题、相关文档、预期事实/证据锚点和阈值作
 
 每个 SearchResult 都带 `document_id`、`document_name`、`chunk_id`、`ordinal`、`start_rune` 和 `end_rune`。引用信息来自持久化原文坐标，而不是让模型临时编造来源。
 
-### 9.9 长期记忆先控制、后自动化
+### 9.9 长期记忆先控制、再自动写入
 
-V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 Memory 生命周期和用户控制面。类型、来源、重要性和过期时间均为一等字段；自动提取只能在后续通过 `source_type=conversation` 关联原始事实。这使错误记忆能够被定位、修正和删除，也为 Consolidation 与 A/B 评估提供稳定边界。
+V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 Memory 生命周期和用户控制面，再接入自动写入。类型、稳定 Key、来源、重要性、人工修正和过期时间均为一等字段；自动提取通过 `source_type=conversation` 关联原始事实。真实模型 Prompt 只允许提取用户明确表达的稳定信息，Service 负责二次校验和同 Key 合并。错误记忆能够被定位、修正和删除，人工修正后不会被下一轮模型覆盖。
 
 ## 10. 当前限制与风险
 
@@ -427,7 +439,8 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 | 同步文档索引 | 大文件会占用 HTTP 请求 | 异步 Ingestion Job、重试和状态机 |
 | 进程内会话锁 | 多实例之间不能互斥 | advisory lock 或带租约分布式锁 |
 | 最近 40 条上下文 | 长对话会丢失早期信息 | 摘要 + 长期记忆召回 |
-| Memory 当前仅支持手动 CRUD | 数据可控但不会自动改善回答 | 增加候选提取、合并、联合召回与上下文注入，并用 A/B 评估门禁上线 |
+| 自动记忆仍同步执行 | 真实模型会增加一次调用延迟；多副本仅有进程内合并锁 | 后续改为任务队列，并在数据库增加唯一约束/版本号 |
+| Memory 尚未进入回答上下文 | 已能积累和管理事实，但不会自动改善后续回答 | 增加联合召回与上下文注入，并用 A/B 评估门禁上线 |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
 | 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
 | 尚无 token/cost 指标 | 无法比较模型成本 | 从 ResponseMeta 采集 Usage |
@@ -470,7 +483,7 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 
 1. **V0.1 Agent Core**：建立当前可运行基线。
 2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
-3. **V0.3 Long-term Memory（进行中）**：Schema、双存储和用户 CRUD 已实现；继续完成记忆提取、合并、过期策略、召回与评估。
+3. **V0.3 Long-term Memory（进行中）**：Schema、双存储、用户 CRUD、候选提取和 Consolidation 已实现；继续完成召回、短期摘要、上下文注入与评估。
 4. **V0.4 Multi-Agent**：Supervisor、专业 Agent、预算和对照评估。
 5. **V0.5 Office Agent**：MCP、办公连接器、审批、权限和审计。
 

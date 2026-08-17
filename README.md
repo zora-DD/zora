@@ -23,7 +23,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | PostgreSQL 向量库 | 已实现 | pgx 连接池、幂等迁移、pgvector HNSW、PostgreSQL FTS、RRF 候选融合 |
 | 生产知识库剩余项 | V0.2 进行中 | 文档权限、版本、PDF、更强语义评测和真实数据验收 |
 | 长期记忆底座 | 已完成 | Semantic/Episodic Schema、重要性、来源、过期时间、SQLite/PostgreSQL 和用户 CRUD |
-| 自动记忆 | V0.3 进行中 | 候选提取、去重/冲突合并、召回注入、短期摘要和 A/B 评估 |
+| 自动记忆写入 | 已完成 | 真实模型结构化提取、本地规则提取、Memory Key 去重/冲突合并、人工修正保护和 Run 审计 |
+| 记忆召回 | V0.3 进行中 | 相关性/时效性/重要性排序、上下文注入、短期摘要和 A/B 评估 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
 
@@ -39,7 +40,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **双存储后端**：SQLite 保留零依赖精确扫描；PostgreSQL 将向量和全文候选召回下推数据库，HTTP 与 Agent Tool 契约保持不变。
 - **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
-- **长期记忆不是消息向量库**：Memory 拥有独立类型、来源、重要性和过期时间；当前先提供用户完全可控的 CRUD，再逐步加入自动提取和召回。
+- **长期记忆不是消息向量库**：Memory 拥有独立类型、稳定 Key、来源、重要性和过期时间；候选只在回答成功后提取，同 Key 冲突执行合并，人工修正不会被自动覆盖。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -61,7 +62,17 @@ make run
 
 打开 [http://localhost:8088](http://localhost:8088)。默认不需要 API Key。
 
-侧边栏“长期记忆”可手动维护 `semantic`（稳定事实/偏好）和 `episodic`（经历/事件）记忆，并设置重要性及可选过期时间。当前版本尚不会自动从对话提取记忆，也不会把这些记忆注入模型上下文。
+侧边栏“长期记忆”可维护 `semantic`（稳定事实/偏好）和 `episodic`（经历/事件）记忆，并设置重要性及可选过期时间。默认开启自动候选提取：本地 Mock 只识别明确的“记住”、个人资料和稳定偏好；真实模型使用严格中文 JSON Prompt 提取。自动记忆会关联来源会话/消息，同一 `memory_key` 的新值会合并，用户手动修改后自动流程不再覆盖。
+
+可以用本地 Mock 验证：
+
+```text
+我的主要编程语言是 Go。
+我的主要编程语言是 Java。
+我以后希望你用中文回答。
+```
+
+前两句话最终只保留一个“主要编程语言”记忆，值更新为 Java。当前记忆尚未注入后续模型上下文，因此“记住”和“回答时真正使用”是两个独立的可验收阶段。
 
 可以尝试：
 
@@ -168,6 +179,8 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_EMBEDDING_DIMENSIONS` | hash: `384`；openai: `1024` | 向量维度，变更后需重建旧索引 |
 | `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 每个分块的 Unicode 字符上限 |
 | `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 相邻分块重叠字符数 |
+| `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 成功回答后是否自动提取并合并长期记忆 |
+| `ZORA_MEMORY_MAX_CANDIDATES` | `3` | 单轮最多候选数，范围 1–10 |
 
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
@@ -230,8 +243,11 @@ sequenceDiagram
     end
     LLM-->>ADK: 流式回答
     ADK-->>UI: delta
-    Service->>DB: 保存回答和完成事件
-    Service-->>UI: done
+    Service->>DB: 保存回答
+    Service->>LLM: 提取长期记忆候选（真实模型）
+    Service->>DB: 按 Memory Key 去重/冲突合并
+    Service->>DB: 保存记忆审计和完成事件
+    Service-->>UI: done（含记忆处理计数）
 ```
 
 ## API 概览
@@ -257,7 +273,7 @@ sequenceDiagram
 | `PUT` | `/api/memories/{id}` | 完整更新内容、类型、重要性和过期时间 |
 | `DELETE` | `/api/memories/{id}` | 用户删除长期记忆 |
 
-SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。
+SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；候选正文不会写进 SSE 或 RunEvent。
 
 完整请求、响应和事件契约见 [项目技术文档](docs/technical-design.md)。
 
@@ -274,7 +290,7 @@ internal/agentruntime/     Eino Runtime、模型适配和事件转换
 internal/agenttools/       只读工具和安全计算器
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/rageval/          检索指标、答案引用/忠实度指标和门禁
-internal/memory/           Semantic/Episodic 模型、校验和用户可控 CRUD
+internal/memory/           Semantic/Episodic 模型、提取、Consolidation、校验和用户 CRUD
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
 internal/store/sqlite/     对话与知识库的 SQLite 实现
@@ -356,7 +372,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 - V0.1：Agent Core——已完成
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
-- V0.3：长期记忆——Schema、双存储和用户 CRUD 已完成，自动提取/召回进行中
+- V0.3：长期记忆——Schema、双存储、用户 CRUD、候选提取和 Consolidation 已完成；召回注入与评测进行中
 - V0.4：多 Agent
 - V0.5：MCP 办公助手
 

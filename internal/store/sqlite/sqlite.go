@@ -69,8 +69,10 @@ CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK (kind IN ('semantic', 'episodic')),
+    memory_key TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
     importance REAL NOT NULL CHECK (importance >= 0 AND importance <= 1),
+    user_edited INTEGER NOT NULL DEFAULT 0 CHECK (user_edited IN (0, 1)),
     source_type TEXT NOT NULL CHECK (source_type IN ('manual', 'conversation')),
     source_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
     source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
@@ -143,7 +145,55 @@ func Open(path string) (*SQLite, error) {
 		db.Close()
 		return nil, fmt.Errorf("执行 SQLite 表结构迁移失败：%w", err)
 	}
+	if err = ensureMemoryColumns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &SQLite{db: db}, nil
+}
+
+// ensureMemoryColumns 兼容已经由 V0.3 第一阶段创建的数据库。
+// SQLite 不支持所有版本上的 ADD COLUMN IF NOT EXISTS，因此先读取表结构再迁移。
+func ensureMemoryColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(memories)`)
+	if err != nil {
+		return fmt.Errorf("读取 SQLite 长期记忆表结构失败：%w", err)
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("解析 SQLite 长期记忆表结构失败：%w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("遍历 SQLite 长期记忆表结构失败：%w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭 SQLite 表结构结果失败：%w", err)
+	}
+	if !columns["memory_key"] {
+		if _, err := db.Exec(`ALTER TABLE memories ADD COLUMN memory_key TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("迁移 SQLite memory_key 字段失败：%w", err)
+		}
+	}
+	if !columns["user_edited"] {
+		if _, err := db.Exec(`ALTER TABLE memories ADD COLUMN user_edited INTEGER NOT NULL DEFAULT 0 CHECK (user_edited IN (0, 1))`); err != nil {
+			return fmt.Errorf("迁移 SQLite user_edited 字段失败：%w", err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE memories SET user_edited = 1 WHERE source_type = 'manual'`); err != nil {
+		return fmt.Errorf("迁移 SQLite 手动记忆保护标记失败：%w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_memories_kind_key ON memories(kind, memory_key)`); err != nil {
+		return fmt.Errorf("创建 SQLite 长期记忆合并索引失败：%w", err)
+	}
+	return nil
 }
 
 func (s *SQLite) Close() error { return s.db.Close() }

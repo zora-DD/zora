@@ -78,15 +78,19 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"knowledge-ingestion", "hybrid-retrieval", "knowledge-citations",
 		"semantic-memory", "episodic-memory", "memory-crud",
 	}
+	if s.memory.AutoCaptureEnabled() {
+		capabilities = append(capabilities, "memory-auto-capture", "memory-consolidation")
+	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "Zora", "version": "0.3.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
-		"embedding_model":   s.knowledge.EmbeddingModel(),
-		"retrieval_backend": s.knowledge.RetrievalBackend(),
-		"capabilities":      capabilities,
+		"embedding_model":     s.knowledge.EmbeddingModel(),
+		"retrieval_backend":   s.knowledge.RetrievalBackend(),
+		"memory_auto_capture": s.memory.AutoCaptureEnabled(),
+		"capabilities":        capabilities,
 	})
 }
 

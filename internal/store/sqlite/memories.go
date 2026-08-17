@@ -13,10 +13,10 @@ import (
 func (s *SQLite) CreateMemory(ctx context.Context, item memory.Memory) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO memories(
-    id, kind, content, importance, source_type, source_conversation_id,
-    source_message_id, created_at, updated_at, expires_at
-) VALUES(?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?)`,
-		item.ID, item.Kind, item.Content, item.Importance, item.SourceType,
+    id, kind, memory_key, content, importance, user_edited, source_type,
+    source_conversation_id, source_message_id, created_at, updated_at, expires_at
+) VALUES(?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?)`,
+		item.ID, item.Kind, item.MemoryKey, item.Content, item.Importance, boolInt(item.UserEdited), item.SourceType,
 		item.SourceConversationID, item.SourceMessageID,
 		formatTime(item.CreatedAt), formatTime(item.UpdatedAt), optionalTimeString(item.ExpiresAt),
 	)
@@ -28,7 +28,7 @@ INSERT INTO memories(
 
 func (s *SQLite) GetMemory(ctx context.Context, id string) (memory.Memory, error) {
 	item, err := scanMemory(s.db.QueryRowContext(ctx, `
-SELECT id, kind, content, importance, source_type, source_conversation_id,
+SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
        source_message_id, created_at, updated_at, expires_at
 FROM memories WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -40,9 +40,24 @@ FROM memories WHERE id = ?`, id))
 	return item, nil
 }
 
+func (s *SQLite) GetMemoryByKey(ctx context.Context, kind, memoryKey string) (memory.Memory, error) {
+	item, err := scanMemory(s.db.QueryRowContext(ctx, `
+SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
+       source_message_id, created_at, updated_at, expires_at
+FROM memories WHERE kind = ? AND memory_key = ?
+ORDER BY updated_at DESC LIMIT 1`, kind, memoryKey))
+	if errors.Is(err, sql.ErrNoRows) {
+		return memory.Memory{}, memory.ErrNotFound
+	}
+	if err != nil {
+		return memory.Memory{}, fmt.Errorf("按 Key 查询长期记忆失败：%w", err)
+	}
+	return item, nil
+}
+
 func (s *SQLite) ListMemories(ctx context.Context, filter memory.ListFilter) ([]memory.Memory, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, kind, content, importance, source_type, source_conversation_id,
+SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
        source_message_id, created_at, updated_at, expires_at
 FROM memories
 WHERE (? = '' OR kind = ?)
@@ -71,8 +86,11 @@ LIMIT ?`, filter.Kind, filter.Kind, boolInt(filter.IncludeExpired), formatTimeNo
 func (s *SQLite) UpdateMemory(ctx context.Context, item memory.Memory) error {
 	result, err := s.db.ExecContext(ctx, `
 UPDATE memories
-SET kind = ?, content = ?, importance = ?, updated_at = ?, expires_at = ?
-WHERE id = ?`, item.Kind, item.Content, item.Importance,
+SET kind = ?, memory_key = ?, content = ?, importance = ?, user_edited = ?,
+    source_type = ?, source_conversation_id = NULLIF(?, ''), source_message_id = NULLIF(?, ''),
+    updated_at = ?, expires_at = ?
+WHERE id = ?`, item.Kind, item.MemoryKey, item.Content, item.Importance, boolInt(item.UserEdited),
+		item.SourceType, item.SourceConversationID, item.SourceMessageID,
 		formatTime(item.UpdatedAt), optionalTimeString(item.ExpiresAt), item.ID)
 	if err != nil {
 		return fmt.Errorf("更新长期记忆失败：%w", err)
@@ -105,15 +123,17 @@ func (s *SQLite) DeleteMemory(ctx context.Context, id string) error {
 func scanMemory(row rowScanner) (memory.Memory, error) {
 	var item memory.Memory
 	var sourceConversationID, sourceMessageID, expiresAt sql.NullString
+	var userEdited int
 	var createdAt, updatedAt string
 	if err := row.Scan(
-		&item.ID, &item.Kind, &item.Content, &item.Importance, &item.SourceType,
+		&item.ID, &item.Kind, &item.MemoryKey, &item.Content, &item.Importance, &userEdited, &item.SourceType,
 		&sourceConversationID, &sourceMessageID, &createdAt, &updatedAt, &expiresAt,
 	); err != nil {
 		return memory.Memory{}, err
 	}
 	item.SourceConversationID = sourceConversationID.String
 	item.SourceMessageID = sourceMessageID.String
+	item.UserEdited = userEdited == 1
 	var err error
 	if item.CreatedAt, err = parseTime(createdAt); err != nil {
 		return memory.Memory{}, err
