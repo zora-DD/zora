@@ -34,7 +34,7 @@
 
 当前验证结果：上传 → 分块 → Embedding → 向量/关键词 → RRF → `knowledge_search` → 对话 SSE 的纵向链路已打通。SQLite 采用进程内精确扫描；PostgreSQL 实现完整 Store、pgvector HNSW、`tsvector`/GIN、维度校验、迁移锁和数据库候选下推。自动化测试已覆盖 Store 契约、候选融合和评测指标；真实 PostgreSQL 生命周期测试可通过 `make test-postgres` 执行，但本次开发环境没有 Docker，容器验收尚未实际运行。`zora-rag-smoke-v1` 在默认 Hash Embedding 下得到 Recall@3=1、MRR=1，事实覆盖率/有效引用覆盖率/引用忠实度均为 1；但三种检索模式仍然打平，确定性锚点评测也不能替代真实模型语义评审，因此仍需真实语义样本和 ACL，V0.2 暂不标记完成。
 
-## V0.3 Long-term Memory
+## V0.3 Long-term Memory — 主链路已完成
 
 - [x] 短期历史压缩与增量摘要（最近消息窗口、双存储、安全注入和审计）
 - [x] Semantic / Episodic Memory Schema（来源、重要性、可选过期时间）
@@ -42,11 +42,11 @@
 - [x] Memory Key 去重、冲突更新、人工修正保护和过期过滤
 - [x] 相关性 + 时效性 + 重要性召回与安全上下文注入
 - [x] 用户创建、查看、编辑、删除记忆（REST API + Web 面板）
-- [ ] 有/无记忆 A/B 评估
+- [x] 有/无记忆 A/B 评估（完整 Chat 链路、硬负例、事实覆盖与污染门禁）
 
 验收条件：长期记忆不是历史消息向量库；每条记忆可解释来源并可由用户控制。
 
-当前验证结果：已建立独立 `memories` 表和 `memory.Service`，区分 semantic/episodic，保存稳定 `memory_key`、来源会话/消息、重要性、人工修正标记和可选过期时间；SQLite 与 PostgreSQL 保持相同 Store 契约。回答成功后，真实模型使用抗指令注入的中文结构化 Prompt 提取候选，本地 Mock 使用保守规则；Service 按 Kind + Memory Key 创建、跳过重复或更新冲突，并拒绝覆盖人工修正。新请求执行前以词项相关性 65% + 重要性 20% + 90 天半衰期时效性 15% 联合排序，过门槛的 Top-K 记忆以不可信 JSON 数据注入独立 System Message，总正文上限 6,000 字符；本轮输入冲突时优先本轮。长对话按实际未摘要消息数触发增量摘要，`conversation_summaries` 保存已覆盖序号，最近窗口继续保留原文；摘要与历史数据均按不可信背景注入，失败自动退化为最近原始消息。原始消息不会因摘要而删除。提取、召回和摘要失败均不影响正常回答，RunEvent 不保存记忆或摘要正文。尚未完成有/无记忆 A/B 质量门禁，因此 V0.3 仍在进行中。
+当前验证结果：已建立独立 `memories` 表和 `memory.Service`，区分 semantic/episodic，保存稳定 `memory_key`、来源会话/消息、重要性、人工修正标记和可选过期时间；SQLite 与 PostgreSQL 保持相同 Store 契约。回答成功后，真实模型使用抗指令注入的中文结构化 Prompt 提取候选，本地 Mock 使用保守规则；Service 按 Kind + Memory Key 创建、跳过重复或更新冲突，并拒绝覆盖人工修正。新请求执行前以词项相关性 65% + 重要性 20% + 90 天半衰期时效性 15% 联合排序，非总览问题还需达到 0.20 最低主题相关性；过门槛的 Top-K 记忆以不可信 JSON 数据注入独立 System Message，总正文上限 6,000 字符。长对话按实际未摘要消息数触发增量摘要，`conversation_summaries` 保存覆盖序号，最近窗口继续保留原文；原始消息不会删除。`make eval-memory` 在隔离数据库中让同一问题通过 Control/Treatment 完整 Chat 链路，并从 RunEvent 核对实际注入 ID。默认 5 题基线达到预期召回率 1、错误召回率 0、Treatment 事实覆盖率 1、Control 事实覆盖率 0、覆盖增益 1、答案污染率 0。基线曾发现“Go 并发模型”被个人语言记忆污染，新增最低主题相关性后通过，证明门禁能够驱动实现修正。V0.3 主链路已完成。
 
 ## V0.4 Multi-Agent
 

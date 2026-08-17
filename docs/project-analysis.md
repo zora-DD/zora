@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.3 Long-term Memory（自动写入、召回注入与会话增量摘要）
+> 文档基线：V0.3 Long-term Memory（自动写入、召回、摘要与 A/B 门禁）
 > 最后更新：2026-08-17
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立 Semantic/Episodic Memory Schema、双数据库持久化、REST/Web 用户控制面、回答后的候选提取/Consolidation、回答前的联合召回，以及“增量摘要 + 最近原始消息”的短期上下文压缩；有/无记忆 A/B 评估仍是后续子阶段。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立 Semantic/Episodic Memory Schema、双数据库持久化、REST/Web 用户控制面、回答后的候选提取/Consolidation、回答前的联合召回、“增量摘要 + 最近原始消息”的短期上下文压缩，以及完整 Chat 链路的有/无记忆 A/B 质量门禁。
 
 ## 2. 背景与问题
 
@@ -115,7 +115,7 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 自动记忆写入 | 已实现 | 结构化/规则提取、Memory Key 去重与冲突更新、来源追踪、人工修正保护和审计 |
 | 记忆召回与注入 | 已实现 | 相关性/重要性/时效性联合评分、Top-K 安全注入、调试 API 和 Run 审计 |
 | 会话摘要与上下文压缩 | 已实现 | 阈值触发、增量合并、最近窗口、双存储、安全注入和审计 |
-| 记忆 A/B 评估 | V0.3 进行中 | 有/无记忆数据集、错误注入率、回答质量、Token 和延迟门禁 |
+| 记忆 A/B 评估 | 已实现 | 隔离数据集、完整 Chat Control/Treatment、预期/错误召回、事实增益、污染和延迟报告 |
 | 多 Agent | 规划 V0.4 | Supervisor、专业 Agent、预算和效果对比 |
 | 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
 
@@ -399,6 +399,9 @@ flowchart LR
     Knowledge --> Embedder["Hash / OpenAI Embedder"]
     EvalCLI["zora-eval"] --> RAGEval["rageval"]
     EvalCLI --> Knowledge
+    MemoryEvalCLI["zora-memory-eval"] --> MemoryEval["memoryeval"]
+    MemoryEvalCLI --> Chat
+    MemoryEval --> Memory
 
     Runtime -. "领域事件" .-> Chat
     Chat -. "SSE 事件" .-> HTTP
@@ -416,6 +419,7 @@ flowchart LR
 | 知识库应用层 | `internal/knowledge` | 分块、Embedding 适配、混合召回、引用与 Agent Tool |
 | RAG 评测层 | `internal/rageval` | 固定集校验、检索指标、答案引用/忠实度和联合门禁 |
 | 记忆应用层 | `internal/memory` | Semantic/Episodic 模型、候选提取、Consolidation、联合召回、输入校验和用户 CRUD |
+| Memory 评测层 | `internal/memoryeval` | Control/Treatment 编排、召回/事实/污染指标、报告和门禁 |
 | 摘要应用层 | `internal/summary` | 触发窗口、增量摘要、Model/Rule Summarizer 和持久化边界 |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
@@ -462,7 +466,7 @@ HTTP 和 Store 不依赖 Eino 事件类型。`agentruntime.Event` 作为防腐�
 
 ### 9.6 面向评估演进
 
-RAG 已把语料、问题、相关文档、预期事实/证据锚点和阈值作为版本化资产：对 vector、keyword、hybrid 分别计算 Recall@K、MRR、命中率和延迟，并让真实 Agent Runtime 生成答案，检查事实覆盖、引用能否解析到本次工具证据、所引原文是否包含支持锚点。后续 Memory 和 Multi-Agent 同样设置对照指标；多 Agent 只有在质量收益能够覆盖成本和延迟时才保留，避免“功能数量等于技术深度”的误区。
+RAG 已把语料、问题、相关文档、预期事实/证据锚点和阈值作为版本化资产：对 vector、keyword、hybrid 分别计算 Recall@K、MRR、命中率和延迟，并让真实 Agent Runtime 生成答案，检查事实覆盖、引用能否解析到本次工具证据、所引原文是否包含支持锚点。Memory 也已建立 Control/Treatment 对照指标；后续多 Agent 只有在质量收益能够覆盖成本和延迟时才保留，避免“功能数量等于技术深度”的误区。
 
 ### 9.7 可交换的 RAG 边界
 
@@ -476,9 +480,13 @@ RAG 已把语料、问题、相关文档、预期事实/证据锚点和阈值作
 
 V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 Memory 生命周期和用户控制面，再接入自动写入。类型、稳定 Key、来源、重要性、人工修正和过期时间均为一等字段；自动提取通过 `source_type=conversation` 关联原始事实。真实模型 Prompt 只允许提取用户明确表达的稳定信息，Service 负责二次校验和同 Key 合并。错误记忆能够被定位、修正和删除，人工修正后不会被下一轮模型覆盖。
 
-召回也先采用可解释基线：中文双字/西文词项相关性占 65%，重要性占 20%，90 天半衰期时效性占 15%。无相关词项默认不注入，记忆正文被标记为不可信背景数据且有 6,000 字符硬上限。通过 `ZORA_MEMORY_RECALL_ENABLED` 可独立关闭注入，为后续有/无记忆 A/B 提供天然对照组。
+召回也先采用可解释基线：中文双字/西文词项相关性占 65%，重要性占 20%，90 天半衰期时效性占 15%。无相关词项默认不注入，非总览问题还需达到 0.20 最低主题相关性；记忆正文被标记为不可信背景数据且有 6,000 字符硬上限。线上可通过 `ZORA_MEMORY_RECALL_ENABLED` 独立关闭注入，离线 A/B 命令则显式组装 Control/Treatment 两个 Chat Service。
 
-### 9.10 会话摘要保留原文与失败隔离
+### 9.10 A/B 门禁真实经过产品链路
+
+Memory 评测不是直接调用 `Recall` 后检查返回数量。Control 和 Treatment 使用相同 Runtime/Store，分别关闭和开启 `MemoryRecaller`，完整经过 `chat.Send`、Eino、消息持久化和 RunEvent；评测器再从实际 Run 审计读取注入 ID。固定集包含相似主题硬负例，第一次运行确实发现通用 Go 问题被个人记忆污染，并推动召回器加入 0.20 最低主题相关性。这能作为“评估驱动实现演进”的面试案例。
+
+### 9.11 会话摘要保留原文与失败隔离
 
 摘要以 `through_sequence` 精确标记覆盖边界，而不是删除或覆盖 Message；因此可以回放、审计或更换模型后重新生成。触发判断按当前会话实际消息条数计算，避免全库自增 sequence 在多会话下产生误判。摘要正文和历史消息都作为不可信数据注入，RunEvent 只保存覆盖序号和统计值；生成失败不会让已成功回答变为失败。
 
@@ -496,8 +504,8 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 | 进程内会话锁 | 多实例之间不能互斥 | advisory lock 或带租约分布式锁 |
 | 摘要模型可能遗漏早期细节 | 长对话成本降低，但压缩是有损的 | 保留完整原始消息和最近窗口；增加摘要信息保留率评测与重新生成能力 |
 | 自动记忆仍同步执行 | 真实模型会增加一次调用延迟；多副本仅有进程内合并锁 | 后续改为任务队列，并在数据库增加唯一约束/版本号 |
-| 轻量召回缺少深层语义 | 可解释且零额外调用，但同义改写可能漏召回 | 先建立 A/B 门禁，再评估 Memory Embedding 或 Rerank |
-| Memory 已进入回答上下文但尚无 A/B 门禁 | 相关回答可使用历史事实，也可能受错误记忆影响 | 建立正确记忆率、错误注入率和回答质量对照评测 |
+| 轻量召回缺少深层语义 | 可解释且零额外调用，但同义改写可能漏召回 | 用现有 A/B 门禁评估 Memory Embedding 或 Rerank 的真实增益 |
+| Memory A/B 固定集仅 5 题 | 能发现弱相关污染并做零密钥回归，但不能代表真实用户分布 | 扩充同义改写、冲突记忆、多轮更新和真实模型人工集 |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
 | 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
 | 尚无 token/cost 指标 | 无法比较模型成本 | 从 ResponseMeta 采集 Usage |
@@ -519,7 +527,7 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 | 能力 | 建议指标 |
 |---|---|
 | RAG | Recall@K、MRR、引用覆盖率、答案忠实度 |
-| Memory | 正确记忆率、错误记忆率、召回命中率、用户删除成功率 |
+| Memory | Recall@K、意外召回率、事实覆盖增益、答案污染率、用户删除成功率 |
 | Multi-Agent | 任务成功率、P95 延迟、token 成本、人工干预率 |
 | 办公 Agent | 审批覆盖率、越权操作数、操作成功率、可恢复率 |
 
@@ -540,7 +548,7 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 
 1. **V0.1 Agent Core**：建立当前可运行基线。
 2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
-3. **V0.3 Long-term Memory（进行中）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入和会话增量摘要已实现；继续完成 A/B 评估。
+3. **V0.3 Long-term Memory（主链路完成）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入、会话增量摘要和 A/B 门禁已实现。
 4. **V0.4 Multi-Agent**：Supervisor、专业 Agent、预算和对照评估。
 5. **V0.5 Office Agent**：MCP、办公连接器、审批、权限和审计。
 

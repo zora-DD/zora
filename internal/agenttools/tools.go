@@ -89,8 +89,9 @@ func Build() ([]tool.BaseTool, error) {
 					"对话记忆候选提取", "基于 Memory Key 的去重与冲突合并",
 					"长期记忆联合召回与上下文注入",
 					"会话增量摘要与上下文压缩",
+					"长期记忆有/无 A/B 评测与质量门禁",
 				},
-				NextMilestone: "长期记忆有/无 A/B 评测与可观测性增强",
+				NextMilestone: "V0.4 Supervisor 与专业 Agent 的可评估协作",
 			}, nil
 		},
 	)

@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.3 Long-term Memory（自动写入、召回注入与会话增量摘要）
+> 适用版本：V0.3 Long-term Memory（自动写入、召回注入、会话摘要与 A/B 门禁）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -41,6 +41,7 @@ internal/
 ├── knowledge/                 分块、Embedding、混合检索与 Agent Tool
 ├── rageval/                   检索指标、答案引用/忠实度指标与门禁
 ├── memory/                    Semantic/Episodic 模型、校验和 CRUD 用例
+├── memoryeval/                长期记忆 Control/Treatment 指标与质量门禁
 ├── summary/                   会话增量摘要、Model/Rule 摘要器与 Store 契约
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
@@ -59,6 +60,9 @@ flowchart TD
     Main --> Knowledge["knowledge"]
     Main --> Memory["memory"]
     Main --> Summary["summary"]
+    MemoryEval["cmd/zora-memory-eval"] --> MemoryAB["memoryeval"]
+    MemoryEval --> Chat
+    MemoryEval --> Memory
     Eval["cmd/zora-eval"] --> RAGEval["rageval"]
     Eval --> Knowledge
     HTTP --> Chat
@@ -513,6 +517,7 @@ recency = exp(-ln(2) * age / 90 days)
 ```
 
 - `relevance` 使用中文双字词项与西文词项的二元余弦重合，作为零额外模型调用、可确定复现的基线；
+- 非显式记忆总览问题要求 `relevance >= 0.20`，避免重要性和新鲜度把只有一两个偶然重合词的记忆抬进上下文；
 - `importance` 直接使用 Memory 的 0–1 重要性；
 - `recency` 按更新时间进行 90 天半衰期衰减；
 - 无相关词项的记忆默认不召回；用户明确询问“你记得我的偏好吗”等总览问题时，允许 0.08 的低相关性先验；
@@ -537,6 +542,19 @@ recency = exp(-ln(2) * age / 90 days)
 真实 Provider 使用共享 Chat Model 和 `[ZORA_CONVERSATION_SUMMARIZER]` 中文结构化 Prompt，要求严格输出 `{"summary":"..."}`；旧摘要和新消息都编码为 JSON 数据，明确禁止执行历史中的指令和保留密码、Token 等敏感凭据。Mock 使用确定性 `RuleSummarizer` 验证阈值、增量合并和端到端上下文，不宣称等同真实语义摘要。
 
 加载时以 `[ZORA_CONVERSATION_SUMMARY]` 独立 System Message 注入，正文仍是用户影响的非可信背景数据；最近原始消息或本轮输入与摘要冲突时，以较晚信息为准。RunEvent 只记录覆盖序号、消息数、字符数和模型，不复制摘要正文。
+
+### 8.13 长期记忆有/无 A/B 评测
+
+`cmd/zora-memory-eval` 每次创建临时 SQLite 数据库并写入 `evals/memory.json` 的固定 Memory，不读取或修改在线数据。每个问题各创建独立 Conversation，并交替执行：
+
+- Control：`chat.Service` 不接入 `MemoryRecaller`；
+- Treatment：同一 Runtime 和 Store，但通过 `WithMemoryRecaller` 开启召回。
+
+两组都经过真实 `chat.Send → Eino Runtime → Message/RunEvent` 链路。评测器从 Treatment Run 的 `memory_recall_completed` 审计事件解析实际注入的 Memory ID，而不是再次直接调用检索函数。Control 若出现任何召回记录会直接判失败。
+
+固定门禁包括：预期 Memory Recall@K、意外召回率、Treatment 事实覆盖率、相对 Control 的事实覆盖增益、Treatment 禁用事实污染率。报告同时输出两组平均延迟和延迟增量，但当前不以本地毫秒波动作为失败条件。事实使用确定性锚点，适合作为零密钥回归基线，不能替代真实模型人工评审或经校准的 LLM Judge。
+
+默认 5 题包含三个正向个性化问题、一个“Go 并发模型”相似主题硬负例和一个无关问题。首次基线曾出现弱词面重合污染：重要性/时效性把个人语言和项目记忆注入通用 Go 问题。门禁失败后新增 0.20 最低主题相关性，当前结果为 Recall@K=1、意外召回率=0、Treatment 事实覆盖率=1、Control=0、覆盖增益=1、污染率=0。
 
 ## 9. 并发、取消与错误处理
 
@@ -887,10 +905,11 @@ DELETE /api/memories/{memoryID}
 
 | 层级 | 当前覆盖 |
 |---|---|
-| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分和人工修正保护；会话摘要阈值、窗口、序号间隔、JSON 解析、敏感信息过滤和安全注入 |
+| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分、弱相关硬负例和人工修正保护；会话摘要阈值、窗口、序号间隔、JSON 解析、敏感信息过滤和安全注入 |
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
 | Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD；ConversationSummary Upsert、消息范围、级联删除和 PostgreSQL Schema |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
+| Memory A/B 测试 | 严格数据集校验；Control/Treatment 事实覆盖；意外召回与答案污染反例；RunEvent 召回 ID 解析；完整 CLI 基线 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
 | HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404、自动提取/召回，以及摘要触发、查询和 Mock 上下文作答 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
@@ -903,6 +922,7 @@ make test
 make vet
 make check
 make eval-rag
+make eval-memory
 make postgres-up
 make test-postgres
 go test -race ./internal/...
@@ -965,7 +985,7 @@ flowchart LR
 程序性记忆：Skill、规则和工具经验
 ```
 
-当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、用户 CRUD、自动候选提取与 Consolidation、相关性/重要性/时效性联合召回、安全上下文注入，以及“增量摘要 + 最近原始消息”的短期历史压缩。下一步补充有/无记忆 A/B 评测，验证召回正确率、错误记忆影响、摘要信息保留率、Token 增量和回答质量，再决定是否引入 Memory Embedding。
+当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、用户 CRUD、自动候选提取与 Consolidation、相关性/重要性/时效性联合召回、安全上下文注入、“增量摘要 + 最近原始消息”的短期历史压缩，以及完整 Chat 链路的有/无记忆 A/B 门禁。V0.3 主链路完成；后续扩充真实模型样本、摘要信息保留率和 Token/成本指标，再以数据决定是否引入 Memory Embedding。
 
 ### 17.3 V0.4 Multi-Agent
 

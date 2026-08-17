@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.3 Long-term Memory（开发中）**。V0.1 Agent Core 已完成，V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.3 正在建设可追溯、可由用户控制的长期记忆。
+当前版本：**V0.3 Long-term Memory（主链路已完成）**。V0.1 Agent Core 已完成，V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.3 已交付可追溯、可由用户控制、可通过 A/B 数据验证收益的长期记忆。
 
 ## 当前能力
 
@@ -26,7 +26,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 自动记忆写入 | 已完成 | 真实模型结构化提取、本地规则提取、Memory Key 去重/冲突合并、人工修正保护和 Run 审计 |
 | 记忆召回与注入 | 已完成 | 词项相关性 + 重要性 + 时效性联合评分、Top-K 安全上下文和 Run 审计 |
 | 会话摘要与上下文压缩 | 已完成 | 阈值触发、增量摘要、最近消息窗口、安全上下文注入、双数据库持久化和审计 |
-| 记忆 A/B 评估 | V0.3 进行中 | 有/无记忆数据集、正确召回率、错误注入率、质量与成本门禁 |
+| 记忆 A/B 评估 | 已完成 | 隔离数据库、完整 Chat 链路 Control/Treatment、召回率、错误注入、事实覆盖、延迟和质量门禁 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
 
@@ -43,7 +43,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
 - **长期记忆不是消息向量库**：Memory 拥有独立类型、稳定 Key、来源、重要性和过期时间；候选只在回答成功后提取，同 Key 冲突执行合并，人工修正不会被自动覆盖。
-- **召回可解释、可关闭**：轻量词项相关性与重要性、时效性联合评分，RunEvent 只记录 ID 和分数组件；可通过环境变量独立关闭注入做 A/B。
+- **召回可解释、可关闭**：轻量词项相关性与重要性、时效性联合评分，并用最低主题相关性阻止弱词面重合被重要性抬高；RunEvent 只记录 ID 和分数组件。
+- **记忆收益可回归**：固定数据集让同一问题分别通过关闭/开启召回的完整 Chat 链路，门禁预期召回、错误注入、事实覆盖增益和答案污染，而不是只评估检索函数。
 - **长对话不会只靠截断**：较早消息增量压缩进 `conversation_summaries`，最近窗口保留原文；摘要读取或生成失败时自动退化为最近消息，不推翻正常回答。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
@@ -79,6 +80,14 @@ make run
 前两句话最终只保留一个“主要编程语言”记忆，值更新为 Java。继续询问“我的主要编程语言是什么？”，系统会按相关性、重要性和时效性召回该记忆并注入模型上下文，本地 Mock 会确定性回答 Java。
 
 默认每当未摘要历史达到 20 条消息时，Zora 会把较早部分增量合并为会话摘要，并保留最近 12 条原始消息。完整消息不会从数据库删除；可通过 `GET /api/conversations/{id}/summary` 查看当前摘要覆盖范围。本地 Mock 使用确定性规则便于测试，真实 Provider 使用同一 Chat Model 通过独立中文结构化 Prompt 生成摘要。
+
+运行长期记忆 A/B 基准：
+
+```bash
+make eval-memory
+```
+
+命令在临时 SQLite 中写入 `evals/memory.json` 的固定记忆，同一问题交替运行关闭召回的 Control 和开启召回的 Treatment，并从真实 RunEvent 读取实际注入的 Memory ID。默认 5 题包含个人资料、交互偏好、项目经历，以及“Go 并发模型”这种相似主题硬负例；门禁未达标时命令返回非零状态。
 
 可以尝试：
 
@@ -302,7 +311,8 @@ SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`�
 ```text
 cmd/zora/                  服务入口、依赖组装和优雅关闭
 cmd/zora-eval/             隔离运行固定 RAG 检索与答案评测
-evals/                     可版本化的语料、问题、事实/证据锚点与阈值
+cmd/zora-memory-eval/      隔离运行长期记忆有/无 A/B 评测
+evals/                     可版本化的 RAG/Memory 语料、问题、事实锚点与阈值
 internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
 internal/id/               随机业务 ID
@@ -311,6 +321,7 @@ internal/agenttools/       只读工具和安全计算器
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/rageval/          检索指标、答案引用/忠实度指标和门禁
 internal/memory/           Semantic/Episodic 模型、提取、Consolidation、联合召回和用户 CRUD
+internal/memoryeval/       长期记忆 Control/Treatment 指标、报告和质量门禁
 internal/summary/          增量摘要策略、Model/Rule 摘要器和持久化契约
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
@@ -331,6 +342,9 @@ make vet
 
 # 固定 RAG 检索与答案评测
 make eval-rag
+
+# 长期记忆有/无 A/B 评测
+make eval-memory
 
 # 启动 pgvector 并执行真实数据库集成测试
 make postgres-up
@@ -361,6 +375,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - HTTP multipart 上传、知识检索与删除。
 - 增量摘要阈值、最近窗口、序号间隔、结构化模型输出、敏感信息过滤和安全上下文注入；
 - SQLite 摘要 Upsert/级联删除、PostgreSQL Schema，以及 HTTP 摘要查询和 Mock 端到端回忆。
+- 长期记忆 A/B 数据集校验、Control/Treatment 指标、错误召回与答案污染反例、RunEvent 召回 ID 解析和完整 CLI 基线。
 
 ## 文档导航
 
@@ -395,7 +410,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 - V0.1：Agent Core——已完成
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
-- V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入和会话摘要已完成；A/B 评测进行中
+- V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent
 - V0.5：MCP 办公助手
 

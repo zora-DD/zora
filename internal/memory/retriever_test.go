@@ -61,3 +61,26 @@ func TestRecallSupportsExplicitMemoryOverviewIntent(t *testing.T) {
 		t.Fatalf("unrelated recall = %+v, %v", unrelated, err)
 	}
 }
+
+func TestRecallRejectsWeakTopicalOverlapWithoutPersonalIntent(t *testing.T) {
+	t.Parallel()
+	store := newMemoryStoreStub()
+	now := time.Now().UTC()
+	store.items["language"] = memory.Memory{
+		ID: "language", Kind: memory.KindSemantic,
+		MemoryKey: "profile:primary-programming-language",
+		Content:   "用户的主要编程语言是 Go。", Importance: 1,
+		SourceType: memory.SourceManual, CreatedAt: now, UpdatedAt: now,
+	}
+	service, err := memory.NewService(store, memory.WithRecallOptions(5, 0.2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	results, err := service.Recall(context.Background(), "Go 语言的并发模型是什么？")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("generic Go question should not recall personal profile: %+v", results)
+	}
+}

@@ -1,0 +1,89 @@
+{
+  "name": "zora-memory-ab-smoke-v1",
+  "description": "覆盖个人资料、交互偏好、项目经历和相似主题硬负例的长期记忆 A/B 基准。",
+  "top_k": 3,
+  "recall_min_score": 0.25,
+  "minimum_recall_at_k": 1.0,
+  "maximum_unexpected_recall_rate": 0.0,
+  "minimum_treatment_fact_coverage": 1.0,
+  "minimum_fact_coverage_delta": 1.0,
+  "maximum_treatment_forbidden_fact_rate": 0.0,
+  "memories": [
+    {
+      "id": "mem_eval_primary_language",
+      "kind": "semantic",
+      "memory_key": "profile:primary-programming-language",
+      "content": "用户的主要编程语言是 Go。",
+      "importance": 0.9
+    },
+    {
+      "id": "mem_eval_response_language",
+      "kind": "semantic",
+      "memory_key": "preference:response-language",
+      "content": "用户希望助手始终使用中文回答。",
+      "importance": 0.85
+    },
+    {
+      "id": "mem_eval_zora_project",
+      "kind": "episodic",
+      "memory_key": "project:zora-agent",
+      "content": "用户正在开发名为 Zora 的 Agent 项目，主要使用 Go 和 Eino。",
+      "importance": 0.95
+    }
+  ],
+  "cases": [
+    {
+      "id": "primary-programming-language",
+      "question": "我的主要编程语言是什么？",
+      "expected_memory_ids": ["mem_eval_primary_language"],
+      "expected_facts": [
+        {
+          "id": "language-go",
+          "answer_contains": ["主要编程语言", "Go"]
+        }
+      ]
+    },
+    {
+      "id": "response-language-preference",
+      "question": "我希望你使用什么语言回答？",
+      "expected_memory_ids": ["mem_eval_response_language"],
+      "expected_facts": [
+        {
+          "id": "reply-in-chinese",
+          "answer_contains": ["中文回答"]
+        }
+      ]
+    },
+    {
+      "id": "current-agent-project",
+      "question": "我正在开发的 Agent 项目叫什么，技术栈是什么？",
+      "expected_memory_ids": ["mem_eval_zora_project"],
+      "expected_facts": [
+        {
+          "id": "project-name",
+          "answer_contains": ["名为", "Zora"]
+        },
+        {
+          "id": "project-stack",
+          "answer_contains": ["Go", "Eino"]
+        }
+      ]
+    },
+    {
+      "id": "generic-go-hard-negative",
+      "question": "Go 语言的并发模型是什么？",
+      "expected_memory_ids": [],
+      "forbidden_treatment_facts": [
+        {
+          "id": "personal-language-contamination",
+          "answer_contains": ["根据长期记忆", "主要编程语言", "Go"]
+        }
+      ]
+    },
+    {
+      "id": "unrelated-world-knowledge",
+      "question": "海水为什么是咸的？",
+      "expected_memory_ids": []
+    }
+  ]
+}

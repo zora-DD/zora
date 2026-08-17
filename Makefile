@@ -1,4 +1,4 @@
-.PHONY: run run-postgres postgres-up postgres-down test-postgres eval-rag test fmt vet check
+.PHONY: run run-postgres postgres-up postgres-down test-postgres eval-rag eval-memory test fmt vet check
 
 run:
 	go run ./cmd/zora
@@ -20,6 +20,9 @@ test-postgres:
 
 eval-rag:
 	go run ./cmd/zora-eval -dataset ./evals/knowledge.json
+
+eval-memory:
+	go run ./cmd/zora-memory-eval -dataset ./evals/memory.json
 
 test:
 	go test ./...

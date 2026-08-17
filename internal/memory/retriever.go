@@ -11,6 +11,7 @@ import (
 )
 
 const recencyHalfLife = 90 * 24 * time.Hour
+const minimumTopicalRelevance = 0.20
 
 // RecallResult 保留总分及三个可解释分量，方便调参、审计和后续 A/B 评估。
 type RecallResult struct {
@@ -46,7 +47,9 @@ func (s *Service) Recall(ctx context.Context, query string) ([]RecallResult, err
 			// 用户显式询问自身信息时允许浏览高价值记忆，但仍保持很低的相关性先验。
 			relevance = 0.08
 		}
-		if relevance == 0 {
+		// 重要性和时效性不能把只有一两个偶然重合词的记忆抬进上下文。
+		// 显式“你记得我的偏好吗”属于总览意图，允许使用上面的低相关性先验。
+		if relevance == 0 || (!memoryIntent && relevance < minimumTopicalRelevance) {
 			continue
 		}
 		recency := recencyScore(now, item.UpdatedAt)

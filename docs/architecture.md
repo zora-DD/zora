@@ -4,7 +4,7 @@
 
 ## 1. 边界
 
-Zora 将系统划分为九个边界：
+Zora 将系统划分为十个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
@@ -13,8 +13,9 @@ Zora 将系统划分为九个边界：
 5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
 6. `memory`：Semantic/Episodic Memory、候选提取、Consolidation、生命周期校验和用户控制。
 7. `summary`：会话增量摘要、最近消息窗口、Model/Rule Summarizer 和持久化契约。
-8. `store`：对话、知识库、长期记忆与摘要的持久化边界，由 SQLite 或 PostgreSQL 实现。
-9. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
+8. `memoryeval`：长期记忆 Control/Treatment、召回/事实/污染指标和质量门禁。
+9. `store`：对话、知识库、长期记忆与摘要的持久化边界，由 SQLite 或 PostgreSQL 实现。
+10. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -130,6 +131,7 @@ internal/memory/
 
 internal/store/sqlite/memories.go
 internal/store/postgres/memories.go
+internal/memoryeval/
 internal/summary/
 internal/store/sqlite/summaries.go
 internal/store/postgres/summaries.go
@@ -145,12 +147,14 @@ SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_
 
 ```text
 对话结束 → 候选事实提取 → 校验 → Key 去重/冲突合并 → 持久化
-新请求   → 相关性 65% + 重要性 20% + 时效性 15% → Top-K → 安全 System 上下文
+新请求   → 最低主题相关性 → 相关性 65% + 重要性 20% + 时效性 15% → Top-K → 安全 System 上下文
 ```
 
 自动提取的 Memory 关联来源用户消息，并按 Kind + Memory Key 跳过重复或更新冲突；用户手动修正会阻止后续自动覆盖。召回默认排除过期/无关记忆，正文按不可信 JSON 数据注入，最多 6,000 字符；RunEvent 只记录 ID 和可解释分数。
 
-长对话按当前会话实际未摘要消息数量触发，保留最近窗口，把较早消息增量写入 `conversation_summaries`。摘要读取/生成失败只记录审计并继续回答。下一步是有/无记忆 A/B 评测，而不是直接增加 Memory 向量库。
+长对话按当前会话实际未摘要消息数量触发，保留最近窗口，把较早消息增量写入 `conversation_summaries`。摘要读取/生成失败只记录审计并继续回答。
+
+`make eval-memory` 在隔离数据库中让每个问题分别走关闭/开启召回的完整 Chat 链路，并从 RunEvent 核验实际注入 ID。默认基线覆盖三个正向问题和两个负例，门禁预期召回、错误召回、事实覆盖增益和答案污染；当前全部通过。后续先扩充真实模型样本，再用同一门禁决定是否增加 Memory 向量检索。
 
 ## 8. 多 Agent 接入点
 
