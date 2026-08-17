@@ -11,6 +11,7 @@ import (
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
+	"github.com/zhiruo/zora/internal/summary"
 )
 
 func TestOpenMigratesV03MemoryColumns(t *testing.T) {
@@ -145,5 +146,69 @@ func TestMemoryLifecycleAndExpiryFilter(t *testing.T) {
 	}
 	if _, err := database.GetMemory(ctx, active.ID); !errors.Is(err, memory.ErrNotFound) {
 		t.Fatalf("get deleted memory error = %v", err)
+	}
+}
+
+func TestConversationSummaryLifecycleAndMessageRange(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "summary.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	conversation := domain.Conversation{ID: "conv_summary", Title: "摘要测试", CreatedAt: now, UpdatedAt: now}
+	if err := database.CreateConversation(ctx, conversation); err != nil {
+		t.Fatal(err)
+	}
+	var messages []domain.Message
+	for index, content := range []string{"目标是开发 Agent", "收到", "主要使用 Go", "已记录"} {
+		role := domain.RoleUser
+		if index%2 == 1 {
+			role = domain.RoleAssistant
+		}
+		message, err := database.AddMessage(ctx, domain.Message{
+			ID: "msg_summary_" + content, ConversationID: conversation.ID,
+			Role: role, Content: content, CreatedAt: now.Add(time.Duration(index) * time.Second),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		messages = append(messages, message)
+	}
+
+	ranged, err := database.ListMessagesForSummary(ctx, conversation.ID, messages[0].Sequence, messages[2].Sequence, 10)
+	if err != nil || len(ranged) != 2 || ranged[0].ID != messages[1].ID || ranged[1].ID != messages[2].ID {
+		t.Fatalf("summary message range = %+v, %v", ranged, err)
+	}
+	item := summary.Summary{
+		ConversationID: conversation.ID, Content: "用户要用 Go 开发 Agent。",
+		ThroughSequence: messages[1].Sequence, MessageCount: 2, Model: "zora-mock", UpdatedAt: now,
+	}
+	if err := database.UpsertConversationSummary(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	got, err := database.GetConversationSummary(ctx, conversation.ID)
+	if err != nil || got.Content != item.Content || got.ThroughSequence != item.ThroughSequence {
+		t.Fatalf("summary = %+v, %v", got, err)
+	}
+	item.Content = "用户要用 Go 开发具备记忆的 Agent。"
+	item.ThroughSequence = messages[2].Sequence
+	item.MessageCount = 3
+	if err := database.UpsertConversationSummary(ctx, item); err != nil {
+		t.Fatal(err)
+	}
+	got, err = database.GetConversationSummary(ctx, conversation.ID)
+	if err != nil || got.Content != item.Content || got.MessageCount != 3 {
+		t.Fatalf("updated summary = %+v, %v", got, err)
+	}
+
+	if err := database.DeleteConversation(ctx, conversation.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.GetConversationSummary(ctx, conversation.ID); !errors.Is(err, summary.ErrNotFound) {
+		t.Fatalf("summary should cascade delete, error = %v", err)
 	}
 }

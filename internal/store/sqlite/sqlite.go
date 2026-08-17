@@ -17,6 +17,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
+	"github.com/zhiruo/zora/internal/summary"
 )
 
 // schema 同时保存用户可见消息和 Agent 的内部执行轨迹。
@@ -66,6 +67,14 @@ CREATE TABLE IF NOT EXISTS run_events (
 );
 CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence
     ON run_events(run_id, sequence);
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    through_sequence INTEGER NOT NULL CHECK (through_sequence >= 0),
+    message_count INTEGER NOT NULL CHECK (message_count >= 0),
+    model TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL CHECK (kind IN ('semantic', 'episodic')),
@@ -121,7 +130,12 @@ type SQLite struct {
 	db *sql.DB
 }
 
-var _ memory.Store = (*SQLite)(nil)
+var (
+	_ store.Store     = (*SQLite)(nil)
+	_ knowledge.Store = (*SQLite)(nil)
+	_ memory.Store    = (*SQLite)(nil)
+	_ summary.Store   = (*SQLite)(nil)
+)
 
 // Open 创建数据库文件，并执行可重复运行的建表语句。
 func Open(path string) (*SQLite, error) {

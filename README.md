@@ -25,7 +25,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 长期记忆底座 | 已完成 | Semantic/Episodic Schema、重要性、来源、过期时间、SQLite/PostgreSQL 和用户 CRUD |
 | 自动记忆写入 | 已完成 | 真实模型结构化提取、本地规则提取、Memory Key 去重/冲突合并、人工修正保护和 Run 审计 |
 | 记忆召回与注入 | 已完成 | 词项相关性 + 重要性 + 时效性联合评分、Top-K 安全上下文和 Run 审计 |
-| 记忆评估与摘要 | V0.3 进行中 | 短期历史摘要、有/无记忆 A/B 数据集和质量门禁 |
+| 会话摘要与上下文压缩 | 已完成 | 阈值触发、增量摘要、最近消息窗口、安全上下文注入、双数据库持久化和审计 |
+| 记忆 A/B 评估 | V0.3 进行中 | 有/无记忆数据集、正确召回率、错误注入率、质量与成本门禁 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
 
@@ -43,6 +44,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
 - **长期记忆不是消息向量库**：Memory 拥有独立类型、稳定 Key、来源、重要性和过期时间；候选只在回答成功后提取，同 Key 冲突执行合并，人工修正不会被自动覆盖。
 - **召回可解释、可关闭**：轻量词项相关性与重要性、时效性联合评分，RunEvent 只记录 ID 和分数组件；可通过环境变量独立关闭注入做 A/B。
+- **长对话不会只靠截断**：较早消息增量压缩进 `conversation_summaries`，最近窗口保留原文；摘要读取或生成失败时自动退化为最近消息，不推翻正常回答。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -75,6 +77,8 @@ make run
 ```
 
 前两句话最终只保留一个“主要编程语言”记忆，值更新为 Java。继续询问“我的主要编程语言是什么？”，系统会按相关性、重要性和时效性召回该记忆并注入模型上下文，本地 Mock 会确定性回答 Java。
+
+默认每当未摘要历史达到 20 条消息时，Zora 会把较早部分增量合并为会话摘要，并保留最近 12 条原始消息。完整消息不会从数据库删除；可通过 `GET /api/conversations/{id}/summary` 查看当前摘要覆盖范围。本地 Mock 使用确定性规则便于测试，真实 Provider 使用同一 Chat Model 通过独立中文结构化 Prompt 生成摘要。
 
 可以尝试：
 
@@ -186,6 +190,10 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_MEMORY_RECALL_ENABLED` | `true` | 是否在回答前召回并注入相关记忆，可独立关闭做 A/B |
 | `ZORA_MEMORY_RECALL_LIMIT` | `5` | 单轮最多注入的记忆数，范围 1–20 |
 | `ZORA_MEMORY_RECALL_MIN_SCORE` | `0.25` | 相关性、重要性、时效性联合分数门槛 |
+| `ZORA_SUMMARY_ENABLED` | `true` | 是否启用增量会话摘要和上下文压缩 |
+| `ZORA_SUMMARY_TRIGGER_MESSAGES` | `20` | 未摘要消息触发阈值，范围 4–500 |
+| `ZORA_SUMMARY_KEEP_RECENT` | `12` | 始终保留原文的最近消息数，至少 2 且小于触发阈值 |
+| `ZORA_SUMMARY_MAX_RUNES` | `4000` | 单份摘要最大 Unicode 字符数，范围 500–20000 |
 
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
@@ -237,9 +245,10 @@ sequenceDiagram
     UI->>API: POST message
     API->>Service: Send
     Service->>DB: 保存 user Message 和 running Run
+    Service->>DB: 读取会话摘要和最近原始消息
     Service->>DB: 查询有效长期记忆
     Service->>Service: 相关性 + 重要性 + 时效性联合排序
-    Service->>ADK: 安全记忆上下文 + 最近对话历史
+    Service->>ADK: 会话摘要 + 安全记忆上下文 + 最近原始消息
     ADK->>LLM: 消息 + Tool Schema
     alt 需要工具
         LLM-->>ADK: ToolCall
@@ -253,6 +262,8 @@ sequenceDiagram
     Service->>DB: 保存回答
     Service->>LLM: 提取长期记忆候选（真实模型）
     Service->>DB: 按 Memory Key 去重/冲突合并
+    Service->>LLM: 达到阈值时增量生成会话摘要
+    Service->>DB: 保存摘要覆盖序号和审计事件
     Service->>DB: 保存记忆审计和完成事件
     Service-->>UI: done（含记忆处理计数）
 ```
@@ -268,6 +279,7 @@ sequenceDiagram
 | `PATCH` | `/api/conversations/{id}` | 重命名对话 |
 | `DELETE` | `/api/conversations/{id}` | 删除对话及关联数据 |
 | `GET` | `/api/conversations/{id}/messages` | 查询消息历史 |
+| `GET` | `/api/conversations/{id}/summary` | 查询当前增量会话摘要及覆盖范围 |
 | `POST` | `/api/conversations/{id}/messages` | 发送消息并接收 SSE |
 | `GET` | `/api/runs/{id}/events` | 查询持久执行事件 |
 | `GET` | `/api/knowledge/documents` | 查询已索引文档 |
@@ -281,7 +293,7 @@ sequenceDiagram
 | `PUT` | `/api/memories/{id}` | 完整更新内容、类型、重要性和过期时间 |
 | `DELETE` | `/api/memories/{id}` | 用户删除长期记忆 |
 
-SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量。候选正文和召回正文都不会复制进 SSE 或 RunEvent。
+SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
 
 完整请求、响应和事件契约见 [项目技术文档](docs/technical-design.md)。
 
@@ -299,6 +311,7 @@ internal/agenttools/       只读工具和安全计算器
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/rageval/          检索指标、答案引用/忠实度指标和门禁
 internal/memory/           Semantic/Episodic 模型、提取、Consolidation、联合召回和用户 CRUD
+internal/summary/          增量摘要策略、Model/Rule 摘要器和持久化契约
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
 internal/store/sqlite/     对话与知识库的 SQLite 实现
@@ -346,6 +359,8 @@ CGO_ENABLED=0 go build ./cmd/zora
 - 文档入库、哈希去重、混合检索、引用和级联删除；
 - 向量、关键词、混合三种检索模式及固定集 Recall@K/MRR 计算；
 - HTTP multipart 上传、知识检索与删除。
+- 增量摘要阈值、最近窗口、序号间隔、结构化模型输出、敏感信息过滤和安全上下文注入；
+- SQLite 摘要 Upsert/级联删除、PostgreSQL Schema，以及 HTTP 摘要查询和 Mock 端到端回忆。
 
 ## 文档导航
 
@@ -370,7 +385,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 ### 为什么工具结果没有全部写进下一轮历史？
 
-工具内部轨迹保存在 RunEvent，主 Message 只保存用户可见历史，防止上下文快速膨胀。未来会通过摘要和长期记忆补充早期信息。
+工具内部轨迹保存在 RunEvent，主 Message 只保存用户可见历史。长对话会把较早消息增量合并为摘要，同时保留最近原文；相关长期记忆按当前问题单独召回，因此不需要把全部工具轨迹反复发送给模型。
 
 ### 如何清空本地数据？
 
@@ -380,7 +395,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 - V0.1：Agent Core——已完成
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
-- V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入已完成；摘要与 A/B 评测进行中
+- V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入和会话摘要已完成；A/B 评测进行中
 - V0.4：多 Agent
 - V0.5：MCP 办公助手
 

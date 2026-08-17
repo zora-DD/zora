@@ -12,6 +12,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
+	"github.com/zhiruo/zora/internal/summary"
 )
 
 func TestPostgresConversationAndKnowledgeLifecycle(t *testing.T) {
@@ -40,6 +41,17 @@ func TestPostgresConversationAndKnowledgeLifecycle(t *testing.T) {
 	})
 	if err != nil || message.Sequence == 0 {
 		t.Fatalf("add message = %+v, %v", message, err)
+	}
+	summaryItem := summary.Summary{
+		ConversationID: conversationID, Content: "PostgreSQL 摘要测试",
+		ThroughSequence: message.Sequence, MessageCount: 1, Model: "integration-test", UpdatedAt: now,
+	}
+	if err := database.UpsertConversationSummary(ctx, summaryItem); err != nil {
+		t.Fatal(err)
+	}
+	loadedSummary, err := database.GetConversationSummary(ctx, conversationID)
+	if err != nil || loadedSummary.Content != summaryItem.Content {
+		t.Fatalf("get conversation summary = %+v, %v", loadedSummary, err)
 	}
 	got, err := database.GetConversation(ctx, conversationID)
 	if err != nil || got.MessageCount != 1 {

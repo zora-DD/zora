@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -23,6 +24,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store/sqlite"
+	"github.com/zhiruo/zora/internal/summary"
 )
 
 func TestConversationAndAgentSSE(t *testing.T) {
@@ -50,7 +52,10 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 	memoryService := newTestMemoryService(t, database)
-	handler, err := New(chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService)), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	handler, err := New(chat.NewService(database, runtime,
+		chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService),
+		chat.WithConversationSummarizer(failingSummaryService{}),
+	), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +82,7 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		t.Fatalf("send status = %d, body = %s", stream.Code, stream.Body.String())
 	}
 	events := stream.Body.String()
-	if !strings.Contains(events, "event: tool_call") || !strings.Contains(events, "event: tool_result") || !strings.Contains(events, "event: done") || !strings.Contains(events, "42") {
+	if !strings.Contains(events, "event: tool_call") || !strings.Contains(events, "event: tool_result") || !strings.Contains(events, "event: done") || strings.Contains(events, "event: error") || !strings.Contains(events, "42") {
 		t.Fatalf("unexpected SSE stream:\n%s", events)
 	}
 
@@ -90,6 +95,18 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		}
 	}
 }
+
+type failingSummaryService struct{}
+
+func (failingSummaryService) Get(context.Context, string) (summary.Summary, error) {
+	return summary.Summary{}, summary.ErrNotFound
+}
+
+func (failingSummaryService) Update(context.Context, string, int64) (summary.UpdateResult, error) {
+	return summary.UpdateResult{}, errors.New("摘要模型暂时不可用")
+}
+
+func (failingSummaryService) HistoryLimit() int { return 4 }
 
 func TestKnowledgeUploadSearchAndDelete(t *testing.T) {
 	t.Parallel()
@@ -192,8 +209,56 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||
 		!strings.Contains(response.Body.String(), `"memory_auto_capture":true`) ||
 		!strings.Contains(response.Body.String(), `"memory_recall":true`) ||
-		!strings.Contains(response.Body.String(), `"memory-context-injection"`) {
+		!strings.Contains(response.Body.String(), `"memory-context-injection"`) ||
+		!strings.Contains(response.Body.String(), `"conversation_summary":true`) ||
+		!strings.Contains(response.Body.String(), `"context-compression"`) {
 		t.Fatalf("info does not report V0.3 memory capability: %s", response.Body.String())
+	}
+}
+
+func TestConversationSummaryEndpointAndContextInjection(t *testing.T) {
+	t.Parallel()
+	handler := newTestHandler(t)
+
+	create := httptest.NewRequest(http.MethodPost, "/api/conversations", strings.NewReader(`{"title":"Summary test"}`))
+	create.Header.Set("Content-Type", "application/json")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	var conversation struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &conversation); err != nil {
+		t.Fatal(err)
+	}
+
+	send := func(content string) string {
+		t.Helper()
+		request := httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversation.ID+"/messages",
+			strings.NewReader(`{"content":`+strconv.Quote(content)+`}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("send status = %d, body = %s", response.Code, response.Body.String())
+		}
+		return response.Body.String()
+	}
+	send("第一项任务是实现会话摘要。")
+	second := send("第二项任务是保留最近消息。")
+	if !strings.Contains(second, `"summary":{"updated":true`) {
+		t.Fatalf("second response did not report summary update: %s", second)
+	}
+
+	getSummary := httptest.NewRequest(http.MethodGet, "/api/conversations/"+conversation.ID+"/summary", nil)
+	gotSummary := httptest.NewRecorder()
+	handler.ServeHTTP(gotSummary, getSummary)
+	if gotSummary.Code != http.StatusOK || !strings.Contains(gotSummary.Body.String(), "第一项任务") || !strings.Contains(gotSummary.Body.String(), `"through_sequence":2`) {
+		t.Fatalf("summary status = %d, body = %s", gotSummary.Code, gotSummary.Body.String())
+	}
+
+	answer := send("总结一下我们之前聊过什么？")
+	if !strings.Contains(answer, "根据这段对话的历史摘要") || !strings.Contains(answer, "第一项任务") {
+		t.Fatalf("summary was not injected into mock context: %s", answer)
 	}
 }
 
@@ -335,7 +400,20 @@ func newTestHandler(t *testing.T) http.Handler {
 		t.Fatal(err)
 	}
 	memoryService := newTestMemoryService(t, database)
-	handler, err := New(chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService)), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	ruleSummarizer, err := summary.NewRuleSummarizer(500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaryService, err := summary.NewService(database, ruleSummarizer, summary.Options{
+		TriggerMessages: 4, KeepRecent: 2, MaxRunes: 500, Model: "zora-mock",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := New(chat.NewService(database, runtime,
+		chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService),
+		chat.WithConversationSummarizer(summaryService),
+	), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

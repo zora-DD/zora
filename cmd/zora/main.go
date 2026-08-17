@@ -22,12 +22,14 @@ import (
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/store/postgres"
 	"github.com/zhiruo/zora/internal/store/sqlite"
+	"github.com/zhiruo/zora/internal/summary"
 )
 
 type applicationStore interface {
 	store.Store
 	knowledge.Store
 	memory.Store
+	summary.Store
 }
 
 func main() {
@@ -102,6 +104,27 @@ func run(logger *slog.Logger) error {
 	if cfg.MemoryRecallEnabled {
 		chatOptions = append(chatOptions, chat.WithMemoryRecaller(memoryService))
 	}
+	if cfg.SummaryEnabled {
+		var summarizer summary.Summarizer
+		if cfg.Provider == "mock" {
+			summarizer, err = summary.NewRuleSummarizer(cfg.SummaryMaxRunes)
+		} else {
+			summarizer, err = summary.NewModelSummarizer(chatModel)
+		}
+		if err != nil {
+			return err
+		}
+		summaryService, err := summary.NewService(database, summarizer, summary.Options{
+			TriggerMessages: cfg.SummaryTriggerMessages,
+			KeepRecent:      cfg.SummaryKeepRecent,
+			MaxRunes:        cfg.SummaryMaxRunes,
+			Model:           cfg.Model,
+		})
+		if err != nil {
+			return err
+		}
+		chatOptions = append(chatOptions, chat.WithConversationSummarizer(summaryService))
+	}
 	chatService := chat.NewService(database, runtime, chatOptions...)
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout)
 	if err != nil {
@@ -120,7 +143,8 @@ func run(logger *slog.Logger) error {
 		logger.Info("zora is ready", "addr", cfg.Addr, "store", cfg.StoreProvider,
 			"provider", cfg.Provider, "model", cfg.Model,
 			"embedding_provider", cfg.EmbeddingProvider, "embedding_model", embedder.Name(),
-			"memory_auto_capture", cfg.MemoryAutoCapture, "memory_recall", cfg.MemoryRecallEnabled)
+			"memory_auto_capture", cfg.MemoryAutoCapture, "memory_recall", cfg.MemoryRecallEnabled,
+			"conversation_summary", cfg.SummaryEnabled)
 		serveErrors <- server.ListenAndServe()
 	}()
 

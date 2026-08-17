@@ -21,6 +21,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
+	"github.com/zhiruo/zora/internal/summary"
 )
 
 //go:embed web/*
@@ -45,6 +46,7 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	mux.HandleFunc("GET /api/conversations", server.listConversations)
 	mux.HandleFunc("POST /api/conversations", server.createConversation)
 	mux.HandleFunc("GET /api/conversations/{conversationID}/messages", server.listMessages)
+	mux.HandleFunc("GET /api/conversations/{conversationID}/summary", server.getConversationSummary)
 	mux.HandleFunc("PATCH /api/conversations/{conversationID}", server.renameConversation)
 	mux.HandleFunc("DELETE /api/conversations/{conversationID}", server.deleteConversation)
 	mux.HandleFunc("POST /api/conversations/{conversationID}/messages", server.sendMessage)
@@ -85,17 +87,21 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.chat.MemoryRecallEnabled() {
 		capabilities = append(capabilities, "memory-recall", "memory-context-injection")
 	}
+	if s.chat.SummaryEnabled() {
+		capabilities = append(capabilities, "conversation-summary", "context-compression")
+	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "Zora", "version": "0.3.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
-		"embedding_model":     s.knowledge.EmbeddingModel(),
-		"retrieval_backend":   s.knowledge.RetrievalBackend(),
-		"memory_auto_capture": s.memory.AutoCaptureEnabled(),
-		"memory_recall":       s.chat.MemoryRecallEnabled(),
-		"capabilities":        capabilities,
+		"embedding_model":      s.knowledge.EmbeddingModel(),
+		"retrieval_backend":    s.knowledge.RetrievalBackend(),
+		"memory_auto_capture":  s.memory.AutoCaptureEnabled(),
+		"memory_recall":        s.chat.MemoryRecallEnabled(),
+		"conversation_summary": s.chat.SummaryEnabled(),
+		"capabilities":         capabilities,
 	})
 }
 
@@ -131,6 +137,15 @@ func (s *Server) listMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"messages": messages})
+}
+
+func (s *Server) getConversationSummary(w http.ResponseWriter, r *http.Request) {
+	item, err := s.chat.GetConversationSummary(r.Context(), r.PathValue("conversationID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (s *Server) renameConversation(w http.ResponseWriter, r *http.Request) {
@@ -411,7 +426,7 @@ func decodeMemoryInput(w http.ResponseWriter, r *http.Request) (memoryRequest, e
 
 func (s *Server) problem(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
-	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) || errors.Is(err, summary.ErrNotFound) {
 		status = http.StatusNotFound
 	} else if errors.Is(err, knowledge.ErrEmbeddingMismatch) {
 		status = http.StatusConflict

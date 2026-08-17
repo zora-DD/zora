@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.3 Long-term Memory（自动写入、Consolidation 与召回注入）
+> 文档基线：V0.3 Long-term Memory（自动写入、召回注入与会话增量摘要）
 > 最后更新：2026-08-17
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立 Semantic/Episodic Memory Schema、双数据库持久化、REST/Web 用户控制面、回答后的候选提取/Consolidation，以及回答前的联合召回和上下文注入；短期摘要和 A/B 评估仍是后续子阶段。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立 Semantic/Episodic Memory Schema、双数据库持久化、REST/Web 用户控制面、回答后的候选提取/Consolidation、回答前的联合召回，以及“增量摘要 + 最近原始消息”的短期上下文压缩；有/无记忆 A/B 评估仍是后续子阶段。
 
 ## 2. 背景与问题
 
@@ -89,6 +89,13 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 3. 以不可信 JSON 背景数据注入独立 System Message；本轮输入与旧记忆冲突时优先本轮。
 4. RunEvent 只保存 Memory ID 与分数组件；召回失败退化为无记忆回答。
 
+长对话增加一条跨轮上下文压缩链：
+
+1. 回答保存后按当前会话实际统计尚未摘要的消息数量，达到阈值才触发摘要。
+2. 最近消息保留原文，较早消息与已有摘要增量合并，并持久化覆盖到的 sequence。
+3. 下一轮只向模型发送会话摘要、相关长期记忆和最近原始消息；全部 Message 仍保留在数据库中。
+4. 历史内容按不可信 JSON 数据处理；摘要读取或生成失败时退化为最近原始消息，不影响正常回答。
+
 ## 5. 业务能力模型
 
 | 能力域 | 当前状态 | 说明 |
@@ -107,7 +114,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 长期记忆底座 | 已实现 | Semantic/Episodic Schema、来源/重要性/过期字段、双存储和用户 CRUD |
 | 自动记忆写入 | 已实现 | 结构化/规则提取、Memory Key 去重与冲突更新、来源追踪、人工修正保护和审计 |
 | 记忆召回与注入 | 已实现 | 相关性/重要性/时效性联合评分、Top-K 安全注入、调试 API 和 Run 审计 |
-| 记忆评估与摘要 | V0.3 进行中 | 短期历史摘要、有/无记忆 A/B 和质量门禁 |
+| 会话摘要与上下文压缩 | 已实现 | 阈值触发、增量合并、最近窗口、双存储、安全注入和审计 |
+| 记忆 A/B 评估 | V0.3 进行中 | 有/无记忆数据集、错误注入率、回答质量、Token 和延迟门禁 |
 | 多 Agent | 规划 V0.4 | Supervisor、专业 Agent、预算和效果对比 |
 | 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
 
@@ -126,6 +134,7 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | KnowledgeDocument | 一份已完成索引的用户文档 | 上传后持续存在，可删除 |
 | KnowledgeChunk | 可检索、可引用的原文片段 | 与文档在同一事务创建，随文档级联删除 |
 | Memory | 经筛选的长期事实、偏好或事件 | 可由对话提取或手动创建、编辑、过期和删除；同 Key 候选执行合并 |
+| ConversationSummary | 一段对话较早历史的增量压缩结果 | 达到阈值后 Upsert，随 Conversation 级联删除；不删除原始 Message |
 
 ### 6.2 对象关系
 
@@ -209,6 +218,21 @@ erDiagram
         string source_type
         datetime expires_at
         datetime created_at
+        datetime updated_at
+    }
+```
+
+会话摘要与对话一一对应，只记录压缩结果和覆盖边界；原始 Message 继续作为审计与重新生成来源：
+
+```mermaid
+erDiagram
+    CONVERSATION ||--o| CONVERSATION_SUMMARY : compresses
+    CONVERSATION_SUMMARY {
+        string conversation_id PK
+        text content
+        int through_sequence
+        int message_count
+        string model
         datetime updated_at
     }
 ```
@@ -332,6 +356,19 @@ SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embe
 
 来源字段在用户编辑时保持不可变，防止手动记忆伪造为模型自动提取结果；编辑会设置 `user_edited=true`，后续自动 Consolidation 必须跳过。当前没有向量列：在真正确定召回算法、Embedding 迁移和评估方案前，不提前把聊天历史变成不可控的向量副本。
 
+### 7.8 conversation_summaries
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `conversation_id` | TEXT | PK/FK | 每个对话最多一份摘要；删除对话时级联删除 |
+| `content` | TEXT | NOT NULL | 增量合并后的会话摘要 |
+| `through_sequence` | INTEGER/BIGINT | >= 0 | 已被摘要覆盖的最后一条 Message sequence |
+| `message_count` | INTEGER | >= 0 | 累计进入摘要的消息数 |
+| `model` | TEXT | NOT NULL | 生成当前摘要的模型标识 |
+| `updated_at` | 时间 | NOT NULL | 最近成功更新摘要的时间 |
+
+该表不替代 `messages`。上下文加载时仅用 `through_sequence` 过滤重复发送给模型的早期消息，查询消息历史仍可获得完整原文。
+
 ## 8. 技术架构
 
 ```mermaid
@@ -340,6 +377,7 @@ flowchart LR
     HTTP --> Chat["chat.Service"]
     HTTP --> Knowledge["knowledge.Service"]
     HTTP --> Memory["memory.Service"]
+    Chat --> Summary["summary.Service"]
     Chat --> Runtime["agentruntime.Runtime"]
     Runtime --> ADK["Eino ChatModelAgent"]
     ADK --> Model["Mock / OpenAI-compatible Model"]
@@ -348,12 +386,15 @@ flowchart LR
     Chat --> Store["store.Store"]
     Knowledge --> KStore["knowledge.Store"]
     Memory --> MStore["memory.Store"]
+    Summary --> SStore["summary.Store"]
     Store --> SQLite["SQLite"]
     KStore --> SQLite
     MStore --> SQLite
+    SStore --> SQLite
     Store --> PostgreSQL["PostgreSQL"]
     KStore --> PostgreSQL
     MStore --> PostgreSQL
+    SStore --> PostgreSQL
     PostgreSQL --> PGVector["pgvector HNSW + FTS GIN"]
     Knowledge --> Embedder["Hash / OpenAI Embedder"]
     EvalCLI["zora-eval"] --> RAGEval["rageval"]
@@ -375,6 +416,7 @@ flowchart LR
 | 知识库应用层 | `internal/knowledge` | 分块、Embedding 适配、混合召回、引用与 Agent Tool |
 | RAG 评测层 | `internal/rageval` | 固定集校验、检索指标、答案引用/忠实度和联合门禁 |
 | 记忆应用层 | `internal/memory` | Semantic/Episodic 模型、候选提取、Consolidation、联合召回、输入校验和用户 CRUD |
+| 摘要应用层 | `internal/summary` | 触发窗口、增量摘要、Model/Rule Summarizer 和持久化边界 |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
@@ -436,6 +478,10 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 
 召回也先采用可解释基线：中文双字/西文词项相关性占 65%，重要性占 20%，90 天半衰期时效性占 15%。无相关词项默认不注入，记忆正文被标记为不可信背景数据且有 6,000 字符硬上限。通过 `ZORA_MEMORY_RECALL_ENABLED` 可独立关闭注入，为后续有/无记忆 A/B 提供天然对照组。
 
+### 9.10 会话摘要保留原文与失败隔离
+
+摘要以 `through_sequence` 精确标记覆盖边界，而不是删除或覆盖 Message；因此可以回放、审计或更换模型后重新生成。触发判断按当前会话实际消息条数计算，避免全库自增 sequence 在多会话下产生误判。摘要正文和历史消息都作为不可信数据注入，RunEvent 只保存覆盖序号和统计值；生成失败不会让已成功回答变为失败。
+
 ## 10. 当前限制与风险
 
 | 限制/风险 | 当前影响 | 后续处理 |
@@ -448,7 +494,7 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 | 答案评测使用确定性锚点 | 零密钥且稳定，但无法识别未标注幻觉或复杂同义改写 | 增加真实模型人工集与经校准的 LLM Judge，对确定性门禁形成补充 |
 | 同步文档索引 | 大文件会占用 HTTP 请求 | 异步 Ingestion Job、重试和状态机 |
 | 进程内会话锁 | 多实例之间不能互斥 | advisory lock 或带租约分布式锁 |
-| 最近 40 条上下文 | 长对话会丢失早期信息 | 摘要 + 长期记忆召回 |
+| 摘要模型可能遗漏早期细节 | 长对话成本降低，但压缩是有损的 | 保留完整原始消息和最近窗口；增加摘要信息保留率评测与重新生成能力 |
 | 自动记忆仍同步执行 | 真实模型会增加一次调用延迟；多副本仅有进程内合并锁 | 后续改为任务队列，并在数据库增加唯一约束/版本号 |
 | 轻量召回缺少深层语义 | 可解释且零额外调用，但同义改写可能漏召回 | 先建立 A/B 门禁，再评估 Memory Embedding 或 Rerank |
 | Memory 已进入回答上下文但尚无 A/B 门禁 | 相关回答可使用历史事实，也可能受错误记忆影响 | 建立正确记忆率、错误注入率和回答质量对照评测 |
@@ -494,7 +540,7 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 
 1. **V0.1 Agent Core**：建立当前可运行基线。
 2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
-3. **V0.3 Long-term Memory（进行中）**：Schema、双存储、用户 CRUD、候选提取、Consolidation 和召回注入已实现；继续完成短期摘要与 A/B 评估。
+3. **V0.3 Long-term Memory（进行中）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入和会话增量摘要已实现；继续完成 A/B 评估。
 4. **V0.4 Multi-Agent**：Supervisor、专业 Agent、预算和对照评估。
 5. **V0.5 Office Agent**：MCP、办公连接器、审批、权限和审计。
 

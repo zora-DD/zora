@@ -26,6 +26,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if !cfg.MemoryRecallEnabled || cfg.MemoryRecallLimit != 5 || cfg.MemoryRecallMinScore != 0.25 {
 		t.Fatalf("unexpected memory recall defaults: %+v", cfg)
 	}
+	if !cfg.SummaryEnabled || cfg.SummaryTriggerMessages != 20 || cfg.SummaryKeepRecent != 12 || cfg.SummaryMaxRunes != 4000 {
+		t.Fatalf("unexpected summary defaults: %+v", cfg)
+	}
 }
 
 func TestLoadPostgresStoreRequiresDSN(t *testing.T) {
@@ -75,6 +78,15 @@ func TestLoadRejectsInvalidMemoryRecallScore(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidSummaryWindow(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ZORA_SUMMARY_TRIGGER_MESSAGES", "10")
+	t.Setenv("ZORA_SUMMARY_KEEP_RECENT", "10")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid summary window error")
+	}
+}
+
 func clearEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
@@ -86,6 +98,7 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_KNOWLEDGE_CHUNK_OVERLAP",
 		"ZORA_MEMORY_AUTO_CAPTURE", "ZORA_MEMORY_MAX_CANDIDATES",
 		"ZORA_MEMORY_RECALL_ENABLED", "ZORA_MEMORY_RECALL_LIMIT", "ZORA_MEMORY_RECALL_MIN_SCORE",
+		"ZORA_SUMMARY_ENABLED", "ZORA_SUMMARY_TRIGGER_MESSAGES", "ZORA_SUMMARY_KEEP_RECENT", "ZORA_SUMMARY_MAX_RUNES",
 	} {
 		t.Setenv(key, "")
 	}

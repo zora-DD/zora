@@ -43,6 +43,11 @@ type Config struct {
 	MemoryRecallEnabled  bool    // 是否在模型执行前召回并注入相关长期记忆。
 	MemoryRecallLimit    int     // 单轮最多注入的长期记忆数量。
 	MemoryRecallMinScore float64 // 联合分数低于该阈值的记忆不得注入。
+
+	SummaryEnabled         bool // 是否启用长对话增量摘要与上下文压缩。
+	SummaryTriggerMessages int  // 尚未摘要的消息达到该数量后触发增量摘要。
+	SummaryKeepRecent      int  // 始终保留给模型的最近原始消息数量。
+	SummaryMaxRunes        int  // 单份摘要允许的最大 Unicode 字符数。
 }
 
 // Load 在启动阶段完成配置校验，让错误尽早暴露，而不是运行到模型调用时才失败。
@@ -98,6 +103,22 @@ func Load() (Config, error) {
 	if err != nil || math.IsNaN(memoryRecallMinScore) || math.IsInf(memoryRecallMinScore, 0) || memoryRecallMinScore < 0 || memoryRecallMinScore > 1 {
 		return Config{}, fmt.Errorf("ZORA_MEMORY_RECALL_MIN_SCORE 必须在 0 到 1 之间")
 	}
+	summaryEnabled, err := strconv.ParseBool(env("ZORA_SUMMARY_ENABLED", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_SUMMARY_ENABLED 必须是 true 或 false")
+	}
+	summaryTriggerMessages, err := positiveInt("ZORA_SUMMARY_TRIGGER_MESSAGES", "20")
+	if err != nil || summaryTriggerMessages < 4 || summaryTriggerMessages > 500 {
+		return Config{}, fmt.Errorf("ZORA_SUMMARY_TRIGGER_MESSAGES 必须在 4 到 500 之间")
+	}
+	summaryKeepRecent, err := positiveInt("ZORA_SUMMARY_KEEP_RECENT", "12")
+	if err != nil || summaryKeepRecent < 2 || summaryKeepRecent >= summaryTriggerMessages {
+		return Config{}, fmt.Errorf("ZORA_SUMMARY_KEEP_RECENT 必须至少为 2，且小于 ZORA_SUMMARY_TRIGGER_MESSAGES")
+	}
+	summaryMaxRunes, err := positiveInt("ZORA_SUMMARY_MAX_RUNES", "4000")
+	if err != nil || summaryMaxRunes < 500 || summaryMaxRunes > 20_000 {
+		return Config{}, fmt.Errorf("ZORA_SUMMARY_MAX_RUNES 必须在 500 到 20000 之间")
+	}
 
 	cfg := Config{
 		Addr:             env("ZORA_ADDR", ":8088"),
@@ -126,6 +147,11 @@ func Load() (Config, error) {
 		MemoryRecallEnabled:  memoryRecallEnabled,
 		MemoryRecallLimit:    memoryRecallLimit,
 		MemoryRecallMinScore: memoryRecallMinScore,
+
+		SummaryEnabled:         summaryEnabled,
+		SummaryTriggerMessages: summaryTriggerMessages,
+		SummaryKeepRecent:      summaryKeepRecent,
+		SummaryMaxRunes:        summaryMaxRunes,
 	}
 
 	switch cfg.StoreProvider {

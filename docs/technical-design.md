@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.3 Long-term Memory（自动写入、Consolidation 与召回注入）
+> 适用版本：V0.3 Long-term Memory（自动写入、召回注入与会话增量摘要）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -41,6 +41,7 @@ internal/
 ├── knowledge/                 分块、Embedding、混合检索与 Agent Tool
 ├── rageval/                   检索指标、答案引用/忠实度指标与门禁
 ├── memory/                    Semantic/Episodic 模型、校验和 CRUD 用例
+├── summary/                   会话增量摘要、Model/Rule 摘要器与 Store 契约
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
 ```
@@ -57,6 +58,7 @@ flowchart TD
     Main --> Tools["agenttools"]
     Main --> Knowledge["knowledge"]
     Main --> Memory["memory"]
+    Main --> Summary["summary"]
     Eval["cmd/zora-eval"] --> RAGEval["rageval"]
     Eval --> Knowledge
     HTTP --> Chat
@@ -66,19 +68,23 @@ flowchart TD
     Chat --> Store["store interface"]
     Chat --> Runtime
     Chat --> Memory
+    Chat --> Summary
     Runtime --> Eino["Eino ADK"]
     Tools --> Eino
     Knowledge --> Eino
     Knowledge --> KStore["knowledge.Store"]
     Memory --> MStore["memory.Store"]
+    Summary --> SStore["summary.Store"]
     RAGEval --> Knowledge
     SQLite --> Store
     SQLite --> KStore
     SQLite --> MStore
+    SQLite --> SStore
     SQLite --> Domain
     Postgres --> Store
     Postgres --> KStore
     Postgres --> MStore
+    Postgres --> SStore
     Postgres --> Domain
 ```
 
@@ -87,7 +93,7 @@ flowchart TD
 - `domain` 不依赖 Eino、HTTP 或数据库驱动；
 - `store.Store` 不暴露 SQL 类型；
 - `httpapi` 不直接调用模型和工具；
-- `httpapi` 只通过 `knowledge.Service` 和 `memory.Service` 调用知识库与记忆用例；
+- `httpapi` 只通过应用 Service 调用知识库、长期记忆和会话摘要用例；
 - `chat` 只依赖 `agentruntime.Runtime` 的统一事件；
 - 工具只能从 `agenttools.Build` 的 allowlist 注入。
 
@@ -104,8 +110,9 @@ flowchart TD
 7. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
 8. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
 9. 使用共享 ChatModel 创建 Eino ChatModelAgent 和 Runner；
-10. 创建 Chat Service，按开关接入 Memory Capture/Recall，再创建 HTTP Handler；
-10. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
+10. 按配置创建 Model/Rule Summarizer 和 Summary Service；
+11. 创建 Chat Service，按开关接入 Memory Capture/Recall 与会话摘要，再创建 HTTP Handler；
+12. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
 
@@ -137,6 +144,10 @@ flowchart TD
 | `ZORA_MEMORY_RECALL_ENABLED` | `true` | 否 | 是否在 Agent 执行前召回并注入长期记忆 |
 | `ZORA_MEMORY_RECALL_LIMIT` | `5` | 否 | 单轮最多注入数量，范围 1–20 |
 | `ZORA_MEMORY_RECALL_MIN_SCORE` | `0.25` | 否 | 联合召回最低总分，范围 0–1 |
+| `ZORA_SUMMARY_ENABLED` | `true` | 否 | 是否启用会话增量摘要与上下文压缩 |
+| `ZORA_SUMMARY_TRIGGER_MESSAGES` | `20` | 否 | 未摘要消息触发阈值，范围 4–500 |
+| `ZORA_SUMMARY_KEEP_RECENT` | `12` | 否 | 保留原文的最近消息数，至少 2 且小于触发阈值 |
+| `ZORA_SUMMARY_MAX_RUNES` | `4000` | 否 | 摘要 Unicode 字符上限，范围 500–20000 |
 
 配置原则：
 
@@ -155,6 +166,7 @@ sequenceDiagram
     participant API as HTTP API
     participant Chat as chat.Service
     participant Memory as memory.Service
+    participant Summary as summary.Service
     participant Store as Store
     participant Runner as Eino Runner
     participant Model as ChatModel
@@ -168,10 +180,12 @@ sequenceDiagram
     Chat->>Store: 保存 user Message
     Chat->>Store: 创建 running AgentRun
     Chat-->>Client: start
-    Chat->>Store: 读取最近 40 条 Message
+    Chat->>Summary: 读取已持久化会话摘要
+    Summary-->>Chat: 摘要正文 + through_sequence
+    Chat->>Store: 读取 max(40, 摘要阈值) 条 Message 并剔除已覆盖部分
     Chat->>Memory: Recall(content)
     Memory-->>Chat: Top-K + 分数组件
-    Chat->>Runner: Run(memory system context + history)
+    Chat->>Runner: Run(summary + memory + recent history)
     Runner->>Model: Stream(messages + tools)
     alt 模型调用工具
         Model-->>Runner: ToolCall
@@ -189,6 +203,8 @@ sequenceDiagram
     Chat->>Store: 保存 assistant Message
     Chat->>Memory: Capture(user + answer + source IDs)
     Memory-->>Chat: created/updated/skipped
+    Chat->>Summary: Update(latestSequence)
+    Summary->>Store: 达阈值时读取未摘要消息并 Upsert
     Chat->>Store: 保存 model_output/run_completed
     Chat->>Store: Run → completed
     Chat-->>Client: done
@@ -200,9 +216,9 @@ sequenceDiagram
 
 ### 5.2 上下文策略
 
-当前读取最近 40 条用户可见消息，并按 sequence 正序转换为 Eino Message；同时按当前问题召回相关长期记忆，以独立 System Message 放在历史之前。内部 ToolCall/ToolResult 不写入下一轮对话历史，只保留最终回答和 RunEvent。
+上下文由三部分组成：已覆盖较早历史的会话摘要、按本轮问题召回的相关长期记忆、最近原始消息。Chat 读取 `max(40, ZORA_SUMMARY_TRIGGER_MESSAGES)` 条用户可见消息，再按 `through_sequence` 剔除已进入摘要的部分；这样自定义触发阈值高于 40 时，摘要生成前也不会漏掉尚未摘要的消息。内部 ToolCall/ToolResult 不写入下一轮对话历史，只保留最终回答和 RunEvent。
 
-最近 40 条仍是明确的临时上限。V0.3 剩余工作会改为：近期原始消息 + 会话摘要 + 相关长期记忆。
+摘要只压缩模型输入，不删除 `messages` 原始记录。摘要读取或生成失败时记录 `conversation_summary_load_failed/failed`，继续使用最近原始消息完成回答；因此增强链路不会把已成功回答改成失败。
 
 ## 6. Agent Runtime 设计
 
@@ -309,12 +325,12 @@ SQL 子查询先按 sequence 倒序取最近 N 条，外层再升序输出。结
 
 ### 8.4 Store 替换策略
 
-应用层依赖 `store.Store`、`knowledge.Store` 与 `memory.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/Document/Memory 语义；`cmd/zora` 只在启动组装阶段选择实现。
+应用层依赖 `store.Store`、`knowledge.Store`、`memory.Store` 与 `summary.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/Document/Memory/Summary 语义；`cmd/zora` 只在启动组装阶段选择实现。
 
 PostgreSQL 已处理：
 
 - pgxpool 连接池和启动连通性检查；
-- `Conversation`、`Message`、`AgentRun`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory` 的关系与约束；
+- `Conversation`、`Message`、`AgentRun`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory`、`ConversationSummary` 的关系与约束；
 - advisory transaction lock 串行化多实例 DDL；
 - pgvector 类型注册、固定维度校验、HNSW cosine index；
 - 基于统一 tokenizer 词项的 `tsvector` generated column 和 GIN index。
@@ -506,6 +522,22 @@ recency = exp(-ln(2) * age / 90 days)
 
 当前仍没有把聊天消息批量向量化，也没有为 Memory 增加向量列。轻量词项召回是可解释基线；只有 A/B 数据证明语义召回有稳定收益后，才引入 Memory Embedding、索引迁移和额外成本。
 
+### 8.12 会话增量摘要与上下文压缩
+
+`conversation_summaries` 以 `conversation_id` 为主键，保存 `content`、`through_sequence`、累计 `message_count`、模型名和更新时间；删除 Conversation 时级联删除摘要。原始 Message 始终保留。
+
+每次回答保存后，`summary.Service.Update` 执行：
+
+1. 按当前会话实际读取 `(through_sequence, latest_sequence]` 内消息，不能用全局 sequence 差值代替消息数；
+2. 未摘要消息少于 `ZORA_SUMMARY_TRIGGER_MESSAGES` 时不调用模型；
+3. 达到阈值后，保留最后 `ZORA_SUMMARY_KEEP_RECENT` 条原文，把更早消息与旧摘要一起交给 Summarizer；
+4. 成功后原子 Upsert 新摘要和覆盖序号，后续请求只发送摘要及覆盖序号之后的原始消息；
+5. 生成、解析或落库失败只写审计事件，回答仍正常完成。
+
+真实 Provider 使用共享 Chat Model 和 `[ZORA_CONVERSATION_SUMMARIZER]` 中文结构化 Prompt，要求严格输出 `{"summary":"..."}`；旧摘要和新消息都编码为 JSON 数据，明确禁止执行历史中的指令和保留密码、Token 等敏感凭据。Mock 使用确定性 `RuleSummarizer` 验证阈值、增量合并和端到端上下文，不宣称等同真实语义摘要。
+
+加载时以 `[ZORA_CONVERSATION_SUMMARY]` 独立 System Message 注入，正文仍是用户影响的非可信背景数据；最近原始消息或本轮输入与摘要冲突时，以较晚信息为准。RunEvent 只记录覆盖序号、消息数、字符数和模型，不复制摘要正文。
+
 ## 9. 并发、取消与错误处理
 
 ### 9.1 会话级并发
@@ -605,7 +637,7 @@ Content-Type: application/json
 DELETE /api/conversations/{conversationID}
 ```
 
-成功返回 204；Message、AgentRun 和 RunEvent 通过外键级联删除。
+成功返回 204；Message、AgentRun、RunEvent 和 ConversationSummary 通过外键级联删除。
 
 ### 10.7 查询消息
 
@@ -614,6 +646,27 @@ GET /api/conversations/{conversationID}/messages
 ```
 
 返回最多 200 条按 sequence 正序排列的消息。
+
+### 10.7.1 查询会话摘要
+
+```http
+GET /api/conversations/{conversationID}/summary
+```
+
+已生成摘要时返回 200：
+
+```json
+{
+  "conversation_id": "conv_xxx",
+  "content": "用户正在使用 Go 开发 Agent，当前已完成长期记忆召回。",
+  "through_sequence": 18,
+  "message_count": 18,
+  "model": "qwen-plus",
+  "updated_at": "2026-08-17T06:00:00Z"
+}
+```
+
+对话或摘要不存在时返回 404；功能关闭时返回 400。`through_sequence` 表示已被摘要覆盖的最后一条原始消息序号，不代表原始消息已删除。
 
 ### 10.8 发送消息
 
@@ -768,7 +821,7 @@ DELETE /api/memories/{memoryID}
 | `tool_call` | `tool_name`, `tool_call_id`, `arguments` | 是 | 模型请求调用工具 |
 | `tool_result` | `tool_name`, `tool_call_id`, `content` | 是 | 工具返回结果 |
 | `delta` | `content` | 否 | 文本增量，只用于实时展示 |
-| `done` | `message`, `memory`, `memory_recalled` | 以 model_output/run_completed 表示 | 回答和 Run 已落库；附带自动写入计数和实际注入记忆数 |
+| `done` | `message`, `memory`, `memory_recalled`, `summary` | 以 model_output/run_completed 表示 | 回答和 Run 已落库；附带自动记忆计数、注入数量和本轮摘要更新统计 |
 | `error` | `content` | 以 failed/cancelled 表示 | 执行失败或取消 |
 
 客户端不能只依赖连接关闭判断成功，必须以 `done` 为成功终点，以 `error` 为失败终点。
@@ -834,12 +887,12 @@ DELETE /api/memories/{memoryID}
 
 | 层级 | 当前覆盖 |
 |---|---|
-| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分、注入边界与人工修正保护 |
+| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分和人工修正保护；会话摘要阈值、窗口、序号间隔、JSON 解析、敏感信息过滤和安全注入 |
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
-| Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD、V0.3 旧库迁移、Key/人工标记和过期过滤 |
+| Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD；ConversationSummary Upsert、消息范围、级联删除和 PostgreSQL Schema |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
-| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404，以及自动提取、同 Key 更新、召回接口和 Mock 上下文作答 |
+| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404、自动提取/召回，以及摘要触发、查询和 Mock 上下文作答 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
 | 工程检查 | `go test`、`go vet`、race、无 CGO build |
 
@@ -912,7 +965,7 @@ flowchart LR
 程序性记忆：Skill、规则和工具经验
 ```
 
-当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、用户 CRUD、自动候选提取与 Consolidation，以及相关性/重要性/时效性联合召回、安全上下文注入和审计。下一步补充短期历史摘要和有/无记忆 A/B 评测，验证召回正确率、错误记忆影响、Token 增量和回答质量，再决定是否引入 Memory Embedding。
+当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、用户 CRUD、自动候选提取与 Consolidation、相关性/重要性/时效性联合召回、安全上下文注入，以及“增量摘要 + 最近原始消息”的短期历史压缩。下一步补充有/无记忆 A/B 评测，验证召回正确率、错误记忆影响、摘要信息保留率、Token 增量和回答质量，再决定是否引入 Memory Embedding。
 
 ### 17.3 V0.4 Multi-Agent
 

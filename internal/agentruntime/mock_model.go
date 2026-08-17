@@ -57,11 +57,14 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	// 新版 Eino 会通过调用级 Option 注入工具，不能只读取 WithTools 保存的字段。
 	availableTools := model.GetCommonOptions(&model.Options{Tools: m.tools}, opts...).Tools
 	memoryFacts := recalledMemoryFacts(input)
+	conversationSummary := conversationSummaryFact(input)
 	switch {
 	// “发布日期”等资料字段会包含“日期”。知识库意图必须优先于时间意图，
 	// 否则本地 Mock 会错误地把“查文档里的日期”理解成“查询当前日期”。
 	case containsAny(lower, "知识库", "文档", "资料", "上传", "knowledge") && hasTool(availableTools, "knowledge_search"):
 		return m.toolCall("knowledge_search", fmt.Sprintf(`{"query":%q,"top_k":5}`, query)), nil
+	case hasConversationSummaryIntent(lower) && conversationSummary != "":
+		return schema.AssistantMessage("根据这段对话的历史摘要：\n\n"+conversationSummary, nil), nil
 	case hasMemoryQuestionIntent(lower) && len(memoryFacts) > 0:
 		return schema.AssistantMessage("根据长期记忆，我找到了这些相关信息：\n\n- "+strings.Join(memoryFacts, "\n- "), nil), nil
 	case containsAny(lower, "几点", "时间", "日期", "date", "time") && hasTool(availableTools, "current_time"):
@@ -81,6 +84,30 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 			nil,
 		), nil
 	}
+}
+
+func hasConversationSummaryIntent(query string) bool {
+	return containsAny(query, "刚才聊", "之前聊", "对话摘要", "总结对话", "我们聊过")
+}
+
+func conversationSummaryFact(input []*schema.Message) string {
+	for _, message := range input {
+		if message.Role != schema.System || !strings.HasPrefix(message.Content, "[ZORA_CONVERSATION_SUMMARY]") {
+			continue
+		}
+		start := strings.Index(message.Content, "{")
+		if start < 0 {
+			return ""
+		}
+		var payload struct {
+			Summary string `json:"summary"`
+		}
+		if err := json.Unmarshal([]byte(message.Content[start:]), &payload); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(payload.Summary)
+	}
+	return ""
 }
 
 func hasMemoryQuestionIntent(query string) bool {

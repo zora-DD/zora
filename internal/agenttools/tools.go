@@ -88,8 +88,9 @@ func Build() ([]tool.BaseTool, error) {
 					"Semantic/Episodic 长期记忆 Schema", "长期记忆用户管理",
 					"对话记忆候选提取", "基于 Memory Key 的去重与冲突合并",
 					"长期记忆联合召回与上下文注入",
+					"会话增量摘要与上下文压缩",
 				},
-				NextMilestone: "短期历史摘要与长期记忆有/无 A/B 评测",
+				NextMilestone: "长期记忆有/无 A/B 评测与可观测性增强",
 			}, nil
 		},
 	)
