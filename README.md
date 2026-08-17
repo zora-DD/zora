@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.5 Office Agent（第二阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已接入官方 MCP Go SDK，并交付文件、Microsoft Graph 邮件和日历只读连接器。草稿预览和写操作审批仍在后续阶段。
+当前版本：**V0.5 Office Agent（第三阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已接入官方 MCP Go SDK，交付文件、Microsoft Graph 邮件/日历只读连接器，以及可持久化的邮件/日程草稿预览。外部写操作审批仍在后续阶段。
 
 ## 当前能力
 
@@ -13,7 +13,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 流式对话 | 已完成 | SSE 增量回复、停止生成、超时取消 |
 | ReAct Agent | 已完成 | Eino ChatModelAgent、工具循环、最大迭代 |
 | 模型接入 | 已完成 | 本地 Mock、OpenAI-compatible、通义千问 |
-| 工具系统 | 已完成 | 三个内置只读工具、知识库工具；MCP 工具通过 Server 名称空间与本地白名单动态追加 |
+| 工具系统 | 已完成 | 三个内置只读工具、知识库工具和两个内部草稿工具；MCP 工具通过 Server 名称空间与本地白名单动态追加 |
 | 对话管理 | 已完成 | 创建、列表、自动标题、重命名、删除 |
 | 持久化 | 已完成 | SQLite 或 PostgreSQL 保存 Conversation、Message、AgentRun 和 RunEvent |
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
@@ -33,7 +33,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | MCP Client | 已完成 | 官方 Go SDK v1.7.0、stdio 子进程、工具发现、Eino 适配、超时/输出上限与生命周期关闭 |
 | 文件办公连接器 | 已完成 | 目录沙箱、只读列表/UTF-8 读取、隐藏路径/越界/符号链接逃逸防护 |
 | Microsoft 邮件/日历连接器 | 已完成 | Graph REST + MCP，支持邮件搜索/详情和日历窗口查询/详情；只返回摘要和元数据 |
-| 草稿与写操作 | V0.5 后续 | 草稿预览、持久化写前确认、幂等执行和完整凭据审计尚未实现 |
+| 邮件/日程草稿预览 | 已完成 | 结构化校验、SQLite/PostgreSQL 持久化、Run 来源追踪、重试幂等、REST API 和 Web 草稿箱 |
+| 外部写操作 | V0.5 后续 | 持久化写前确认、幂等执行、恢复和完整凭据审计尚未实现 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
 
@@ -58,6 +59,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **MCP 不是无边界插件系统**：仅连接配置中的 stdio Server；只有同时命中本地 `allowed_tools` 且声明 `readOnlyHint` 的工具才能注册，公开名称增加 Server 前缀。
 - **连接器凭据与主进程隔离**：MCP 子进程默认不继承任何环境变量，只透传 `pass_env`；模型 Key、Embedding Key 和数据库 DSN 被配置层显式拒绝。
 - **外部办公内容按不可信数据处理**：邮件、日历和外部文件的正文不能改变系统规则，也不能触发其中嵌入的链接、权限请求或工具指令。
+- **草稿不等于执行**：`preview_*` 工具只在 Zora 内部保存不可执行快照；同一 Run 的相同参数按内容哈希幂等复用，回答必须明确“尚未发送/创建”。
 - **明确的终态语义**：根 Run 最终进入 completed、failed、cancelled 或 rejected。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -190,6 +192,19 @@ make run
 ```
 
 四个工具实际公开为 `mcp_microsoft_search_emails`、`mcp_microsoft_get_email`、`mcp_microsoft_list_calendar_events` 和 `mcp_microsoft_get_calendar_event`。默认邮件查询最多扫描最近 50 封并在本地按关键词过滤；默认日历窗口为未来 7 天，单次最长 93 天。邮件只返回正文摘要，不下载完整 HTML 和附件；所有外部内容都会附带不可信数据提示。当前没有发送邮件、创建或修改日程的工具。
+
+### 创建和查看办公草稿
+
+草稿能力默认启用，不需要 Microsoft Token。单 Agent 会直接调用草稿工具；启用多 Agent 后，Writer Agent 独占这两个工具。可以用本地 Mock 验证：
+
+```text
+起草邮件，收件人 dev@example.com，主题：发布通知；正文：项目将在周五发布。
+创建日程，主题：发布评审；开始：2026-08-20T10:00:00+08:00；结束：2026-08-20T11:00:00+08:00；参与人 dev@example.com
+```
+
+邮件地址会被解析、去重并规范化；邮件主题最多 200 字符，正文最多 20,000 字符。日程开始/结束时间必须是带时区的 RFC3339，结束时间必须更晚，单次持续时间最多 31 天。每份草稿关联可信的 `conversation_id` 和 `source_run_id`，模型无法自行伪造；同一 Run 用相同参数重试时返回原草稿，不会重复创建。
+
+侧边栏“办公草稿”展示结构化预览并支持删除 `draft` 状态记录。此阶段没有发送邮件或创建日程的 Graph 写工具，也没有“批准即执行”的入口。
 
 点击侧边栏的“知识库”可上传 UTF-8 编码的 `.txt` / `.md` / `.markdown` 文件（单文件最大 5 MiB）。上传后可以询问：
 
@@ -427,6 +442,9 @@ sequenceDiagram
 | `GET` | `/api/memories/{id}` | 查询单条长期记忆及来源 |
 | `PUT` | `/api/memories/{id}` | 完整更新内容、类型、重要性和过期时间 |
 | `DELETE` | `/api/memories/{id}` | 用户删除长期记忆 |
+| `GET` | `/api/office/drafts` | 查询办公草稿，可按 `kind`、`status` 和 `limit` 筛选 |
+| `GET` | `/api/office/drafts/{id}` | 查询单份邮件/日程草稿预览及来源 Run |
+| `DELETE` | `/api/office/drafts/{id}` | 删除仍处于 `draft` 状态的草稿 |
 
 SSE 事件：`start`、`approval_required`、`approval_approved/rejected/expired`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`delta`、`done`、`error`。交接事件包含 `child_run_id`；`agent_output` 只显示在协作 Trace，不拼入最终回答。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
 
@@ -456,6 +474,7 @@ internal/memoryeval/       长期记忆 Control/Treatment 指标、报告和质�
 internal/mcpbridge/        官方 MCP Client、工具发现、白名单和 Eino Tool 适配
 internal/mcpfiles/         文件目录沙箱、列表/读取工具和安全边界
 internal/mcpmicrosoft/     Graph HTTP 适配、邮件/日历只读工具和外部内容标记
+internal/office/           邮件/日程草稿模型、校验、幂等持久化和 Agent 工具
 internal/summary/          增量摘要策略、Model/Rule 摘要器和持久化契约
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
@@ -516,6 +535,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - Supervisor/AgentTool 串行与并行交接、执行预算/超时/重试/取消、子 Run、人工审批等待与恢复，以及 7 题单/多 Agent 对照 CLI 基线。
 - MCP in-memory 端到端握手、工具发现/调用、白名单缺失失败、环境变量隔离，以及文件遍历/隐藏路径/符号链接逃逸防护；
 - Microsoft Graph 请求鉴权、查询时间窗、本地关键词过滤、四工具只读标注、错误脱敏和 Agent 中文结果整理。
+- 邮件/日程草稿参数校验、可信 Run 来源、内容哈希幂等、双数据库生命周期、Agent/Writer 路由、REST API 和 Web 草稿箱。
 
 ## 文档导航
 
@@ -552,7 +572,7 @@ V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
-- V0.5：MCP 办公助手——官方 SDK、文件与 Microsoft Graph 邮件/日历只读连接器已完成；草稿与写操作审批继续实现
+- V0.5：MCP 办公助手——官方 SDK、文件与 Microsoft Graph 邮件/日历只读连接器、持久化草稿预览已完成；外部写操作确认与执行继续实现
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
 

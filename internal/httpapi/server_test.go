@@ -27,6 +27,7 @@ import (
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store/sqlite"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -97,6 +98,126 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		if strings.HasPrefix(line, "data: ") && !json.Valid([]byte(strings.TrimPrefix(line, "data: "))) {
 			t.Fatalf("invalid SSE JSON: %s", line)
 		}
+	}
+}
+
+func TestAgentCreatesPersistedEmailDraftPreview(t *testing.T) {
+	t.Parallel()
+	database, err := sqlite.Open(filepath.Join(t.TempDir(), "office-api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	registeredTools, err := agenttools.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	officeService, err := office.NewService(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draftTools, err := office.NewDraftTools(officeService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registeredTools = append(registeredTools, draftTools...)
+	runtime, err := agentruntime.New(context.Background(), config.Config{
+		Provider: "mock", Model: "zora-mock", Instruction: "请使用中文回答。",
+		RequestTimeout: time.Second, MaxIterations: 6,
+	}, registeredTools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	knowledgeService := newTestKnowledgeService(t, database)
+	memoryService := newTestMemoryService(t, database)
+	chatService := chat.NewService(database, runtime)
+	handler, err := New(chatService, knowledgeService, memoryService,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second,
+		WithOfficeService(officeService))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := chatService.CreateConversation(context.Background(), "草稿预览")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversation.ID+"/messages",
+		strings.NewReader(`{"content":"起草邮件，收件人 dev@example.com，主题：发布通知；正文：项目将在周五发布。"}`))
+	request.Header.Set("Content-Type", "application/json")
+	stream := httptest.NewRecorder()
+	handler.ServeHTTP(stream, request)
+	if stream.Code != http.StatusOK || !strings.Contains(stream.Body.String(), "邮件草稿已保存") || !strings.Contains(stream.Body.String(), "尚未发送") {
+		t.Fatalf("draft SSE status = %d, body = %s", stream.Code, stream.Body.String())
+	}
+	listRequest := httptest.NewRequest(http.MethodGet, "/api/office/drafts?kind=email&status=draft", nil)
+	listed := httptest.NewRecorder()
+	handler.ServeHTTP(listed, listRequest)
+	if listed.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", listed.Code, listed.Body.String())
+	}
+	var response struct {
+		Drafts []office.Draft `json:"drafts"`
+	}
+	if err := json.Unmarshal(listed.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Drafts) != 1 || response.Drafts[0].ConversationID != conversation.ID || response.Drafts[0].Status != office.StatusDraft {
+		t.Fatalf("unexpected drafts: %+v", response.Drafts)
+	}
+	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/office/drafts/"+response.Drafts[0].ID, nil)
+	deleted := httptest.NewRecorder()
+	handler.ServeHTTP(deleted, deleteRequest)
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("delete status = %d, body = %s", deleted.Code, deleted.Body.String())
+	}
+}
+
+func TestMultiAgentWriterPreservesTrustedDraftIdentity(t *testing.T) {
+	t.Parallel()
+	database, err := sqlite.Open(filepath.Join(t.TempDir(), "office-multi-agent.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	officeService, err := office.NewService(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draftTools, err := office.NewDraftTools(officeService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Provider: "mock", Model: "zora-mock", Instruction: "请使用中文回答。",
+		RequestTimeout: 2 * time.Second, MaxIterations: 8,
+		MultiAgentMaxHandoffs: 4, MultiAgentMaxParallel: 2,
+		MultiAgentSpecialistTimeout: time.Second,
+	}
+	chatModel, err := agentruntime.NewChatModel(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := agentruntime.NewMultiAgentWithModel(context.Background(), cfg,
+		agentruntime.SpecialistToolset{Writer: draftTools}, chatModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chatService := chat.NewService(database, runtime)
+	conversation, err := chatService.CreateConversation(context.Background(), "多 Agent 草稿预览")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := chatService.Send(context.Background(), conversation.ID,
+		"起草邮件，收件人 dev@example.com，主题：发布通知；正文：项目将在周五发布。",
+		func(chat.StreamEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	drafts, err := officeService.List(context.Background(), office.ListFilter{Kind: office.KindEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(drafts) != 1 || drafts[0].ConversationID != conversation.ID || drafts[0].SourceRunID == "" {
+		t.Fatalf("unexpected multi-agent drafts: %+v", drafts)
 	}
 }
 

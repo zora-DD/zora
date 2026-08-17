@@ -37,6 +37,12 @@
         <small id="memoryCount">0 条记忆</small>
       </button>
 
+      <button class="knowledge-button" id="openOfficeDrafts">
+        <span aria-hidden="true">▱</span>
+        办公草稿
+        <small id="officeDraftCount">0 份草稿</small>
+      </button>
+
       <div class="section-label">最近对话</div>
       <nav class="conversation-list" id="conversationList" aria-label="对话列表"></nav>
 
@@ -100,7 +106,7 @@
           <textarea id="messageInput" rows="1" maxlength="20000" placeholder="给 Zora 发送消息…" aria-label="消息"></textarea>
           <div class="composer-bottom">
             <div class="composer-meta">
-              <span class="tool-badge" id="toolBadge"><i></i> 4 个只读工具</span>
+              <span class="tool-badge" id="toolBadge"><i></i> 6 个受控工具</span>
               <span>Enter 发送 · Shift Enter 换行</span>
             </div>
             <button type="submit" class="send-button" id="sendButton" aria-label="发送" disabled>
@@ -170,6 +176,18 @@
       </div>
     </form>
     <div class="memory-list" id="memoryList"></div>
+  </dialog>
+
+  <dialog class="knowledge-dialog office-draft-dialog" id="officeDraftDialog">
+    <div class="dialog-heading">
+      <div>
+        <strong>办公草稿</strong>
+        <span>邮件 / 日程 · 仅内部预览</span>
+      </div>
+      <button class="icon-button" id="closeOfficeDrafts" aria-label="关闭办公草稿">×</button>
+    </div>
+    <p class="dialog-description">这里的内容只保存在 Zora 数据库中，不会发送邮件或写入日历。草稿必须在后续阶段经过独立人工确认，才允许产生外部操作。</p>
+    <div class="office-draft-list" id="officeDraftList"></div>
   </dialog>
 
   <div class="toast" id="toast" role="status"></div>

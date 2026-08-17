@@ -63,17 +63,19 @@
 
 当前验证结果：`ZORA_MULTI_AGENT_ENABLED` 默认关闭，显式开启后由 `zora_supervisor` 通过 Eino AgentTool 调用研究、文档和写作专家。研究专家仅持有时间、计算器和项目状态工具，文档专家持有 `knowledge_search`（V0.5 启用时再追加 MCP 文件只读工具），写作专家无底层工具；AgentTool 默认只传递 Supervisor 构造的 `request`，不共享主会话完整历史。Runtime 对每个根 Run 注入独立的交接次数、并行度、专家超时和重试预算，Context 取消继续下传；独立子任务由 Eino ToolNode 并行执行，证据依赖任务保持串行。每次交接同步创建 `agent_task_runs` 子 Run，SSE/Web Trace 暴露 `child_run_id`。`risky/all/off` 审批策略把高影响请求持久化为 `approval_requests`，Web 可批准或拒绝，批准后恢复原 SSE，拒绝/超时进入明确终态。`make eval-agents` 使用隔离 SQLite 和完整 Chat/RunEvent 链路，默认 7 题路由准确率 1、意外专家调用率 0、答案完成率 1；同题单 Agent Control 质量 0.785714，多 Agent Treatment 质量 1，质量增益 0.214286，调用次数代理比 2，延迟比例随环境输出并受宽松上限门禁。该结论只适用于确定性 Mock 小样本，真实 Provider 仍需扩充业务集和 Token Usage。V0.4 主链路已完成。
 
-## V0.5 Office Agent — 第二阶段已完成
+## V0.5 Office Agent — 第三阶段已完成
 
 - [x] 官方 MCP Go SDK
 - [x] 文件只读连接器
 - [x] 邮件只读连接器
 - [x] 日历只读连接器
-- [ ] 草稿预览
+- [x] 草稿预览
 - [ ] 写操作人工确认
 - [ ] 凭据隔离、最小权限和完整审计
 
-当前验证结果：已固定官方 `github.com/modelcontextprotocol/go-sdk v1.7.0`，Zora 通过 stdio 启动 MCP 子进程、完成协议握手和分页工具发现，再把 JSON Schema 转为 Eino Tool。只有同时进入本地 `allowed_tools` 且声明 `readOnlyHint` 的工具会被注册，公开名称增加 `mcp_{server}_` 前缀；每次调用受独立超时与 12,000 字符默认输出上限约束，工具调用/结果沿用 RunEvent 审计。内置 `zora-mcp-files` 仅支持文件列表和 UTF-8 文本读取，授权根目录在子进程内强制校验，拒绝绝对路径、`..`、隐藏路径、符号链接逃逸、二进制及超过 2 MiB 的文件。新增 `zora-mcp-microsoft` 通过 Microsoft Graph 提供邮件搜索/详情和日历窗口查询/详情四个只读工具；只返回元数据与正文摘要，不下载附件，默认日历窗口 7 天且最长 93 天。Graph Token 只透传给独立子进程，邮件/日历内容带不可信数据提示。纯内存 Graph HTTP、MCP 协议和 Agent 路由测试已通过；因开发环境没有真实 Microsoft 租户凭据，尚未声明真实账号集成验收完成。OAuth 登录/刷新和 Secret 托管、草稿、写操作状态机及完整外部操作审计仍待实现，因此 V0.5 继续进行。
+当前验证结果：已固定官方 `github.com/modelcontextprotocol/go-sdk v1.7.0`，Zora 通过 stdio 启动 MCP 子进程、完成协议握手和分页工具发现，再把 JSON Schema 转为 Eino Tool。只有同时进入本地 `allowed_tools` 且声明 `readOnlyHint` 的工具会被注册，公开名称增加 `mcp_{server}_` 前缀；每次调用受独立超时与 12,000 字符默认输出上限约束，工具调用/结果沿用 RunEvent 审计。内置 `zora-mcp-files` 仅支持文件列表和 UTF-8 文本读取，授权根目录在子进程内强制校验；`zora-mcp-microsoft` 通过 Graph 提供邮件搜索/详情和日历窗口查询/详情四个只读工具，只返回元数据与正文摘要。Graph Token 只透传给独立子进程，外部内容带不可信数据提示。
+
+第三阶段新增 `office_drafts` 业务对象与 `preview_email_draft`、`preview_calendar_draft` 两个内部工具。草稿保存规范化 JSON、内容 SHA-256、Conversation/Run 来源和预留状态字段；`UNIQUE(source_run_id, content_hash)` 保证 Agent 重试不重复创建。SQLite/PostgreSQL、REST 查询/删除、Web 草稿箱和单/多 Agent Writer 路由均已接通。工具结果固定返回 `external_effect=false` 并提示尚未发送或创建；本阶段没有 Graph 写接口，也没有从草稿进入 approved/executing 的 Service 方法。全量测试、前端语法检查和既有评测门禁通过。因开发环境没有真实 Microsoft 租户凭据，Graph 真实账号集成验收仍待完成。写操作人工确认、异步幂等执行、OAuth 登录/刷新与 Secret 托管仍待实现，因此 V0.5 继续进行。
 
 ## 每个版本的文档完成标准
 

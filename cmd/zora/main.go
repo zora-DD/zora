@@ -23,6 +23,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/mcpbridge"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/store/postgres"
 	"github.com/zhiruo/zora/internal/store/sqlite"
@@ -34,6 +35,7 @@ type applicationStore interface {
 	knowledge.Store
 	memory.Store
 	approval.Store
+	office.Store
 	summary.Store
 }
 
@@ -60,6 +62,14 @@ func run(logger *slog.Logger) error {
 	defer database.Close()
 
 	registeredTools, err := agenttools.Build()
+	if err != nil {
+		return err
+	}
+	officeService, err := office.NewService(database)
+	if err != nil {
+		return err
+	}
+	draftTools, err := office.NewDraftTools(officeService)
 	if err != nil {
 		return err
 	}
@@ -133,10 +143,12 @@ func run(logger *slog.Logger) error {
 		runtime, err = agentruntime.NewMultiAgentWithModel(context.Background(), cfg, agentruntime.SpecialistToolset{
 			Research: registeredTools,
 			Document: append([]tool.BaseTool{knowledgeTool}, mcpTools...),
+			Writer:   draftTools,
 		}, chatModel)
 	} else {
 		singleAgentTools := append(append([]tool.BaseTool{}, registeredTools...), mcpTools...)
 		singleAgentTools = append(singleAgentTools, knowledgeTool)
+		singleAgentTools = append(singleAgentTools, draftTools...)
 		runtime, err = agentruntime.NewWithModel(context.Background(), cfg, singleAgentTools, chatModel)
 	}
 	if err != nil {
@@ -178,7 +190,7 @@ func run(logger *slog.Logger) error {
 		chatOptions = append(chatOptions, chat.WithConversationSummarizer(summaryService))
 	}
 	chatService := chat.NewService(database, runtime, chatOptions...)
-	httpOptions := make([]httpapi.Option, 0, 2)
+	httpOptions := make([]httpapi.Option, 0, 3)
 	if approvalService != nil {
 		httpOptions = append(httpOptions, httpapi.WithApprovalService(approvalService))
 	}
@@ -187,6 +199,7 @@ func run(logger *slog.Logger) error {
 		mcpToolCount = len(mcpManager.Tools())
 	}
 	httpOptions = append(httpOptions, httpapi.WithMCPInfo(cfg.MCPEnabled, mcpToolCount))
+	httpOptions = append(httpOptions, httpapi.WithOfficeService(officeService))
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout, httpOptions...)
 	if err != nil {
 		return err

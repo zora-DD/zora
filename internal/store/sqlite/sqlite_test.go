@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -156,6 +158,61 @@ func TestAgentTaskRunLifecycle(t *testing.T) {
 	resolved, err := database.ResolveApproval(ctx, approvalItem.ID, approval.StatusApproved, "已确认", completedAt)
 	if err != nil || resolved.Status != approval.StatusApproved || resolved.DecidedAt == nil {
 		t.Fatalf("resolved approval = %+v, %v", resolved, err)
+	}
+}
+
+func TestOfficeDraftLifecycleAndRunIdempotency(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "office-draft.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	conversation := domain.Conversation{ID: "conv_draft", Title: "草稿测试", CreatedAt: now, UpdatedAt: now}
+	if err := database.CreateConversation(ctx, conversation); err != nil {
+		t.Fatal(err)
+	}
+	message, err := database.AddMessage(ctx, domain.Message{
+		ID: "msg_draft", ConversationID: conversation.ID, Role: domain.RoleUser, Content: "起草邮件", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := domain.AgentRun{
+		ID: "run_draft", ConversationID: conversation.ID, UserMessageID: message.ID,
+		Status: domain.RunRunning, Model: "zora-mock", StartedAt: now,
+	}
+	if err := database.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	service, err := office.NewService(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionCtx := agentruntime.WithExecutionIdentity(ctx, conversation.ID, run.ID)
+	first, created, err := service.CreateEmailDraft(executionCtx, office.EmailDraft{
+		To: []string{"dev@example.com"}, Subject: "发布通知", Body: "项目将在周五发布。",
+	})
+	if err != nil || !created {
+		t.Fatalf("first draft = %+v, created=%v, err=%v", first, created, err)
+	}
+	second, created, err := service.CreateEmailDraft(executionCtx, office.EmailDraft{
+		To: []string{"dev@example.com"}, Subject: "发布通知", Body: "项目将在周五发布。",
+	})
+	if err != nil || created || second.ID != first.ID {
+		t.Fatalf("second draft = %+v, created=%v, err=%v", second, created, err)
+	}
+	items, err := service.List(ctx, office.ListFilter{Kind: office.KindEmail, Status: office.StatusDraft})
+	if err != nil || len(items) != 1 || items[0].SourceRunID != run.ID {
+		t.Fatalf("drafts = %+v, err=%v", items, err)
+	}
+	if err := service.Delete(ctx, first.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Get(ctx, first.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("get deleted draft error = %v", err)
 	}
 }
 

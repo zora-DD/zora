@@ -13,6 +13,7 @@ import (
 
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -33,6 +34,7 @@ var (
 	_ knowledge.Store          = (*Postgres)(nil)
 	_ knowledge.CandidateStore = (*Postgres)(nil)
 	_ memory.Store             = (*Postgres)(nil)
+	_ office.Store             = (*Postgres)(nil)
 	_ summary.Store            = (*Postgres)(nil)
 )
 

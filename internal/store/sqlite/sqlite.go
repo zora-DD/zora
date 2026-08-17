@@ -16,6 +16,7 @@ import (
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -84,6 +85,21 @@ CREATE TABLE IF NOT EXISTS approval_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_approval_requests_status_requested
     ON approval_requests(status, requested_at DESC);
+CREATE TABLE IF NOT EXISTS office_drafts (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('email', 'calendar')),
+    status TEXT NOT NULL CHECK (status IN ('draft', 'pending_confirmation', 'approved', 'executing', 'completed', 'rejected', 'failed', 'cancelled')),
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    source_run_id TEXT REFERENCES agent_runs(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    payload TEXT NOT NULL CHECK (json_valid(payload)),
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(source_run_id, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_office_drafts_status_updated
+    ON office_drafts(status, updated_at DESC);
 CREATE TABLE IF NOT EXISTS run_events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     id TEXT NOT NULL UNIQUE,
@@ -163,6 +179,7 @@ var (
 	_ store.Store     = (*SQLite)(nil)
 	_ knowledge.Store = (*SQLite)(nil)
 	_ memory.Store    = (*SQLite)(nil)
+	_ office.Store    = (*SQLite)(nil)
 	_ summary.Store   = (*SQLite)(nil)
 )
 

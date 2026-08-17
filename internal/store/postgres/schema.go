@@ -72,6 +72,22 @@ CREATE TABLE IF NOT EXISTS approval_requests (
 CREATE INDEX IF NOT EXISTS idx_approval_requests_status_requested
     ON approval_requests(status, requested_at DESC);
 
+CREATE TABLE IF NOT EXISTS office_drafts (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('email', 'calendar')),
+    status TEXT NOT NULL CHECK (status IN ('draft', 'pending_confirmation', 'approved', 'executing', 'completed', 'rejected', 'failed', 'cancelled')),
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    source_run_id TEXT REFERENCES agent_runs(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    UNIQUE(source_run_id, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_office_drafts_status_updated
+    ON office_drafts(status, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS run_events (
     sequence BIGSERIAL PRIMARY KEY,
     id TEXT NOT NULL UNIQUE,
@@ -162,4 +178,5 @@ INSERT INTO zora_schema_versions(version) VALUES (2) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (3) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (4) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (5) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (6) ON CONFLICT DO NOTHING;
 `

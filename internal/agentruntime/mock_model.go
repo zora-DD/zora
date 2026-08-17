@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"unicode"
@@ -69,6 +70,8 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 			prefix = "项目状态"
 		case "knowledge_search":
 			return schema.AssistantMessage(formatKnowledgeResult(last.Content), nil), nil
+		case "preview_email_draft", "preview_calendar_draft":
+			return schema.AssistantMessage(formatOfficeDraftResult(last.ToolName, last.Content), nil), nil
 		}
 		if strings.HasPrefix(last.ToolName, "mcp_") {
 			return schema.AssistantMessage(formatMCPResult(last.ToolName, last.Content), nil), nil
@@ -79,8 +82,32 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	memoryFacts := recalledMemoryFacts(input)
 	conversationSummary := conversationSummaryFact(input)
 	switch {
+	case systemHasAgentRole(input, "writer") && hasEmailDraftIntent(lower) && hasTool(availableTools, "preview_email_draft"):
+		arguments, prompt := mockEmailDraftArguments(query)
+		if prompt != "" {
+			return schema.AssistantMessage(prompt, nil), nil
+		}
+		return m.toolCall("preview_email_draft", arguments), nil
+	case systemHasAgentRole(input, "writer") && hasCalendarDraftIntent(lower) && hasTool(availableTools, "preview_calendar_draft"):
+		arguments, prompt := mockCalendarDraftArguments(query)
+		if prompt != "" {
+			return schema.AssistantMessage(prompt, nil), nil
+		}
+		return m.toolCall("preview_calendar_draft", arguments), nil
 	case systemHasAgentRole(input, "writer"):
 		return schema.AssistantMessage(formatWriterDraft(query), nil), nil
+	case hasEmailDraftIntent(lower) && hasTool(availableTools, "preview_email_draft"):
+		arguments, prompt := mockEmailDraftArguments(query)
+		if prompt != "" {
+			return schema.AssistantMessage(prompt, nil), nil
+		}
+		return m.toolCall("preview_email_draft", arguments), nil
+	case hasCalendarDraftIntent(lower) && hasTool(availableTools, "preview_calendar_draft"):
+		arguments, prompt := mockCalendarDraftArguments(query)
+		if prompt != "" {
+			return schema.AssistantMessage(prompt, nil), nil
+		}
+		return m.toolCall("preview_calendar_draft", arguments), nil
 	case hasMCPEmailReadIntent(lower) && toolNameWithSuffix(availableTools, "_search_emails") != "":
 		keyword := extractMCPKeyword(query, []string{"搜索邮件", "查找邮件", "search email", "search mail"})
 		return m.toolCall(toolNameWithSuffix(availableTools, "_search_emails"), fmt.Sprintf(`{"query":%q,"limit":10}`, keyword)), nil
@@ -403,6 +430,57 @@ func formatMCPResult(toolName, content string) string {
 	return "MCP 办公工具返回：\n\n" + content
 }
 
+func formatOfficeDraftResult(toolName, content string) string {
+	var payload struct {
+		Draft struct {
+			ID      string          `json:"id"`
+			Kind    string          `json:"kind"`
+			Status  string          `json:"status"`
+			Title   string          `json:"title"`
+			Payload json.RawMessage `json:"payload"`
+		} `json:"draft"`
+		ExternalEffect  bool   `json:"external_effect"`
+		ConfirmationTip string `json:"confirmation_tip"`
+	}
+	if err := json.Unmarshal([]byte(content), &payload); err != nil || payload.Draft.ID == "" {
+		return "办公草稿工具返回：\n\n" + content
+	}
+	var builder strings.Builder
+	if strings.HasSuffix(toolName, "preview_email_draft") {
+		var email struct {
+			To      []string `json:"to"`
+			CC      []string `json:"cc"`
+			Subject string   `json:"subject"`
+			Body    string   `json:"body"`
+		}
+		if err := json.Unmarshal(payload.Draft.Payload, &email); err == nil {
+			fmt.Fprintf(&builder, "邮件草稿已保存：\n\n- 草稿 ID：`%s`\n- 状态：%s\n- 收件人：%s\n- 抄送：%s\n- 主题：%s\n\n%s", payload.Draft.ID, payload.Draft.Status, strings.Join(email.To, "、"), valueOrDefault(strings.Join(email.CC, "、"), "无"), email.Subject, email.Body)
+		}
+	} else {
+		var event struct {
+			Attendees []string `json:"attendees"`
+			Subject   string   `json:"subject"`
+			Start     string   `json:"start"`
+			End       string   `json:"end"`
+			TimeZone  string   `json:"timezone"`
+			Location  string   `json:"location"`
+			Body      string   `json:"body"`
+		}
+		if err := json.Unmarshal(payload.Draft.Payload, &event); err == nil {
+			fmt.Fprintf(&builder, "日程草稿已保存：\n\n- 草稿 ID：`%s`\n- 状态：%s\n- 主题：%s\n- 时间：%s — %s\n- 时区：%s\n- 地点：%s\n- 参与人：%s\n\n%s", payload.Draft.ID, payload.Draft.Status, event.Subject, event.Start, event.End, valueOrDefault(event.TimeZone, "按时间中的偏移量"), valueOrDefault(event.Location, "未填写"), valueOrDefault(strings.Join(event.Attendees, "、"), "无"), event.Body)
+		}
+	}
+	if builder.Len() == 0 {
+		fmt.Fprintf(&builder, "办公草稿 `%s` 已保存，状态为 %s。", payload.Draft.ID, payload.Draft.Status)
+	}
+	if payload.ConfirmationTip != "" {
+		builder.WriteString("\n\n> " + payload.ConfirmationTip)
+	} else if !payload.ExternalEffect {
+		builder.WriteString("\n\n> 当前只保存了内部预览，没有产生任何外部写操作。")
+	}
+	return builder.String()
+}
+
 func appendMCPContentWarning(builder *strings.Builder, warning string) {
 	if warning = strings.TrimSpace(warning); warning != "" {
 		builder.WriteString("\n\n> 安全提示：" + warning)
@@ -417,7 +495,76 @@ func valueOrDefault(value, fallback string) string {
 }
 
 func hasWritingIntent(query string) bool {
-	return containsAny(query, "写一", "写份", "起草", "撰写", "润色", "改写", "整理成", "生成邮件", "生成通知", "写邮件", "写通知", "文案")
+	return containsAny(query, "写一", "写份", "起草", "撰写", "润色", "改写", "整理成", "生成邮件", "生成通知", "写邮件", "写通知", "文案", "安排会议", "创建日程", "新建日程", "日程草稿")
+}
+
+func hasEmailDraftIntent(query string) bool {
+	return containsAny(query, "起草邮件", "起草一封邮件", "邮件草稿", "写邮件", "写一封邮件", "写封邮件", "拟一封邮件", "生成邮件", "发邮件")
+}
+
+func hasCalendarDraftIntent(query string) bool {
+	return containsAny(query, "安排会议", "创建日程", "新建日程", "日程草稿", "会议草稿", "拟定日程")
+}
+
+var (
+	mockEmailPattern   = regexp.MustCompile(`[A-Za-z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+`)
+	mockRFC3339Pattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})`)
+)
+
+func mockEmailDraftArguments(query string) (string, string) {
+	addresses := mockEmailPattern.FindAllString(query, -1)
+	if len(addresses) == 0 {
+		return "", "请提供至少一个收件人邮箱，并尽量给出主题和正文。例如：起草邮件，收件人 dev@example.com，主题：发布通知，正文：项目将在周五发布。"
+	}
+	subject := extractDraftField(query, "主题")
+	if subject == "" {
+		subject = "待确认邮件草稿"
+	}
+	body := extractDraftField(query, "正文")
+	if body == "" {
+		body = "请根据以下需求确认并完善邮件正文：\n\n" + query
+	}
+	encoded, _ := json.Marshal(map[string]any{"to": addresses, "subject": subject, "body": body})
+	return string(encoded), ""
+}
+
+func mockCalendarDraftArguments(query string) (string, string) {
+	times := mockRFC3339Pattern.FindAllString(query, -1)
+	if len(times) < 2 {
+		return "", "请提供带时区的开始和结束时间。例如：创建日程，主题：发布评审，开始：2026-08-20T10:00:00+08:00，结束：2026-08-20T11:00:00+08:00。"
+	}
+	subject := extractDraftField(query, "主题")
+	if subject == "" {
+		subject = "待确认日程"
+	}
+	body := extractDraftField(query, "正文")
+	encoded, _ := json.Marshal(map[string]any{
+		"attendees": mockEmailPattern.FindAllString(query, -1),
+		"subject":   subject, "start": times[0], "end": times[1],
+		"timezone": "Asia/Shanghai", "body": body,
+	})
+	return string(encoded), ""
+}
+
+func extractDraftField(query, field string) string {
+	for _, marker := range []string{field + "：", field + ":"} {
+		index := strings.Index(query, marker)
+		if index < 0 {
+			continue
+		}
+		value := strings.TrimSpace(query[index+len(marker):])
+		separators := []string{"\n", "；", ";"}
+		if field == "主题" {
+			separators = append(separators, "，正文：", ",正文:", "，开始：", ",开始:")
+		}
+		for _, separator := range separators {
+			if end := strings.Index(value, separator); end >= 0 {
+				value = value[:end]
+			}
+		}
+		return strings.TrimSpace(value)
+	}
+	return ""
 }
 
 func hasResearchIntent(query string) bool {

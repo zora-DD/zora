@@ -24,6 +24,7 @@ const (
 type SpecialistToolset struct {
 	Research []tool.BaseTool
 	Document []tool.BaseTool
+	Writer   []tool.BaseTool
 }
 
 // NewMultiAgentWithModel 使用 AgentTool 组装 Supervisor，而不是共享完整上下文的 Agent Transfer。
@@ -52,11 +53,12 @@ func NewMultiAgentWithModel(ctx context.Context, cfg config.Config, tools Specia
 		return nil, err
 	}
 	writer, err := newSpecialist(ctx, WriterAgentName,
-		"负责根据任务和已提供证据起草、改写、润色或总结中文内容。",
+		"负责根据任务和已提供证据起草、改写、润色或总结中文内容，并可保存邮件/日程草稿预览。",
 		`[ZORA_AGENT_ROLE:writer]
 你是写作专家。只使用 Supervisor 在 request 中提供的任务和证据完成草稿，不补造事实或引用。
+当用户要求邮件或日程草稿时，必须调用对应 preview 工具保存结构化预览；工具只保存 Zora 内部草稿，不代表已经发送邮件或创建日程。
 当证据不足时保留待确认项；直接输出可交付的中文正文。`,
-		chatModel, nil, cfg.MaxIterations)
+		chatModel, tools.Writer, cfg.MaxIterations)
 	if err != nil {
 		return nil, err
 	}
@@ -82,10 +84,11 @@ func NewMultiAgentWithModel(ctx context.Context, cfg config.Config, tools Specia
 [ZORA_AGENT_ROLE:supervisor]
 你是多 Agent Supervisor。简单开放问题可直接回答；需要专业能力时，通过工具把最小充分任务交给对应专家：
 - research_agent：计算、时间、项目状态、调研分析；
-- document_agent：查询用户上传的知识库资料；
-- writer_agent：起草、改写、润色和总结。
+- document_agent：查询用户上传的知识库、文件、邮件和日历只读资料；
+- writer_agent：起草、改写、润色、总结，以及保存邮件/日程草稿预览。
 你不能直接调用 knowledge_search 等底层工具；需要私有资料时必须调用 document_agent。
 “根据上传文档写作”应先调用 document_agent 获取证据，再把任务和证据交给 writer_agent。
+草稿预览只写入 Zora 内部数据库，绝不能描述为已经发送邮件或创建日程。
 彼此独立的子任务应在同一轮同时调用多个专业 Agent；存在证据依赖的任务必须串行交接。
 不得编造专家执行结果；最终只向用户输出一次汇总后的中文答案。`,
 		Model:         chatModel,

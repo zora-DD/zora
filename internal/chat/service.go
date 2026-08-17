@@ -290,7 +290,9 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 
 	childRuns := make(map[string]domain.AgentTaskRun)
 	finishedChildRuns := make(map[string]bool)
-	answer, err := s.runtime.Execute(ctx, history, func(event agentruntime.Event) error {
+	// 可信 Conversation/Run 身份通过 Context 传给本地草稿工具，模型参数中不暴露这些审计字段。
+	runtimeCtx := agentruntime.WithExecutionIdentity(ctx, conversationID, run.ID)
+	answer, err := s.runtime.Execute(runtimeCtx, history, func(event agentruntime.Event) error {
 		payload := map[string]any{}
 		var childRunID string
 		if event.Type == "agent_handoff_started" {

@@ -21,6 +21,7 @@ import (
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -33,6 +34,7 @@ type Server struct {
 	knowledge      *knowledge.Service
 	memory         *memory.Service
 	approval       *approval.Service
+	office         *office.Service
 	mcpEnabled     bool
 	mcpToolCount   int
 	logger         *slog.Logger
@@ -43,6 +45,10 @@ type Option func(*Server)
 
 func WithApprovalService(service *approval.Service) Option {
 	return func(server *Server) { server.approval = service }
+}
+
+func WithOfficeService(service *office.Service) Option {
+	return func(server *Server) { server.office = service }
 }
 
 // WithMCPInfo 只向展示层暴露启用状态和已通过门禁的工具数，不泄露命令、参数或环境变量。
@@ -77,6 +83,11 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 		mux.HandleFunc("GET /api/approvals", server.listApprovals)
 		mux.HandleFunc("POST /api/approvals/{approvalID}/decision", server.decideApproval)
 	}
+	if server.office != nil {
+		mux.HandleFunc("GET /api/office/drafts", server.listOfficeDrafts)
+		mux.HandleFunc("GET /api/office/drafts/{draftID}", server.getOfficeDraft)
+		mux.HandleFunc("DELETE /api/office/drafts/{draftID}", server.deleteOfficeDraft)
+	}
 	mux.HandleFunc("GET /api/knowledge/documents", server.listKnowledgeDocuments)
 	mux.HandleFunc("POST /api/knowledge/documents", server.uploadKnowledgeDocument)
 	mux.HandleFunc("DELETE /api/knowledge/documents/{documentID}", server.deleteKnowledgeDocument)
@@ -102,6 +113,7 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
+	toolCount := 4 + s.mcpToolCount
 	capabilities := []string{
 		"chat", "streaming", "tools", "persistence", "run-audit",
 		"knowledge-ingestion", "hybrid-retrieval", "knowledge-citations",
@@ -125,6 +137,10 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.mcpEnabled {
 		capabilities = append(capabilities, "mcp-client", "mcp-readonly-tools")
 	}
+	if s.office != nil {
+		capabilities = append(capabilities, "office-draft-preview", "email-draft", "calendar-draft")
+		toolCount += 2
+	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
@@ -140,7 +156,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"conversation_summary": s.chat.SummaryEnabled(),
 		"mcp_enabled":          s.mcpEnabled,
 		"mcp_tool_count":       s.mcpToolCount,
-		"tool_count":           4 + s.mcpToolCount,
+		"tool_count":           toolCount,
 		"capabilities":         capabilities,
 	})
 }
@@ -466,6 +482,45 @@ func (s *Server) replaceMemory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
 	if err := s.memory.Delete(r.Context(), r.PathValue("memoryID")); err != nil {
+		s.problem(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) listOfficeDrafts(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			s.problem(w, fmt.Errorf("limit 必须是整数"))
+			return
+		}
+		limit = parsed
+	}
+	items, err := s.office.List(r.Context(), office.ListFilter{
+		Kind:   strings.TrimSpace(r.URL.Query().Get("kind")),
+		Status: strings.TrimSpace(r.URL.Query().Get("status")),
+		Limit:  limit,
+	})
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"drafts": items})
+}
+
+func (s *Server) getOfficeDraft(w http.ResponseWriter, r *http.Request) {
+	item, err := s.office.Get(r.Context(), r.PathValue("draftID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) deleteOfficeDraft(w http.ResponseWriter, r *http.Request) {
+	if err := s.office.Delete(r.Context(), r.PathValue("draftID")); err != nil {
 		s.problem(w, err)
 		return
 	}

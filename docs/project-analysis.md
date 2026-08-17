@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.5 Office Agent 第二阶段（文件与 Microsoft Graph 只读连接器）
+> 文档基线：V0.5 Office Agent 第三阶段（持久化邮件/日程草稿预览）
 > 最后更新：2026-08-17
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第二阶段已经以官方 MCP Go SDK 接入受目录约束的只读文件连接器，以及 Microsoft Graph 邮件/日历只读连接器；草稿和写操作状态机尚未实现。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第三阶段已经接入文件与 Microsoft Graph 邮件/日历只读连接器，并建立邮件/日程结构化草稿、双数据库持久化、可信 Run 来源和 Web 预览；外部写操作状态机尚未实现。
 
 ## 2. 背景与问题
 
@@ -139,7 +139,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | MCP 办公底座 | 已实现 | 官方 Go SDK、stdio 生命周期、只读双门禁、子进程环境隔离和 RunEvent 审计 |
 | 文件连接器 | 已实现 | 目录沙箱、列表和 UTF-8 读取；拒绝隐藏路径、越界与符号链接逃逸 |
 | Microsoft 邮件/日历连接器 | 已实现 | Graph 邮件搜索/详情、日历窗口查询/详情；只返回摘要和元数据 |
-| 草稿/写操作 | V0.5 进行中 | 草稿、持久化写前确认、幂等执行、OAuth 生命周期和完整审计仍待实现 |
+| 邮件/日程草稿预览 | 已实现 | 结构化校验、双数据库、可信 Run 来源、内容哈希幂等、REST 与 Web 草稿箱 |
+| 外部写操作 | V0.5 进行中 | 持久化写前确认、幂等执行、OAuth 生命周期和完整审计仍待实现 |
 
 ## 6. 业务模型
 
@@ -152,10 +153,11 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | AgentRun | 一次用户请求对应的一次根 Agent 执行 | running → completed/failed/cancelled/rejected |
 | AgentTaskRun | 根 Run 下的一次专业 Agent 交接 | running → completed/failed/cancelled；保存任务与输出摘要 |
 | RunEvent | Run 内部发生的可观察事实 | append-only，随 AgentRun 删除 |
-| Tool | Agent 可选择的受控能力 | 启动时注册，当前均为只读 |
+| Tool | Agent 可选择的受控能力 | 启动时注册；外部系统工具只读，草稿工具只写 Zora 内部预览 |
 | MCPServer | 独立运行的办公连接器进程 | 启动握手 → 工具发现/调用 → 应用退出时关闭 |
 | MCPToolAdapter | MCP Tool 到 Eino Tool 的命名空间与 Schema 适配 | 启动时创建，只允许白名单且声明只读的工具 |
 | MicrosoftConnector | Graph 邮件和日历的只读适配器 | 进程启动后持有短期 Token；Token 不进入数据库、日志或 ToolResult |
+| OfficeDraft | 尚未执行的邮件或日程参数快照 | draft；当前只能创建、查看和删除，后续状态仅预留 |
 | Specialist Agent | Research/Document/Writer 专业执行单元 | 启动时组装，通过 AgentTool 接收 request，执行后返回交付物 |
 | Agent Handoff | Supervisor 与专业 Agent 的一次结构化交接 | started → agent output → completed；关联 AgentTaskRun 与顶层 RunEvent |
 | ApprovalRequest | 高影响请求的人工审批记录 | pending → approved/rejected/expired；决定可恢复等待中的 Run |
@@ -440,6 +442,22 @@ SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embe
 
 该表不替代 `messages`。上下文加载时仅用 `through_sequence` 过滤重复发送给模型的早期消息，查询消息历史仍可获得完整原文。
 
+### 7.9 office_drafts
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | TEXT | PK | `draft_` 前缀 ID |
+| `kind` | TEXT | CHECK | `email` 或 `calendar` |
+| `status` | TEXT | CHECK | 当前只创建 `draft`；为后续确认/执行终态预留枚举 |
+| `conversation_id` | TEXT | Nullable FK | 来源会话，删除会话时置空而不删除用户草稿 |
+| `source_run_id` | TEXT | Nullable FK | 创建草稿的可信根 Run，由 Chat Context 注入 |
+| `title` | TEXT | NOT NULL | 邮件主题或日程主题 |
+| `payload` | TEXT/JSONB | 合法 JSON | 规范化收件人、正文、时间窗、参与人等参数 |
+| `content_hash` | TEXT | NOT NULL | Kind + 规范化 Payload 的 SHA-256 |
+| `created_at` / `updated_at` | 时间 | NOT NULL | 创建和最近更新时间 |
+
+`UNIQUE(source_run_id, content_hash)` 使同一 Agent Run 的工具重试返回已有草稿。当前 Service 没有状态推进 API，且删除 SQL 再次限制 `status='draft'`；预留枚举不等于对应写操作已经实现。
+
 ## 8. 技术架构
 
 ```mermaid
@@ -448,24 +466,29 @@ flowchart LR
     HTTP --> Chat["chat.Service"]
     HTTP --> Knowledge["knowledge.Service"]
     HTTP --> Memory["memory.Service"]
+    HTTP --> Office["office.Service"]
     Chat --> Summary["summary.Service"]
     Chat --> Runtime["agentruntime.Runtime"]
     Runtime --> ADK["Eino ChatModelAgent"]
     ADK --> Model["Mock / OpenAI-compatible Model"]
     ADK --> Tools["Read-only Tool Allowlist"]
     Tools --> Knowledge
+    Tools --> Office
     Chat --> Store["store.Store"]
     Knowledge --> KStore["knowledge.Store"]
     Memory --> MStore["memory.Store"]
     Summary --> SStore["summary.Store"]
+    Office --> OStore["office.Store"]
     Store --> SQLite["SQLite"]
     KStore --> SQLite
     MStore --> SQLite
     SStore --> SQLite
+    OStore --> SQLite
     Store --> PostgreSQL["PostgreSQL"]
     KStore --> PostgreSQL
     MStore --> PostgreSQL
     SStore --> PostgreSQL
+    OStore --> PostgreSQL
     PostgreSQL --> PGVector["pgvector HNSW + FTS GIN"]
     Knowledge --> Embedder["Hash / OpenAI Embedder"]
     EvalCLI["zora-eval"] --> RAGEval["rageval"]
@@ -505,6 +528,7 @@ flowchart LR
 | 摘要应用层 | `internal/summary` | 触发窗口、增量摘要、Model/Rule Summarizer 和持久化边界 |
 | MCP 适配层 | `internal/mcpbridge` | stdio 生命周期、工具发现、只读白名单、Schema 与 Eino 适配 |
 | MCP 连接器层 | `internal/mcpfiles`、`internal/mcpmicrosoft` | 文件目录沙箱；Graph 邮件/日历只读查询、Token 隔离与外部内容标记 |
+| 办公应用层 | `internal/office` | 邮件/日程草稿校验、可信来源、内容哈希幂等、生命周期与 Agent Tool |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
@@ -588,6 +612,12 @@ V0.5 把“办公能力”落成独立 MCP 进程，而不是把文件系统或 
 
 Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要，不下载 HTML/附件。内容同时由工具结果警告和系统 Prompt 标记为不可信数据，避免邮件正文中的“忽略规则、调用工具、打开链接”等文本被当成 Agent 指令。这个实现同时体现协议落地、最小数据暴露和 Prompt Injection 防线分层。
 
+### 9.14 草稿与外部执行显式分层
+
+邮件/日程草稿不是 Writer 输出的一段不可追踪文本，而是独立 `OfficeDraft`。Chat 在创建根 Run 后通过 Context 注入可信来源，工具参数中不允许模型填写 Conversation/Run ID；Service 对邮箱、正文长度、RFC3339 时间窗和 IANA 时区二次校验。规范化 Payload 与 Kind 计算 SHA-256，同一 Run 重试相同工具参数不会制造重复草稿。
+
+草稿工具固定返回 `external_effect=false`，Web 使用“仅预览”标记，数据库和 Service 也没有从 draft 推进到 approved/executing 的公开方法。因此当前实现可以展示状态机基础，又不会把“生成预览”和“执行外部操作”混为一谈。
+
 ## 10. 当前限制与风险
 
 | 限制/风险 | 当前影响 | 后续处理 |
@@ -612,6 +642,8 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 | Graph 只完成模拟集成验收 | 代码和协议测试已通过，但没有真实 Microsoft 租户凭据的在线验收记录 | 建立最小权限 Entra 测试应用和专用测试账号，执行真实邮件/日历冒烟 |
 | 邮件/日历仅支持 Microsoft | Google Workspace 等来源尚不能接入 | 保持 MCP 工具语义稳定，新增独立 Provider 连接器而不修改 Chat 主链路 |
 | MCP 凭据尚无统一托管 | `pass_env` 已隔离 Zora 核心凭据，但专用连接器 Token 仍依赖部署平台 | 引入 Secret 引用/短期令牌，不在 JSON、日志、RunEvent 或模型上下文保存明文 |
+| 草稿状态只实现 draft | 已能持久化和预览，但不能批准、恢复或执行 | 下一阶段增加一次性确认、版本校验、幂等 Operation 和终态审计 |
+| 草稿 Payload 尚未加密 | 本地数据库读取者可以看到邮件正文和日程内容 | 生产环境增加磁盘/列加密、数据保留策略和 Tenant ACL |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
 | 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
 | 尚无 token/cost 指标 | 无法比较模型成本 | 从 ResponseMeta 采集 Usage |
@@ -656,6 +688,6 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
 3. **V0.3 Long-term Memory（主链路完成）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入、会话增量摘要和 A/B 门禁已实现。
 4. **V0.4 Multi-Agent（已完成）**：Supervisor、三个专业 Agent、隔离交接、串/并行执行治理、父子 Run、人工审批和单/多 Agent 对照门禁已实现。
-5. **V0.5 Office Agent（进行中）**：官方 MCP Client、文件与 Microsoft Graph 邮件/日历只读连接器已完成；继续实现草稿预览、持久化写操作审批、OAuth 生命周期和完整审计。
+5. **V0.5 Office Agent（进行中）**：官方 MCP Client、文件与 Microsoft Graph 邮件/日历只读连接器、持久化草稿预览已完成；继续实现外部写操作确认、异步幂等执行、OAuth 生命周期和完整审计。
 
 详细任务与验收条件见 [Roadmap](roadmap.md)。

@@ -398,6 +398,18 @@ button { color: inherit; }
 .memory-item-actions button { padding: 5px 8px; border: 0; border-radius: 7px; background: var(--panel-3); color: var(--muted); font-size: 9px; cursor: pointer; }
 .memory-item-actions button:hover { color: var(--text); }
 .memory-item-actions button:last-child:hover { background: rgba(255,107,125,.12); color: var(--danger); }
+.office-draft-list { max-height: 510px; padding: 14px 20px 20px; overflow-y: auto; }
+.office-draft-item { padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.018); }
+.office-draft-item + .office-draft-item { margin-top: 10px; }
+.office-draft-heading { display: flex; align-items: center; gap: 8px; }
+.office-draft-heading strong { padding: 3px 7px; border-radius: 6px; background: var(--accent-soft); color: #cfc9ff; font-size: 9px; }
+.office-draft-heading span { margin-left: auto; color: #77d9b1; font-size: 9px; }
+.office-draft-item h3 { margin: 10px 0 8px; font-size: 12px; }
+.office-draft-item pre { max-height: 190px; margin: 0 0 9px; overflow: auto; color: #d8d9de; font: inherit; font-size: 10px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.office-draft-item small { color: var(--muted-2); font-size: 9px; }
+.office-draft-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+.office-draft-actions button { padding: 6px 9px; border: 0; border-radius: 7px; background: var(--panel-3); color: var(--muted); font-size: 9px; cursor: pointer; }
+.office-draft-actions button:hover { background: rgba(255,107,125,.12); color: var(--danger); }
 .mobile-only { display: none; }
 .sidebar-scrim { display: none; }
 

@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.5 Office Agent 第二阶段（文件与 Microsoft Graph 只读连接器）
+> 适用版本：V0.5 Office Agent 第三阶段（持久化邮件/日历草稿预览）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -55,6 +55,7 @@ internal/
 ├── mcpbridge/                 MCP Client、发现/白名单与 Eino Tool 适配
 ├── mcpfiles/                  文件目录沙箱与只读 MCP Tools
 ├── mcpmicrosoft/              Graph HTTP、邮件/日历工具和外部内容安全标记
+├── office/                    邮件/日历草稿校验、持久化与 Agent Tools
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
 ```
@@ -72,6 +73,7 @@ flowchart TD
     Main --> Knowledge["knowledge"]
     Main --> Memory["memory"]
     Main --> Summary["summary"]
+    Main --> Office["office"]
     Main --> MCPBridge["mcpbridge"]
     MCPBridge --> MCPServer["MCP stdio Server"]
     MCPServer --> MCPFiles["mcpfiles"]
@@ -89,27 +91,32 @@ flowchart TD
     HTTP --> Chat
     HTTP --> Knowledge
     HTTP --> Memory
+    HTTP --> Office
     Chat --> Domain["domain"]
     Chat --> Store["store interface"]
     Chat --> Runtime
     Chat --> Memory
     Chat --> Summary
+    Chat -. "注入可信 conversation/run 身份" .-> Office
     Runtime --> Eino["Eino ADK"]
     Tools --> Eino
     Knowledge --> Eino
     Knowledge --> KStore["knowledge.Store"]
     Memory --> MStore["memory.Store"]
     Summary --> SStore["summary.Store"]
+    Office --> OStore["office.Store"]
     RAGEval --> Knowledge
     SQLite --> Store
     SQLite --> KStore
     SQLite --> MStore
     SQLite --> SStore
+    SQLite --> OStore
     SQLite --> Domain
     Postgres --> Store
     Postgres --> KStore
     Postgres --> MStore
     Postgres --> SStore
+    Postgres --> OStore
     Postgres --> Domain
 ```
 
@@ -118,7 +125,7 @@ flowchart TD
 - `domain` 不依赖 Eino、HTTP 或数据库驱动；
 - `store.Store` 不暴露 SQL 类型；
 - `httpapi` 不直接调用模型和工具；
-- `httpapi` 只通过应用 Service 调用知识库、长期记忆和会话摘要用例；
+- `httpapi` 只通过应用 Service 调用知识库、长期记忆、会话摘要和办公草稿用例；
 - `chat` 只依赖 `agentruntime.Runtime` 的统一事件；
 - 单 Agent 工具从显式 allowlist 注入；多 Agent 模式进一步按 Research/Document/Writer 职责分组，Supervisor 不能直接调用底层工具。
 
@@ -130,17 +137,18 @@ flowchart TD
 2. 根据 `ZORA_STORE_PROVIDER` 打开 SQLite 或 PostgreSQL；
 3. SQLite 启用 WAL/busy timeout；PostgreSQL 初始化连接池、pgvector 类型和幂等迁移；
 4. 构造时间、计算器和项目状态工具；
-5. 启用 MCP 时启动白名单中的 stdio Server，握手、发现只读工具并建立生命周期管理；
-6. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder；
-7. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
-8. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
-9. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
-10. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
-11. 创建 Eino Runner；多 Agent 模式包装受控 AgentTool，并开启内部 Agent 事件透传；
-12. 按配置创建 Model/Rule Summarizer 和 Summary Service；
-13. 多 Agent 审批模式不为 off 时创建 Approval Service；
-14. 创建 Chat Service，按开关接入 Memory Capture/Recall、会话摘要和审批，再创建 HTTP Handler；
-15. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
+5. 创建 Office Service 与邮件/日历草稿预览工具；草稿写入当前应用数据库，不调用外部写接口；
+6. 启用 MCP 时启动白名单中的 stdio Server，握手、发现只读工具并建立生命周期管理；
+7. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder；
+8. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
+9. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
+10. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
+11. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
+12. 创建 Eino Runner；多 Agent 模式包装受控 AgentTool，并开启内部 Agent 事件透传；
+13. 按配置创建 Model/Rule Summarizer 和 Summary Service；
+14. 多 Agent 审批模式不为 off 时创建 Approval Service；
+15. 创建 Chat Service，按开关接入 Memory Capture/Recall、会话摘要和审批，再创建含 Office Service 的 HTTP Handler；
+16. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
 
@@ -218,6 +226,7 @@ sequenceDiagram
     participant Specialist as Specialist Agent
     participant Model as ChatModel
     participant Tool as ToolNode
+    participant Office as office.Service
 
     Client->>API: POST /messages
     API->>API: 校验 JSON 并建立 SSE
@@ -226,6 +235,7 @@ sequenceDiagram
     Chat->>Store: 查询 Conversation
     Chat->>Store: 保存 user Message
     Chat->>Store: 创建 running AgentRun
+    Chat->>Chat: 将 conversation_id/run_id 注入可信 Context
     Chat-->>Client: start
     Chat->>Summary: 读取已持久化会话摘要
     Summary-->>Chat: 摘要正文 + through_sequence
@@ -248,6 +258,11 @@ sequenceDiagram
         Runner-->>Chat: tool_call
         Chat-->>Client: tool_call
         Runner->>Tool: 执行结构化参数
+        opt 邮件/日历草稿预览
+            Tool->>Office: 使用可信 Context 创建 draft
+            Office->>Store: 幂等写入 office_drafts
+            Office-->>Tool: Draft + external_effect=false
+        end
         Tool-->>Runner: ToolResult
         Runner-->>Chat: tool_result
         Chat-->>Client: tool_result
@@ -337,7 +352,7 @@ AgentTool 外层由 `controlledAgentTool` 统一治理。`Runtime.Execute` 为�
 | `zora_supervisor` | 三个 AgentTool | 读取主对话上下文，决定直接回答或交接，最终只输出一次答案 |
 | `research_agent` | `current_time`、`calculator`、`project_status` | 只接收 request，负责核验和分析 |
 | `document_agent` | `knowledge_search`；启用后追加 MCP 文件、邮件和日历只读工具 | 只接收 request，负责知识库证据和授权办公数据读取 |
-| `writer_agent` | 无底层工具 | 只使用 request 中的任务和证据，不补造事实 |
+| `writer_agent` | `preview_email_draft`、`preview_calendar_draft` | 只使用 request 中的任务和证据，不补造事实；只能保存内部预览，不能对外发送或创建日程 |
 
 复合“根据文档写作”任务采用 `document_agent → writer_agent` 串行交接。Eino 会透传子 Agent 的流式事件；Runtime 只累计根 Agent 的文本为最终回答，子 Agent 文本统一转成单条 `agent_output`。这避免专家草稿和 Supervisor 定稿被重复拼接，同时保留调试证据。
 
@@ -363,13 +378,15 @@ AgentTool 外层由 `controlledAgentTool` 统一治理。`Runtime.Execute` 为�
 
 ### 7.1 工具注册
 
-所有工具在 `agenttools.Build` 中显式注册。Eino `InferTool` 根据 Go 输入结构生成 JSON Schema，并在执行前反序列化参数。
+工具在启动组装阶段显式注册：基础工具来自 `agenttools.Build`，知识检索和 Office 草稿工具分别由各自 Service 构造。Eino `InferTool` 根据 Go 输入结构生成 JSON Schema，并在执行前反序列化参数。
 
 | Tool | 输入 | 输出 | 安全属性 |
 |---|---|---|---|
 | `current_time` | IANA timezone | timezone + RFC3339 time | 只读；无外部网络 |
 | `calculator` | 四则表达式 | expression + result | 自研解析器；不执行代码 |
 | `project_status` | 空对象 | 版本、能力、下一里程碑 | 只读静态信息 |
+| `preview_email_draft` | 收件人、抄送、主题、正文 | 持久化邮件草稿与 `external_effect=false` | 仅写 Zora 内部数据库；不调用邮件发送接口 |
+| `preview_calendar_draft` | 参与人、主题、起止时间、时区、地点、正文 | 持久化日历草稿与 `external_effect=false` | 仅写 Zora 内部数据库；不调用 Graph 日历写接口 |
 
 ### 7.2 计算器语法
 
@@ -390,6 +407,14 @@ AgentTool 外层由 `controlledAgentTool` 统一治理。`Runtime.Execute` 为�
 - Shell 或代码表达式。
 
 解析器使用递归下降，优先级为：expression → term → factor → number。
+
+### 7.3 Office 草稿预览工具
+
+草稿工具不是外部写操作，而是“生成结构化内容 → 校验 → 保存内部预览”的准备阶段。工具输入中不存在 `conversation_id` 和 `run_id`；`chat.Service` 在创建 Agent Run 后把这两个值写入执行 Context，`office.Service` 只接受该可信来源，避免模型伪造草稿归属或审计来源。
+
+邮件草稿校验包括：至少一个合法收件人、收件人和抄送人归一化去重、主题最多 200 字符、正文最多 20,000 字符。日历草稿要求合法参与人地址、RFC3339 起止时间、结束时间晚于开始时间、跨度不超过 31 天、合法 IANA 时区和最多 300 字符地点。
+
+Service 将规范化后的 `kind + payload` 计算 SHA-256。数据库唯一约束 `(source_run_id, content_hash)` 使模型重试同一次 ToolCall 时返回原草稿，不重复创建。ToolResult 始终包含 `external_effect=false` 和中文提示，系统 Prompt 同时要求最终回答明确说明“尚未发送/尚未创建日程”。
 
 ## 8. 持久化与一致性
 
@@ -417,12 +442,12 @@ SQL 子查询先按 sequence 倒序取最近 N 条，外层再升序输出。结
 
 ### 8.4 Store 替换策略
 
-应用层依赖 `store.Store`、`knowledge.Store`、`memory.Store`、`summary.Store` 与 `approval.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/ChildRun/Approval/Document/Memory/Summary 语义；`cmd/zora` 只在启动组装阶段选择实现。
+应用层依赖 `store.Store`、`knowledge.Store`、`memory.Store`、`summary.Store`、`approval.Store` 与 `office.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/ChildRun/Approval/Document/Memory/Summary/OfficeDraft 语义；`cmd/zora` 只在启动组装阶段选择实现。
 
 PostgreSQL 已处理：
 
 - pgxpool 连接池和启动连通性检查；
-- `Conversation`、`Message`、`AgentRun`、`AgentTaskRun`、`ApprovalRequest`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory`、`ConversationSummary` 的关系与约束；
+- `Conversation`、`Message`、`AgentRun`、`AgentTaskRun`、`ApprovalRequest`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory`、`ConversationSummary`、`OfficeDraft` 的关系与约束；
 - advisory transaction lock 串行化多实例 DDL；
 - pgvector 类型注册、固定维度校验、HNSW cosine index；
 - 基于统一 tokenizer 词项的 `tsvector` generated column 和 GIN index。
@@ -651,6 +676,22 @@ recency = exp(-ln(2) * age / 90 days)
 指标包括：完整路由序列准确率、实际调用中不属于预期序列的意外专家调用率、非空且包含预期事实锚点的答案完成率和平均延迟。默认 7 题增加 Research + Writer 同轮并行，原有 Document/Research/Writer 单专家、`document_agent → writer_agent` 串行、直接回答和“文档”硬负例继续保留。默认 Mock 路由三项质量指标分别为 1、0、1。
 
 同一命令还组装拥有全部底层工具的单 Agent Control 和 Supervisor Treatment，逐题完整经过 `chat.Send`。质量按答案事实锚点覆盖比例计算；成本使用“根 Agent + 专业 Agent 交接数”作为确定性调用次数代理；耗时记录两组真实执行时间。当前 Control 质量 0.785714、Treatment 质量 1、增益 0.214286，平均调用次数 1 对 2、比例 2；延迟比例按运行环境实时输出并受宽松上限门禁。调用次数不是 Token 成本，接真实 Provider 后仍需从 ResponseMeta 补充 Usage。
+
+### 8.15 Office 草稿状态与一致性
+
+`office_drafts` 同时支持 SQLite JSON 文本和 PostgreSQL JSONB，保存 `kind`、`status`、归属 Conversation、来源 Agent Run、规范化 Payload、内容哈希和时间戳。当前可创建状态只有 `draft`；Schema 为后续确认和执行预留 `pending_confirmation`、`approved`、`executing`、`completed`、`rejected`、`failed`、`cancelled`，但当前 Service 不允许进入这些状态，避免把目标设计误当成交付能力。
+
+```text
+当前阶段：draft（仅内部预览，可删除）
+
+下一阶段目标：
+draft → pending_confirmation → approved → executing → completed
+                            ├→ rejected
+                            ├→ cancelled
+                            └→ failed
+```
+
+Conversation 或 Agent Run 删除时，草稿通过 `ON DELETE SET NULL` 保留，避免审计对象随聊天清理而消失。只有 `draft` 状态允许删除；未来进入确认或执行链的记录必须通过显式状态迁移处理。`source_run_id + content_hash` 唯一约束为同一 Run 内的工具重试提供幂等性。
 
 ## 9. 并发、取消与错误处理
 
@@ -964,6 +1005,18 @@ DELETE /api/memories/{memoryID}
 }
 ```
 
+### 10.14 Office 草稿管理
+
+```http
+GET /api/office/drafts?kind=email&status=draft&limit=100
+GET /api/office/drafts/{draftID}
+DELETE /api/office/drafts/{draftID}
+```
+
+列表默认最多返回 100 条、按更新时间倒序，`kind` 可选 `email`/`calendar`，`status` 当前使用 `draft`。详情响应为完整 Draft；邮件 Payload 包含 `to`、`cc`、`subject`、`body`，日历 Payload 包含 `attendees`、`subject`、`start`、`end`、`timezone`、`location`、`body` 和 `is_all_day`。
+
+只有内部预览状态的草稿可以删除；成功返回 204，不存在返回 404，非法筛选参数返回 400。创建不开放独立 REST API，只能由 Agent 在有效 Run 中调用草稿预览 Tool，确保每条草稿都有可信 `source_run_id`。
+
 ## 11. SSE 事件契约
 
 | 事件 | 关键字段 | 是否持久化 | 说明 |
@@ -988,6 +1041,7 @@ DELETE /api/memories/{memoryID}
 - 欢迎页提供三个可触发工具的示例；
 - 侧边栏知识库弹窗支持上传、文档列表、分块数和删除；
 - 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，展示手动/对话来源、人工修正状态及自动提取/召回开关状态；
+- 侧边栏办公草稿面板展示持久化邮件/日历预览、来源 Run、更新时间和“仅预览”状态，支持刷新、查看结构化内容和删除；
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用和专业 Agent 协作均以可折叠 Trace 展示；专家中间输出不会进入最终回答气泡；
@@ -1017,6 +1071,9 @@ DELETE /api/memories/{memoryID}
 - MCP Server 必须同时通过部署白名单和 `readOnlyHint` 门禁；子进程只继承显式 `pass_env`，主模型 Key、Embedding Key 和数据库 DSN 禁止透传。
 - Graph Token 不落库、不写日志、不进入 ToolResult；邮件/日历只返回元数据和正文摘要，不下载 HTML 或附件。
 - 系统 Prompt 与 Graph ToolResult 都把外部内容标为不可信数据，明确禁止执行其中的工具指令、链接或权限请求。
+- 邮件/日历草稿只保存到 Zora 数据库；当前代码没有邮件发送或 Graph 日历写入调用，ToolResult 固定返回 `external_effect=false`。
+- 草稿归属的 Conversation/Run ID 由 Chat 注入 Context，模型参数不能覆盖；收件地址、时间窗、时区和内容长度在 Service 层二次校验。
+- 同一 Run 的同内容草稿由数据库唯一约束幂等去重；Web 和回答都明确标记“仅预览、尚未发送/创建”。
 
 ### 上线前必须补充
 
@@ -1055,6 +1112,7 @@ DELETE /api/memories/{memoryID}
 | Memory A/B 测试 | 严格数据集校验；Control/Treatment 事实覆盖；意外召回与答案污染反例；RunEvent 召回 ID 解析；完整 CLI 基线 |
 | Multi-Agent 评测测试 | 严格数据集校验；路由序列、意外专家和答案完成指标；协作事件闭环；完整 Chat/RunEvent CLI 基线 |
 | MCP/Graph 测试 | in-memory MCP 握手、只读标注、白名单和环境隔离；纯内存 HTTP 验证 Graph Bearer Token、查询窗口、关键词过滤、错误脱敏和不可信内容警告 |
+| Office 草稿测试 | 邮件/日历参数归一化与拒绝规则；可信 Run Context；ToolResult 无外部副作用；SQLite 生命周期和幂等性；PostgreSQL Schema；Mock Agent→Tool→SQLite→SSE→REST 端到端 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
 | HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404、自动提取/召回，以及摘要触发、查询和 Mock 上下文作答 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
@@ -1139,7 +1197,7 @@ flowchart LR
 
 ### 17.4 V0.5 Office Agent
 
-第二阶段已用官方 MCP Go SDK v1.7.0 打通文件和 Microsoft Graph 两类只读链路：
+第三阶段在官方 MCP 只读链路基础上，增加了持久化邮件/日历草稿预览。现有只读连接器链路如下：
 
 ```mermaid
 sequenceDiagram
@@ -1184,7 +1242,9 @@ Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，�
 
 当前调用继续复用已有 `tool_call` / `tool_result` RunEvent，因此无需新增 MCP 专属数据库表。`GET /api/info` 只公开 `mcp_enabled`、`mcp_tool_count` 和总工具数，不返回命令、参数、根目录或环境变量。in-memory MCP 端到端测试覆盖握手、发现、Schema 适配和调用；文件测试覆盖隐藏路径、`..` 与符号链接逃逸；Graph 使用纯内存 HTTP Transport 验证鉴权、查询、四工具只读标注与错误脱敏。由于当前开发环境没有 Microsoft 租户凭据，真实账号集成验收仍待专用测试租户完成。
 
-后续需要设计“先生成不可执行草稿 → 用户确认 → 持久化异步任务 → 幂等写入”的状态机，并补齐 OAuth 登录/刷新、Secret 托管和真实租户集成测试。当前多 Agent 的通用审批门禁不能直接视为办公写操作已安全落地。
+第三阶段新增 `preview_email_draft` 与 `preview_calendar_draft`。它们只生成规范化 Payload 并保存 `office_drafts`，返回 `external_effect=false`；单 Agent 可以直接使用，多 Agent 模式只授权 Writer 使用。草稿归属由执行 Context 提供，SQLite/PostgreSQL 使用 `(source_run_id, content_hash)` 去重，REST/Web 提供列表、详情和删除。该能力没有调用 `sendMail`、`events POST` 等外部写接口，因此“草稿已保存”不能表述为“邮件已发送”或“日程已创建”。
+
+下一阶段需要把草稿状态推进到“等待用户确认 → 一次性批准 → 幂等执行 → 结果回写”，并补齐 OAuth 登录/刷新、Secret 托管、最小 Graph 写权限和真实租户集成测试。当前多 Agent 的通用审批门禁与 OfficeDraft 尚未绑定，不能直接视为办公写操作已安全落地。
 
 ## 18. 维护约定
 

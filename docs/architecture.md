@@ -4,7 +4,7 @@
 
 ## 1. 边界
 
-Zora 将系统划分为十四个边界：
+Zora 将系统划分为十五个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
@@ -20,6 +20,7 @@ Zora 将系统划分为十四个边界：
 12. `mcpbridge`：官方 MCP Client、stdio 生命周期、工具发现/白名单和 Eino 适配。
 13. `mcpfiles`：独立文件连接器的授权目录、路径校验和只读工具实现。
 14. `mcpmicrosoft`：独立 Microsoft Graph 连接器的 Token 边界、邮件/日历只读查询和外部内容安全标记。
+15. `office`：邮件/日程草稿模型、结构化校验、可信 Run 来源、重试幂等和内部预览工具。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -64,6 +65,10 @@ Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episo
 
 每个 Conversation 最多一份增量摘要，记录正文、已覆盖的 Message sequence、累计消息数、模型和更新时间。达到阈值时合并旧摘要与较早消息，最近窗口继续保留原文；原始 Message 不删除。下一轮上下文由“摘要 + 相关长期记忆 + 最近原始消息”组成。
 
+### OfficeDraft
+
+OfficeDraft 是尚未产生外部影响的邮件或日程参数快照。它保存类型、状态、标题、规范化 JSON Payload、内容哈希、来源 Conversation/Run 和时间戳。当前 Service 只创建 `draft`，并只允许删除 `draft`；其余状态为后续写前确认与执行状态机预留，模型不能直接修改。
+
 ## 4. 并发与取消
 
 - 同一 Conversation 同时只允许一个 Run 修改历史，避免两个请求读取相同旧上下文后交错落库。
@@ -82,6 +87,7 @@ PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业�
 - 默认 Content Security Policy 只允许同源资源。
 - API Key 只从环境变量读取。
 - 当前没有任何写入外部系统的工具。
+- 草稿工具只能从 Chat 注入的可信 Conversation/Run Context 取得来源，并固定返回 `external_effect=false`。
 - 知识文档限制为 UTF-8 TXT/Markdown 且最大 5 MiB，文档删除需要用户确认。
 - 长期记忆内容最多 2,000 字符，类型/重要性/过期时间在 Service 层校验，来源字段不可由用户伪造，删除需要确认；候选提取 Prompt 隔离不可信聊天数据，Service 二次拒绝明显敏感凭据。
 - 会话摘要 Prompt 把旧摘要和消息编码为不可信 JSON，禁止保留密码或 Token；加载时仍按非指令背景数据注入，摘要失败自动退化为最近原始消息。
@@ -192,7 +198,7 @@ Web 将交接事件显示为带 `child_run_id` 的专业 Agent Trace，并显示
 
 ## 9. V0.5 MCP 办公连接器架构
 
-第二阶段已形成文件与 Microsoft Graph 两类只读连接器：
+第三阶段在文件与 Microsoft Graph 两类只读连接器之上增加内部草稿层：
 
 ```text
 Zora 主进程
@@ -204,6 +210,12 @@ Zora 主进程
         └── zora-mcp-microsoft 子进程
             ├── search_emails / get_email
             └── list_calendar_events / get_calendar_event
+
+Writer Agent / 单 Agent
+└── office.Service
+    ├── preview_email_draft
+    ├── preview_calendar_draft
+    └── office_drafts（SQLite / PostgreSQL）
 ```
 
 启动时，`mcpbridge` 按配置逐个启动 stdio Server，执行 MCP 握手和分页工具发现。一个工具必须同时出现在部署者提供的 `allowed_tools` 中，并由 Server 声明 `readOnlyHint=true`；之后才会以 `mcp_{server}_{tool}` 名称进入 Eino。主进程不经过 Shell，子进程也不默认继承环境；模型 Key、Embedding Key 与数据库 DSN 不能透传。
@@ -212,4 +224,6 @@ Zora 主进程
 
 Microsoft 连接器使用 Graph REST 统一查询邮件和日历。OAuth 登录、刷新和 Secret 保存不进入连接器：部署平台只向子进程注入短期 Token，委托访问使用 `me`，应用访问必须指定用户 ID。四个工具仅返回元数据和正文摘要，不下载邮件附件；默认日历窗口为 7 天、最长 93 天。外部内容始终附带不可信数据提示，系统 Prompt 也要求忽略其中的工具指令、链接和权限请求。
 
-未来写操作不能直接复用只读适配器：必须先生成草稿并持久化参数摘要，再经人工决定和幂等任务执行，避免“模型产生 ToolCall”直接等于外部副作用。
+`preview_email_draft` 和 `preview_calendar_draft` 会先校验邮箱、长度、RFC3339 时间窗与 IANA 时区，再保存结构化草稿。`source_run_id + content_hash` 唯一约束吸收 Agent/Writer 重试；REST 和 Web 只允许查看或删除 `draft`。当前没有 Graph 写接口，也没有草稿状态推进方法。
+
+未来写操作不能直接复用只读适配器：必须在现有草稿快照之上建立独立人工决定、幂等任务和恢复机制，避免“模型产生 ToolCall”直接等于外部副作用。

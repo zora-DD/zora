@@ -6,6 +6,7 @@ const state = {
   messages: [],
   documents: [],
   memories: [],
+	officeDrafts: [],
 	memoryAutoCapture: false,
 	memoryRecall: false,
   multiAgent: false,
@@ -59,6 +60,11 @@ const elements = {
   memoryList: document.querySelector("#memoryList"),
   memoryCount: document.querySelector("#memoryCount"),
   memoryDescription: document.querySelector("#memoryDescription"),
+  openOfficeDrafts: document.querySelector("#openOfficeDrafts"),
+  closeOfficeDrafts: document.querySelector("#closeOfficeDrafts"),
+  officeDraftDialog: document.querySelector("#officeDraftDialog"),
+  officeDraftList: document.querySelector("#officeDraftList"),
+  officeDraftCount: document.querySelector("#officeDraftCount"),
   toast: document.querySelector("#toast"),
 };
 
@@ -84,18 +90,20 @@ async function initialize() {
   bindEvents();
   resizeInput();
   try {
-    const [info, result, knowledgeResult, memoryResult] = await Promise.all([
+    const [info, result, knowledgeResult, memoryResult, officeDraftResult] = await Promise.all([
       api("/api/info"), api("/api/conversations"), api("/api/knowledge/documents"),
       api("/api/memories?include_expired=true"),
+      api("/api/office/drafts?status=draft"),
     ]);
     elements.runtimeModel.textContent = info.model;
     state.multiAgent = Boolean(info.multi_agent);
     state.humanApproval = Boolean(info.human_approval);
     elements.runtimeProvider.textContent = `${info.provider} · ${info.version}${state.multiAgent ? " · 多 Agent" : ""}`;
-	elements.toolBadge.innerHTML = `<i></i> ${Number(info.tool_count || 4)} 个只读工具${info.mcp_enabled ? " · MCP" : ""}`;
+	elements.toolBadge.innerHTML = `<i></i> ${Number(info.tool_count || 6)} 个受控工具${info.mcp_enabled ? " · MCP" : ""}`;
     state.conversations = result.conversations || [];
     state.documents = knowledgeResult.documents || [];
     state.memories = memoryResult.memories || [];
+	state.officeDrafts = officeDraftResult.drafts || [];
 	state.memoryAutoCapture = Boolean(info.memory_auto_capture);
 	state.memoryRecall = Boolean(info.memory_recall);
 	elements.memoryDescription.textContent = memoryStatusText();
@@ -103,6 +111,7 @@ async function initialize() {
     renderConversations();
     renderKnowledgeDocuments();
     renderMemories();
+	renderOfficeDrafts();
     if (state.conversations.length) {
       await selectConversation(state.conversations[0].id);
     }
@@ -127,6 +136,8 @@ function bindEvents() {
   elements.closeMemory.addEventListener("click", () => elements.memoryDialog.close());
   elements.memoryForm.addEventListener("submit", saveMemory);
   elements.cancelMemoryEdit.addEventListener("click", resetMemoryForm);
+  elements.openOfficeDrafts.addEventListener("click", openOfficeDrafts);
+  elements.closeOfficeDrafts.addEventListener("click", () => elements.officeDraftDialog.close());
   elements.renameConversation.addEventListener("click", renameActiveConversation);
   elements.composer.addEventListener("submit", event => {
     event.preventDefault();
@@ -172,6 +183,79 @@ async function openMemory() {
     await refreshMemories();
     elements.memoryDialog.showModal();
     closeSidebar();
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function openOfficeDrafts() {
+  try {
+    await refreshOfficeDrafts();
+    elements.officeDraftDialog.showModal();
+    closeSidebar();
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function refreshOfficeDrafts() {
+  const result = await api("/api/office/drafts?status=draft");
+  state.officeDrafts = result.drafts || [];
+  renderOfficeDrafts();
+}
+
+function renderOfficeDrafts() {
+  elements.officeDraftCount.textContent = `${state.officeDrafts.length} 份草稿`;
+  elements.officeDraftList.replaceChildren();
+  if (!state.officeDrafts.length) {
+    const empty = document.createElement("div");
+    empty.className = "document-empty";
+    empty.textContent = "还没有办公草稿。可以在对话中让 Zora 起草邮件或拟定日程。";
+    elements.officeDraftList.append(empty);
+    return;
+  }
+  for (const item of state.officeDrafts) elements.officeDraftList.append(officeDraftNode(item));
+}
+
+function officeDraftNode(item) {
+  const card = document.createElement("article");
+  card.className = "office-draft-item";
+  const heading = document.createElement("div");
+  heading.className = "office-draft-heading";
+  const kind = document.createElement("strong");
+  kind.textContent = item.kind === "email" ? "邮件" : "日程";
+  const status = document.createElement("span");
+  status.textContent = item.status === "draft" ? "仅预览" : item.status;
+  heading.append(kind, status);
+  const title = document.createElement("h3");
+  title.textContent = item.title;
+  const detail = document.createElement("pre");
+  const payload = item.payload || {};
+  if (item.kind === "email") {
+    detail.textContent = `收件人：${(payload.to || []).join("、") || "未填写"}\n抄送：${(payload.cc || []).join("、") || "无"}\n\n${payload.body || ""}`;
+  } else {
+    detail.textContent = `时间：${payload.start || "未填写"} — ${payload.end || "未填写"}\n地点：${payload.location || "未填写"}\n参与人：${(payload.attendees || []).join("、") || "无"}\n\n${payload.body || ""}`;
+  }
+  const meta = document.createElement("small");
+  meta.textContent = `创建于 ${formatDateTime(item.created_at)} · 草稿 ID ${item.id}`;
+  const actions = document.createElement("div");
+  actions.className = "office-draft-actions";
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "删除草稿";
+  remove.addEventListener("click", () => deleteOfficeDraft(item));
+  actions.append(remove);
+  card.append(heading, title, detail, meta, actions);
+  return card;
+}
+
+async function deleteOfficeDraft(item) {
+  if (!confirm(`删除草稿「${item.title}」？此操作不可恢复。`)) return;
+  try {
+    await api(`/api/office/drafts/${item.id}`, { method: "DELETE" });
+    state.officeDrafts = state.officeDrafts.filter(draft => draft.id !== item.id);
+    renderOfficeDrafts();
+    notify("办公草稿已删除");
   } catch (error) {
     notify(error.message);
   }
@@ -549,6 +633,9 @@ function handleAgentEvent(type, event) {
         trace.result = prettyJSON(event.content);
         trace.done = true;
       }
+	  if (event.tool_name === "preview_email_draft" || event.tool_name === "preview_calendar_draft") {
+		refreshOfficeDrafts().catch(() => {});
+	  }
       break;
     }
 	case "agent_handoff_completed": {

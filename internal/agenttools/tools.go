@@ -97,8 +97,9 @@ func Build() ([]tool.BaseTool, error) {
 					"单 Agent / 多 Agent 质量、调用成本代理和耗时对照门禁",
 					"官方 MCP Go SDK 客户端、只读文件连接器与最小环境隔离",
 					"Microsoft Graph 邮件/日历只读连接器与外部内容安全标记",
+					"邮件/日程结构化草稿预览、持久化与 Run 来源追踪",
 				},
-				NextMilestone: "V0.5 邮件/日历草稿预览、写前确认与凭据审计",
+				NextMilestone: "V0.5 办公写操作人工确认、幂等执行与凭据审计",
 			}, nil
 		},
 	)
