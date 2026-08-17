@@ -28,11 +28,11 @@
 - [x] 结构化引用坐标与 Agent Tool 证据查看
 - [ ] 文档级权限过滤
 - [x] 固定检索评测集：Recall@K、MRR、命中率和单路/混合对比
-- [ ] 答案引用覆盖率与忠实度评估
+- [x] 确定性答案事实覆盖、有效引用覆盖与引用忠实度评估
 
 验收条件：每个知识库答案能够定位到原文；能用固定数据证明混合召回优于单一路径。
 
-当前验证结果：上传 → 分块 → Embedding → 向量/关键词 → RRF → `knowledge_search` → 对话 SSE 的纵向链路已打通。SQLite 采用进程内精确扫描；PostgreSQL 实现完整 Store、pgvector HNSW、`tsvector`/GIN、维度校验、迁移锁和数据库候选下推。自动化测试已覆盖 Store 契约、候选融合和评测指标；真实 PostgreSQL 生命周期测试可通过 `make test-postgres` 执行，但本次开发环境没有 Docker，容器验收尚未实际运行。`zora-rag-smoke-v1` 在默认 Hash Embedding 下得到 Recall@3=1、MRR=1，但三种模式打平；仍需真实语义样本、ACL 和答案忠实度，因此 V0.2 未标记完成。
+当前验证结果：上传 → 分块 → Embedding → 向量/关键词 → RRF → `knowledge_search` → 对话 SSE 的纵向链路已打通。SQLite 采用进程内精确扫描；PostgreSQL 实现完整 Store、pgvector HNSW、`tsvector`/GIN、维度校验、迁移锁和数据库候选下推。自动化测试已覆盖 Store 契约、候选融合和评测指标；真实 PostgreSQL 生命周期测试可通过 `make test-postgres` 执行，但本次开发环境没有 Docker，容器验收尚未实际运行。`zora-rag-smoke-v1` 在默认 Hash Embedding 下得到 Recall@3=1、MRR=1，事实覆盖率/有效引用覆盖率/引用忠实度均为 1；但三种检索模式仍然打平，确定性锚点评测也不能替代真实模型语义评审，因此仍需真实语义样本和 ACL，V0.2 暂不标记完成。
 
 ## V0.3 Long-term Memory
 

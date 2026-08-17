@@ -12,7 +12,7 @@ Zora 将系统划分为七个边界：
 4. `agenttools`：工具 Schema、输入校验和执行代码。
 5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
 6. `store`：对话与知识库的持久化边界，由 SQLite 或 PostgreSQL 实现。
-7. `rageval`：固定数据集校验、检索指标计算和单路/混合效果对比。
+7. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -92,17 +92,18 @@ internal/store/postgres/
 └── schema.go        PostgreSQL DDL 与索引
 
 internal/rageval/
-└── evaluator.go     Recall@K、MRR、命中率和模式对比
+├── evaluator.go     Recall@K、MRR、命中率和模式对比
+└── answer.go        事实覆盖、有效引用覆盖和引用忠实度
 
 evals/
-└── knowledge.json   固定语料、问题、相关文档与阈值
+└── knowledge.json   固定语料、问题、事实/证据锚点与阈值
 
 SQLite 候选召回在 Go 内最多精确扫描 10,000 个 Chunk。PostgreSQL 使用 `CandidateStore` 将 pgvector HNSW 和 `tsvector`/GIN 两路 Top 50 候选下推数据库，再由 `knowledge.Service` 统一执行 RRF。两个后端保持相同的 Service 和 Tool 契约。
 ```
 
 检索作为 Eino Tool 或 Graph 暴露给 Agent，但召回、权限过滤和评估属于业务层。
 
-线上 `knowledge_search` 固定使用 hybrid；离线评测通过 `SearchWithMode` 分别执行 vector、keyword 和 hybrid。`cmd/zora-eval` 每次在临时 SQLite 中重建固定语料，因此不会被在线历史数据污染。PostgreSQL 集成测试通过 `ZORA_TEST_POSTGRES_DSN` 显式启用。
+线上 `knowledge_search` 固定使用 hybrid；离线评测通过 `SearchWithMode` 分别执行 vector、keyword 和 hybrid，再通过真实 Eino Runtime 生成答案并核对事实、有效引用及原文支持。`cmd/zora-eval` 每次在临时 SQLite 中重建固定语料，因此不会被在线历史数据污染。PostgreSQL 集成测试通过 `ZORA_TEST_POSTGRES_DSN` 显式启用。
 
 ## 7. 长期记忆接入点
 

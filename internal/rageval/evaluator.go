@@ -16,13 +16,16 @@ import (
 
 // Dataset 同时保存固定语料和问题，避免评测依赖开发者本机已有数据。
 type Dataset struct {
-	Name             string            `json:"name"`
-	Description      string            `json:"description,omitempty"`
-	TopK             int               `json:"top_k"`
-	MinimumRecallAtK float64           `json:"minimum_recall_at_k"`
-	MinimumMRR       float64           `json:"minimum_mrr"`
-	Documents        []FixtureDocument `json:"documents"`
-	Cases            []Case            `json:"cases"`
+	Name                        string            `json:"name"`
+	Description                 string            `json:"description,omitempty"`
+	TopK                        int               `json:"top_k"`
+	MinimumRecallAtK            float64           `json:"minimum_recall_at_k"`
+	MinimumMRR                  float64           `json:"minimum_mrr"`
+	MinimumFactCoverage         float64           `json:"minimum_fact_coverage,omitempty"`
+	MinimumCitationCoverage     float64           `json:"minimum_citation_coverage,omitempty"`
+	MinimumCitationFaithfulness float64           `json:"minimum_citation_faithfulness,omitempty"`
+	Documents                   []FixtureDocument `json:"documents"`
+	Cases                       []Case            `json:"cases"`
 }
 
 type FixtureDocument struct {
@@ -32,9 +35,18 @@ type FixtureDocument struct {
 }
 
 type Case struct {
-	ID                string   `json:"id"`
-	Question          string   `json:"question"`
-	RelevantDocuments []string `json:"relevant_documents"`
+	ID                string         `json:"id"`
+	Question          string         `json:"question"`
+	RelevantDocuments []string       `json:"relevant_documents"`
+	ExpectedFacts     []ExpectedFact `json:"expected_facts,omitempty"`
+}
+
+// ExpectedFact 用少量稳定锚点描述答案事实和原文依据。
+// 这是无需外部 Judge 的确定性基线，并不替代后续基于模型的语义忠实度评估。
+type ExpectedFact struct {
+	ID               string   `json:"id"`
+	AnswerContains   []string `json:"answer_contains"`
+	EvidenceContains []string `json:"evidence_contains"`
 }
 
 // Searcher 只依赖评测所需的最小检索能力，便于用真实 Service 或测试桩运行。
@@ -50,12 +62,16 @@ type Report struct {
 	Thresholds     Thresholds     `json:"thresholds"`
 	Modes          []ModeReport   `json:"modes"`
 	Comparison     ModeComparison `json:"comparison"`
+	Answer         *AnswerReport  `json:"answer,omitempty"`
 	Passed         bool           `json:"passed"`
 }
 
 type Thresholds struct {
-	MinimumRecallAtK float64 `json:"minimum_recall_at_k"`
-	MinimumMRR       float64 `json:"minimum_mrr"`
+	MinimumRecallAtK            float64 `json:"minimum_recall_at_k"`
+	MinimumMRR                  float64 `json:"minimum_mrr"`
+	MinimumFactCoverage         float64 `json:"minimum_fact_coverage,omitempty"`
+	MinimumCitationCoverage     float64 `json:"minimum_citation_coverage,omitempty"`
+	MinimumCitationFaithfulness float64 `json:"minimum_citation_faithfulness,omitempty"`
 }
 
 type ModeReport struct {
@@ -108,7 +124,9 @@ func (d Dataset) Validate() error {
 	if d.TopK < 1 || d.TopK > 20 {
 		return fmt.Errorf("评测集 top_k 必须在 1 到 20 之间")
 	}
-	if !validMetric(d.MinimumRecallAtK) || !validMetric(d.MinimumMRR) {
+	if !validMetric(d.MinimumRecallAtK) || !validMetric(d.MinimumMRR) ||
+		!validMetric(d.MinimumFactCoverage) || !validMetric(d.MinimumCitationCoverage) ||
+		!validMetric(d.MinimumCitationFaithfulness) {
 		return fmt.Errorf("评测阈值必须在 0 到 1 之间")
 	}
 	if len(d.Documents) == 0 || len(d.Cases) == 0 {
@@ -151,6 +169,29 @@ func (d Dataset) Validate() error {
 			}
 			seenRelevant[name] = struct{}{}
 		}
+		factIDs := make(map[string]struct{}, len(item.ExpectedFacts))
+		for factIndex, fact := range item.ExpectedFacts {
+			factID := strings.TrimSpace(fact.ID)
+			if factID == "" || len(fact.AnswerContains) == 0 || len(fact.EvidenceContains) == 0 {
+				return fmt.Errorf("评测问题 %s 的第 %d 个答案事实配置不完整", id, factIndex+1)
+			}
+			if _, exists := factIDs[factID]; exists {
+				return fmt.Errorf("评测问题 %s 的答案事实 ID 重复：%s", id, factID)
+			}
+			factIDs[factID] = struct{}{}
+			for _, anchor := range append(append([]string(nil), fact.AnswerContains...), fact.EvidenceContains...) {
+				if strings.TrimSpace(anchor) == "" {
+					return fmt.Errorf("评测问题 %s 的答案事实 %s 包含空锚点", id, factID)
+				}
+			}
+		}
+	}
+	if d.MinimumFactCoverage > 0 || d.MinimumCitationCoverage > 0 || d.MinimumCitationFaithfulness > 0 {
+		for _, item := range d.Cases {
+			if len(item.ExpectedFacts) == 0 {
+				return fmt.Errorf("启用答案评测阈值后，问题 %s 必须配置 expected_facts", item.ID)
+			}
+		}
 	}
 	return nil
 }
@@ -166,8 +207,13 @@ func Evaluate(ctx context.Context, searcher Searcher, dataset Dataset) (Report, 
 
 	report := Report{
 		Dataset: dataset.Name, TopK: dataset.TopK, CaseCount: len(dataset.Cases),
-		Thresholds: Thresholds{MinimumRecallAtK: dataset.MinimumRecallAtK, MinimumMRR: dataset.MinimumMRR},
-		Modes:      make([]ModeReport, 0, 3),
+		Thresholds: Thresholds{
+			MinimumRecallAtK: dataset.MinimumRecallAtK, MinimumMRR: dataset.MinimumMRR,
+			MinimumFactCoverage:         dataset.MinimumFactCoverage,
+			MinimumCitationCoverage:     dataset.MinimumCitationCoverage,
+			MinimumCitationFaithfulness: dataset.MinimumCitationFaithfulness,
+		},
+		Modes: make([]ModeReport, 0, 3),
 	}
 	for _, mode := range []knowledge.RetrievalMode{
 		knowledge.RetrievalVector,

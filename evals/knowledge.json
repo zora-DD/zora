@@ -4,6 +4,9 @@
   "top_k": 3,
   "minimum_recall_at_k": 1.0,
   "minimum_mrr": 0.8,
+  "minimum_fact_coverage": 1.0,
+  "minimum_citation_coverage": 1.0,
+  "minimum_citation_faithfulness": 1.0,
   "documents": [
     {
       "name": "蓝鲸项目发布计划.md",
@@ -30,22 +33,55 @@
     {
       "id": "release-date-and-gate",
       "question": "蓝鲸项目什么时候发布，上线前要完成哪些事项？",
-      "relevant_documents": ["蓝鲸项目发布计划.md"]
+      "relevant_documents": ["蓝鲸项目发布计划.md"],
+      "expected_facts": [
+        {
+          "id": "release-date",
+          "answer_contains": ["2026", "9月18日"],
+          "evidence_contains": ["2026", "9月18日"]
+        },
+        {
+          "id": "release-gates",
+          "answer_contains": ["灰度验证", "回滚演练", "负责人签字确认"],
+          "evidence_contains": ["灰度验证", "回滚演练", "负责人签字确认"]
+        }
+      ]
     },
     {
       "id": "travel-hotel-limit",
       "question": "去上海出差的住宿报销上限是多少？",
-      "relevant_documents": ["差旅报销制度.md"]
+      "relevant_documents": ["差旅报销制度.md"],
+      "expected_facts": [
+        {
+          "id": "hotel-limit",
+          "answer_contains": ["每晚", "600元"],
+          "evidence_contains": ["每晚", "600元"]
+        }
+      ]
     },
     {
       "id": "p1-response-time",
       "question": "P1 生产告警需要在几分钟内响应？",
-      "relevant_documents": ["值班响应手册.md"]
+      "relevant_documents": ["值班响应手册.md"],
+      "expected_facts": [
+        {
+          "id": "p1-response",
+          "answer_contains": ["P1", "5分钟内响应"],
+          "evidence_contains": ["P1", "5分钟内响应"]
+        }
+      ]
     },
     {
       "id": "local-web-port",
       "question": "Zora Web 服务默认监听哪个端口？",
-      "relevant_documents": ["研发环境规范.md"]
+      "relevant_documents": ["研发环境规范.md"],
+      "expected_facts": [
+        {
+          "id": "web-port",
+          "answer_contains": ["8088端口"],
+          "evidence_contains": ["8088端口"]
+        }
+      ]
     }
   ]
 }

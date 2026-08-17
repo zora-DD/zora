@@ -19,9 +19,9 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
 | Web UI | 已完成 | 内嵌响应式页面，不需要 Node.js 部署 |
 | 知识库 MVP | 已完成 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
-| RAG 检索评测 | 已完成 | 固定语料与问题集，对比向量/关键词/混合召回，输出 Recall@K、MRR、命中率和延迟 |
+| RAG 检索与答案评测 | 已完成 | 对比三路召回，并通过真实 Agent 链路评估事实覆盖、有效引用覆盖和引用忠实度 |
 | PostgreSQL 向量库 | 已实现 | pgx 连接池、幂等迁移、pgvector HNSW、PostgreSQL FTS、RRF 候选融合 |
-| 生产知识库剩余项 | V0.2 进行中 | 文档权限、版本、PDF、答案忠实度和真实数据验收 |
+| 生产知识库剩余项 | V0.2 进行中 | 文档权限、版本、PDF、更强语义评测和真实数据验收 |
 | 长期记忆 | V0.3 | Semantic/Episodic Memory、合并、过期和用户控制 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
@@ -81,7 +81,9 @@ make run
 make eval-rag
 ```
 
-命令会在临时 SQLite 数据库中摄取 `evals/knowledge.json`，不会修改在线知识库；报告包含三种检索模式的 Recall@K、MRR、命中率、平均延迟和逐题排名。默认 Hash Embedding 基线的 4 个问题均达到 Recall@3=1、MRR=1。当前小样本下三种模式打平，因此尚不能据此声称混合召回优于单路。
+命令会在临时 SQLite 数据库中摄取 `evals/knowledge.json`，不会修改在线知识库。报告先给出三种检索模式的 Recall@K、MRR、命中率、平均延迟和逐题排名，再通过与线上相同的 Eino Runtime 和 `knowledge_search` 生成答案，计算事实覆盖率、有效引用覆盖率和引用忠实度；任一门禁未达标都会返回非零退出码。
+
+默认 Hash Embedding + Mock 基线的 4 个问题达到 Recall@3=1、MRR=1，答案三项指标均为 1。答案评测采用数据集中显式标注的事实/证据锚点，是零密钥、可重复的工程基线；它不能替代真实模型语义评测或人工抽检。当前检索小样本下三种模式仍然打平，因此尚不能据此声称混合召回优于单路。
 
 数据默认保存到：
 
@@ -254,15 +256,15 @@ SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`�
 
 ```text
 cmd/zora/                  服务入口、依赖组装和优雅关闭
-cmd/zora-eval/             隔离运行固定 RAG 检索评测集
-evals/                     可版本化的固定评测语料与问题
+cmd/zora-eval/             隔离运行固定 RAG 检索与答案评测
+evals/                     可版本化的语料、问题、事实/证据锚点与阈值
 internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
 internal/id/               随机业务 ID
 internal/agentruntime/     Eino Runtime、模型适配和事件转换
 internal/agenttools/       只读工具和安全计算器
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
-internal/rageval/          Recall@K、MRR、命中率和模式对比
+internal/rageval/          检索指标、答案引用/忠实度指标和门禁
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
 internal/store/sqlite/     对话与知识库的 SQLite 实现
@@ -280,7 +282,7 @@ make test
 # 静态分析
 make vet
 
-# 固定 RAG 检索评测
+# 固定 RAG 检索与答案评测
 make eval-rag
 
 # 启动 pgvector 并执行真实数据库集成测试

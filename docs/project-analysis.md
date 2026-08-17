@@ -1,7 +1,7 @@
 # Zora 项目分析文档
 
 > 文档基线：V0.2 Knowledge Base（SQLite + PostgreSQL/pgvector）
-> 最后更新：2026-08-14  
+> 最后更新：2026-08-15
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
 ## 1. 项目概述
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通 TXT/Markdown 上传、去重、分块、Embedding、混合召回、Agent 引用、固定检索评测，以及 SQLite/PostgreSQL 双存储闭环。PostgreSQL 模式包含完整业务持久化、pgvector HNSW 和 FTS/GIN；权限过滤、答案忠实度和更大规模语义评测集仍是后续子阶段。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通 TXT/Markdown 上传、去重、分块、Embedding、混合召回、Agent 引用、固定检索/答案评测，以及 SQLite/PostgreSQL 双存储闭环。PostgreSQL 模式包含完整业务持久化、pgvector HNSW 和 FTS/GIN；权限过滤和更大规模真实语义评测集仍是后续子阶段。
 
 ## 2. 背景与问题
 
@@ -87,9 +87,9 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 执行审计 | 已实现 | AgentRun 与 append-only RunEvent |
 | 本地持久化 | 已实现 | SQLite、WAL、事务与级联删除 |
 | 知识库本地 MVP | 已实现 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
-| RAG 检索评测 | 已实现 | 固定语料与问题、三种检索模式、Recall@K、MRR、命中率、延迟和阈值门禁 |
+| RAG 检索与答案评测 | 已实现 | 三种召回指标，以及 Agent 答案的事实覆盖、有效引用覆盖、引用忠实度和联合门禁 |
 | PostgreSQL 知识库 | 已实现 | pgxpool、完整 Store、pgvector HNSW、FTS/GIN、RRF 候选融合 |
-| 生产知识库剩余项 | V0.2 进行中 | 权限、文档版本/PDF、答案忠实度和生产验收 |
+| 生产知识库剩余项 | V0.2 进行中 | 权限、文档版本/PDF、更强语义评测和生产验收 |
 | 长期记忆 | 规划 V0.3 | Semantic/Episodic Memory 与 Consolidation |
 | 多 Agent | 规划 V0.4 | Supervisor、专业 Agent、预算和效果对比 |
 | 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
@@ -313,7 +313,7 @@ flowchart LR
 | Agent 适配层 | `internal/agentruntime` | Eino 组装、模型选择、事件归一化 |
 | 能力层 | `internal/agenttools` | 工具 Schema、校验和安全执行 |
 | 知识库应用层 | `internal/knowledge` | 分块、Embedding 适配、混合召回、引用与 Agent Tool |
-| RAG 评测层 | `internal/rageval` | 固定集校验、Recall@K/MRR、模式对比和阈值判断 |
+| RAG 评测层 | `internal/rageval` | 固定集校验、检索指标、答案引用/忠实度和联合门禁 |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
@@ -359,7 +359,7 @@ HTTP 和 Store 不依赖 Eino 事件类型。`agentruntime.Event` 作为防腐�
 
 ### 9.6 面向评估演进
 
-RAG 已把语料、问题、相关文档和阈值作为版本化资产，并对 vector、keyword、hybrid 分别计算 Recall@K、MRR、命中率和延迟。后续 Memory 和 Multi-Agent 同样设置对照指标；多 Agent 只有在质量收益能够覆盖成本和延迟时才保留，避免“功能数量等于技术深度”的误区。
+RAG 已把语料、问题、相关文档、预期事实/证据锚点和阈值作为版本化资产：对 vector、keyword、hybrid 分别计算 Recall@K、MRR、命中率和延迟，并让真实 Agent Runtime 生成答案，检查事实覆盖、引用能否解析到本次工具证据、所引原文是否包含支持锚点。后续 Memory 和 Multi-Agent 同样设置对照指标；多 Agent 只有在质量收益能够覆盖成本和延迟时才保留，避免“功能数量等于技术深度”的误区。
 
 ### 9.7 可交换的 RAG 边界
 
@@ -378,6 +378,7 @@ RAG 已把语料、问题、相关文档和阈值作为版本化资产，并对 
 | PostgreSQL 容器验收未在当前环境执行 | 代码、单测和可选集成测试已完成，但缺少本机 Docker 实测记录 | 在有 Docker 的环境运行 `make postgres-up && make test-postgres` |
 | Hash Embedding 无深度语义 | 适合关键词相关性和链路测试，不适合生产问答 | 生产切换 text-embedding-v4 等语义模型 |
 | 固定评测集仅 4 题 | 能做冒烟回归，无法证明复杂语义场景或融合收益 | 增加语义改写、难负例、多相关文档和真实业务问题 |
+| 答案评测使用确定性锚点 | 零密钥且稳定，但无法识别未标注幻觉或复杂同义改写 | 增加真实模型人工集与经校准的 LLM Judge，对确定性门禁形成补充 |
 | 同步文档索引 | 大文件会占用 HTTP 请求 | 异步 Ingestion Job、重试和状态机 |
 | 进程内会话锁 | 多实例之间不能互斥 | advisory lock 或带租约分布式锁 |
 | 最近 40 条上下文 | 长对话会丢失早期信息 | 摘要 + 长期记忆召回 |
@@ -414,6 +415,7 @@ RAG 已把语料、问题、相关文档和阈值作为版本化资产，并对 
 - 知识库工具结果必须包含文档名、分块序号和原文；
 - 默认无密钥可运行，同时有真实 Embedding 适配器的契约测试。
 - 固定评测命令在隔离数据库中复现语料，并输出 vector、keyword、hybrid 的 Recall@K、MRR、命中率和延迟；
+- 同一命令经过 Eino Runtime 与 `knowledge_search` 生成答案，输出事实覆盖率、有效引用覆盖率和引用忠实度；
 - 默认 `zora-rag-smoke-v1` 的实际基线为 Recall@3=1、MRR=1，三种模式打平，尚不能证明融合收益。
 - PostgreSQL 与 SQLite 实现相同 Store 契约，数据库侧只下推 Top 50 单路候选，RRF 仍由应用层统一计算；
 - PostgreSQL 启动校验 `vector(N)` 维度，多实例 DDL 使用 advisory transaction lock。

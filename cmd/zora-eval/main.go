@@ -15,6 +15,10 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/cloudwego/eino/schema"
+
+	"github.com/zhiruo/zora/internal/agentruntime"
+	"github.com/zhiruo/zora/internal/agenttools"
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/rageval"
@@ -103,6 +107,27 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
+
+	// 答案评测走和线上相同的 Eino Runtime 与 knowledge_search 工具，
+	// 因而能够同时发现“没有调用知识库”和“回答引用了不存在证据”等问题。
+	registeredTools, err := agenttools.Build()
+	if err != nil {
+		return err
+	}
+	knowledgeTool, err := knowledge.NewSearchTool(service)
+	if err != nil {
+		return err
+	}
+	registeredTools = append(registeredTools, knowledgeTool)
+	agentRuntime, err := agentruntime.New(ctx, cfg, registeredTools)
+	if err != nil {
+		return err
+	}
+	answerReport, err := rageval.EvaluateAnswers(ctx, agentAnswerer{runtime: agentRuntime}, dataset)
+	if err != nil {
+		return err
+	}
+	report = rageval.AttachAnswerReport(report, answerReport)
 	report.EmbeddingModel = service.EmbeddingModel()
 	encoder := json.NewEncoder(output)
 	encoder.SetIndent("", "  ")
@@ -113,4 +138,31 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return errThresholdNotMet
 	}
 	return nil
+}
+
+type agentAnswerer struct {
+	runtime *agentruntime.Runtime
+}
+
+func (a agentAnswerer) Answer(ctx context.Context, question string) (rageval.GeneratedAnswer, error) {
+	prompt := "请根据知识库文档回答下列问题，并在每个事实所在行使用 [文档名#分块序号] 格式标注引用：\n" + question
+	generated := rageval.GeneratedAnswer{}
+	answer, err := a.runtime.Execute(ctx, []*schema.Message{schema.UserMessage(prompt)}, func(event agentruntime.Event) error {
+		if event.Type != "tool_result" || event.ToolName != "knowledge_search" {
+			return nil
+		}
+		var output struct {
+			Results []knowledge.SearchResult `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(event.Content), &output); err != nil {
+			return fmt.Errorf("解析知识库工具证据失败：%w", err)
+		}
+		generated.Evidence = append(generated.Evidence, output.Results...)
+		return nil
+	})
+	if err != nil {
+		return rageval.GeneratedAnswer{}, err
+	}
+	generated.Content = answer
+	return generated, nil
 }
