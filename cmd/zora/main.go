@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cloudwego/eino/components/tool"
+
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/agenttools"
 	"github.com/zhiruo/zora/internal/chat"
@@ -73,7 +75,6 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	registeredTools = append(registeredTools, knowledgeTool)
 	chatModel, err := agentruntime.NewChatModel(context.Background(), cfg)
 	if err != nil {
 		return err
@@ -96,7 +97,16 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	runtime, err := agentruntime.NewWithModel(context.Background(), cfg, registeredTools, chatModel)
+	var runtime *agentruntime.Runtime
+	if cfg.MultiAgentEnabled {
+		// Supervisor 只看得到三个专业 Agent；底层工具按职责注入，避免越权调用。
+		runtime, err = agentruntime.NewMultiAgentWithModel(context.Background(), cfg, agentruntime.SpecialistToolset{
+			Research: registeredTools,
+			Document: []tool.BaseTool{knowledgeTool},
+		}, chatModel)
+	} else {
+		runtime, err = agentruntime.NewWithModel(context.Background(), cfg, append(registeredTools, knowledgeTool), chatModel)
+	}
 	if err != nil {
 		return err
 	}
@@ -144,7 +154,7 @@ func run(logger *slog.Logger) error {
 			"provider", cfg.Provider, "model", cfg.Model,
 			"embedding_provider", cfg.EmbeddingProvider, "embedding_model", embedder.Name(),
 			"memory_auto_capture", cfg.MemoryAutoCapture, "memory_recall", cfg.MemoryRecallEnabled,
-			"conversation_summary", cfg.SummaryEnabled)
+			"conversation_summary", cfg.SummaryEnabled, "multi_agent", cfg.MultiAgentEnabled)
 		serveErrors <- server.ListenAndServe()
 	}()
 

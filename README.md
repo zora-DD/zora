@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.3 Long-term Memory（主链路已完成）**。V0.1 Agent Core 已完成，V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.3 已交付可追溯、可由用户控制、可通过 A/B 数据验证收益的长期记忆。
+当前版本：**V0.4 Multi-Agent（第一阶段）**。V0.1 Agent Core 已完成，V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.3 已交付可追溯、可由用户控制、可通过 A/B 数据验证收益的长期记忆；V0.4 已打通可配置 Supervisor、专业 Agent、工具隔离、协作审计和路由评测。
 
 ## 当前能力
 
@@ -27,7 +27,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 记忆召回与注入 | 已完成 | 词项相关性 + 重要性 + 时效性联合评分、Top-K 安全上下文和 Run 审计 |
 | 会话摘要与上下文压缩 | 已完成 | 阈值触发、增量摘要、最近消息窗口、安全上下文注入、双数据库持久化和审计 |
 | 记忆 A/B 评估 | 已完成 | 隔离数据库、完整 Chat 链路 Control/Treatment、召回率、错误注入、事实覆盖、延迟和质量门禁 |
-| 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
+| 多 Agent 路由与协作 | V0.4 第一阶段已完成 | 可选 Supervisor、Research/Document/Writer Agent、上下文隔离、串行交接、Web Trace 和固定路由门禁 |
+| 多 Agent 生产治理 | V0.4 进行中 | 子任务预算/超时/重试、父子 Run、审批节点及单/多 Agent 收益对比 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
@@ -46,6 +47,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **召回可解释、可关闭**：轻量词项相关性与重要性、时效性联合评分，并用最低主题相关性阻止弱词面重合被重要性抬高；RunEvent 只记录 ID 和分数组件。
 - **记忆收益可回归**：固定数据集让同一问题分别通过关闭/开启召回的完整 Chat 链路，门禁预期召回、错误注入、事实覆盖增益和答案污染，而不是只评估检索函数。
 - **长对话不会只靠截断**：较早消息增量压缩进 `conversation_summaries`，最近窗口保留原文；摘要读取或生成失败时自动退化为最近消息，不推翻正常回答。
+- **多 Agent 不是角色 Prompt 展示**：Supervisor 通过 Eino AgentTool 调用研究、文档和写作专家；专家只收到结构化 request，底层工具按职责隔离，协作开始/输出/完成均进入 RunEvent。
+- **专家路由可回归**：固定 6 题覆盖单专家、文档到写作的串行协作、直接回答和“文档”相似词硬负例，门禁路由准确率、意外专家调用和答案完成率。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -88,6 +91,30 @@ make eval-memory
 ```
 
 命令在临时 SQLite 中写入 `evals/memory.json` 的固定记忆，同一问题交替运行关闭召回的 Control 和开启召回的 Treatment，并从真实 RunEvent 读取实际注入的 Memory ID。默认 5 题包含个人资料、交互偏好、项目经历，以及“Go 并发模型”这种相似主题硬负例；门禁未达标时命令返回非零状态。
+
+### 启用多 Agent
+
+多 Agent 会增加模型调用次数，因此默认关闭。通过环境变量显式启用：
+
+```bash
+ZORA_MULTI_AGENT_ENABLED=true make run
+```
+
+启用后，Supervisor 会把任务交给研究、文档或写作专家。复合办公任务可以先由文档专家检索证据，再交给写作专家整理：
+
+```text
+帮我计算 (128 + 72) * 3.5
+帮我写一封会议延期通知
+根据我上传的文档，写一份项目发布通知
+```
+
+Web 对话中会显示“协作：研究专家/文档专家/写作专家”轨迹。运行固定路由基准：
+
+```bash
+make eval-agents
+```
+
+评测命令使用隔离 SQLite 和真实 `chat.Send → Eino AgentTool → RunEvent` 链路。默认 6 题基线的路由准确率为 1、意外专家调用率为 0、答案完成率为 1；真实模型仍应使用业务样本重新验证。
 
 可以尝试：
 
@@ -187,6 +214,7 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_SYSTEM_PROMPT` | 内置中文指令 | Agent 系统指令 |
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 单次 Agent 请求超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | ReAct 最大迭代，范围 1–50 |
+| `ZORA_MULTI_AGENT_ENABLED` | `false` | 是否启用 Supervisor 与三个专业 Agent；默认关闭以控制成本 |
 | `ZORA_EMBEDDING_PROVIDER` | `hash` | `hash` 或 `openai` |
 | `ZORA_EMBEDDING_MODEL` | `text-embedding-v4` | 真实 Embedding 模型名 |
 | `ZORA_EMBEDDING_API_KEY` | 复用 `ZORA_API_KEY` | Embedding 独立密钥 |
@@ -247,7 +275,9 @@ sequenceDiagram
     participant API as "Go HTTP/SSE"
     participant Service as Chat Service
     participant DB as SQLite
-    participant ADK as Eino Agent
+    participant ADK as Eino Runtime
+    participant Supervisor as Supervisor
+    participant Specialist as Specialist Agent
     participant LLM as Model
     participant Tool as ToolNode
 
@@ -258,7 +288,16 @@ sequenceDiagram
     Service->>DB: 查询有效长期记忆
     Service->>Service: 相关性 + 重要性 + 时效性联合排序
     Service->>ADK: 会话摘要 + 安全记忆上下文 + 最近原始消息
-    ADK->>LLM: 消息 + Tool Schema
+    ADK->>Supervisor: 执行根 Agent
+    Supervisor->>LLM: 消息 + Tool/Agent Schema
+    alt 已启用多 Agent 且需要专业能力
+        LLM-->>Supervisor: AgentTool Call
+        Supervisor->>Specialist: AgentTool(request)
+        Specialist->>Tool: 仅调用职责内工具
+        Tool-->>Specialist: ToolResult
+        Specialist-->>Supervisor: 专家交付物
+        ADK-->>UI: agent_handoff_started / agent_output / agent_handoff_completed
+    end
     alt 需要工具
         LLM-->>ADK: ToolCall
         ADK->>Tool: 执行参数
@@ -302,7 +341,7 @@ sequenceDiagram
 | `PUT` | `/api/memories/{id}` | 完整更新内容、类型、重要性和过期时间 |
 | `DELETE` | `/api/memories/{id}` | 用户删除长期记忆 |
 
-SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
+SSE 事件：`start`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`delta`、`done`、`error`。其中 `agent_output` 是专家中间交付物，只显示在协作 Trace，不拼入最终回答。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
 
 完整请求、响应和事件契约见 [项目技术文档](docs/technical-design.md)。
 
@@ -312,11 +351,13 @@ SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`�
 cmd/zora/                  服务入口、依赖组装和优雅关闭
 cmd/zora-eval/             隔离运行固定 RAG 检索与答案评测
 cmd/zora-memory-eval/      隔离运行长期记忆有/无 A/B 评测
-evals/                     可版本化的 RAG/Memory 语料、问题、事实锚点与阈值
+cmd/zora-agent-eval/       隔离运行多 Agent 路由与协作评测
+evals/                     可版本化的 RAG/Memory/Multi-Agent 数据、锚点与阈值
 internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
 internal/id/               随机业务 ID
 internal/agentruntime/     Eino Runtime、模型适配和事件转换
+internal/agentseval/       专家路由、意外调用、答案完成指标和质量门禁
 internal/agenttools/       只读工具和安全计算器
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/rageval/          检索指标、答案引用/忠实度指标和门禁
@@ -345,6 +386,9 @@ make eval-rag
 
 # 长期记忆有/无 A/B 评测
 make eval-memory
+
+# 多 Agent 路由与协作评测
+make eval-agents
 
 # 启动 pgvector 并执行真实数据库集成测试
 make postgres-up
@@ -376,6 +420,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - 增量摘要阈值、最近窗口、序号间隔、结构化模型输出、敏感信息过滤和安全上下文注入；
 - SQLite 摘要 Upsert/级联删除、PostgreSQL Schema，以及 HTTP 摘要查询和 Mock 端到端回忆。
 - 长期记忆 A/B 数据集校验、Control/Treatment 指标、错误召回与答案污染反例、RunEvent 召回 ID 解析和完整 CLI 基线。
+- Supervisor/AgentTool 串行交接、子 Agent 输出与根答案隔离、工具权限分组、协作审计闭环，以及 6 题多 Agent 路由 CLI 基线。
 
 ## 文档导航
 
@@ -394,9 +439,9 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 它提供零运维体验，适合演示和本地开发。需要更大的数据规模或多连接服务时，可将 `ZORA_STORE_PROVIDER` 改为 `postgres`；向量 HNSW 和全文候选召回会下推 PostgreSQL，而上层 Service、Tool 和 HTTP API 不变。
 
-### 为什么不立即实现多 Agent？
+### 为什么多 Agent 默认关闭？
 
-单 Agent 的工具链、评估和可观察性是多 Agent 的基础。项目会在能够量化多 Agent 的质量收益、成本和延迟后再保留该方案。
+V0.4 第一阶段已实现 Supervisor 与专业 Agent，但一次任务可能产生多次模型调用。默认关闭可以避免用户接入真实模型后意外增加成本；使用 `ZORA_MULTI_AGENT_ENABLED=true` 显式开启，并通过 `make eval-agents` 验证路由。是否默认启用仍需后续单 Agent/多 Agent 质量、Token、成本和耗时对比决定。
 
 ### 为什么工具结果没有全部写进下一轮历史？
 
@@ -411,7 +456,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - V0.1：Agent Core——已完成
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
-- V0.4：多 Agent
+- V0.4：多 Agent——Supervisor、专业 Agent、工具隔离、协作审计和路由门禁已完成；治理与收益对比进行中
 - V0.5：MCP 办公助手
 
 详见 [docs/roadmap.md](docs/roadmap.md)。

@@ -87,6 +87,8 @@ func NewService(store store.Store, runtime *agentruntime.Runtime, options ...Opt
 
 func (s *Service) Model() string             { return s.runtime.Model() }
 func (s *Service) Provider() string          { return s.runtime.Provider() }
+func (s *Service) AgentName() string         { return s.runtime.AgentName() }
+func (s *Service) MultiAgentEnabled() bool   { return s.runtime.MultiAgentEnabled() }
 func (s *Service) MemoryRecallEnabled() bool { return s.memoryRecall != nil }
 func (s *Service) SummaryEnabled() bool      { return s.summary != nil }
 
@@ -191,8 +193,9 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 	if err := s.store.CreateRun(ctx, run); err != nil {
 		return err
 	}
-	if err := s.appendEvent(ctx, run.ID, "run_started", agentruntime.AgentName, "", map[string]any{
+	if err := s.appendEvent(ctx, run.ID, "run_started", s.runtime.AgentName(), "", map[string]any{
 		"model": s.runtime.Model(), "provider": s.runtime.Provider(),
+		"multi_agent": s.runtime.MultiAgentEnabled(),
 	}); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
@@ -216,11 +219,11 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		case errors.Is(summaryErr, summary.ErrNotFound):
 		case summaryErr != nil:
 			// 摘要是增强链路；读取失败留下审计，并继续使用最近原始消息完成回答。
-			_ = s.appendEvent(ctx, run.ID, "conversation_summary_load_failed", agentruntime.AgentName, "", map[string]any{"error": summaryErr.Error()})
+			_ = s.appendEvent(ctx, run.ID, "conversation_summary_load_failed", s.runtime.AgentName(), "", map[string]any{"error": summaryErr.Error()})
 		default:
 			messages = messagesAfterSequence(messages, item.ThroughSequence)
 			loadedSummary = &item
-			_ = s.appendEvent(ctx, run.ID, "conversation_summary_loaded", agentruntime.AgentName, "", summaryAuditPayload(item))
+			_ = s.appendEvent(ctx, run.ID, "conversation_summary_loaded", s.runtime.AgentName(), "", summaryAuditPayload(item))
 		}
 	}
 	history := toEinoMessages(messages)
@@ -232,12 +235,12 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		recalled, recallErr := s.memoryRecall.Recall(ctx, content)
 		if recallErr != nil {
 			// 召回属于增强链路；失败应留下审计，但不能阻断没有记忆也能完成的正常对话。
-			_ = s.appendEvent(ctx, run.ID, "memory_recall_failed", agentruntime.AgentName, "", map[string]any{"error": recallErr.Error()})
+			_ = s.appendEvent(ctx, run.ID, "memory_recall_failed", s.runtime.AgentName(), "", map[string]any{"error": recallErr.Error()})
 		} else {
 			var injected []memory.RecallResult
 			history, injected = prependRecalledMemories(history, recalled)
 			recalledCount = len(injected)
-			_ = s.appendEvent(ctx, run.ID, "memory_recall_completed", agentruntime.AgentName, "", recallAuditPayload(injected))
+			_ = s.appendEvent(ctx, run.ID, "memory_recall_completed", s.runtime.AgentName(), "", recallAuditPayload(injected))
 		}
 	}
 
@@ -275,7 +278,7 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 	if err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
-	if err := s.appendEvent(ctx, run.ID, "model_output", agentruntime.AgentName, "", map[string]any{
+	if err := s.appendEvent(ctx, run.ID, "model_output", s.runtime.AgentName(), "", map[string]any{
 		"assistant_message_id": assistantMessage.ID,
 		"characters":           utf8.RuneCountInString(answer),
 	}); err != nil {
@@ -289,12 +292,12 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		})
 		if captureErr != nil {
 			// 自动记忆是回答后的增强链路，失败只进入审计，不能让已经生成的正常回答失败。
-			_ = s.appendEvent(ctx, run.ID, "memory_capture_failed", agentruntime.AgentName, "", map[string]any{
+			_ = s.appendEvent(ctx, run.ID, "memory_capture_failed", s.runtime.AgentName(), "", map[string]any{
 				"error": captureErr.Error(),
 			})
 		} else if result.Enabled {
 			captureResult = &result
-			_ = s.appendEvent(ctx, run.ID, "memory_capture_completed", agentruntime.AgentName, "", map[string]any{
+			_ = s.appendEvent(ctx, run.ID, "memory_capture_completed", s.runtime.AgentName(), "", map[string]any{
 				"candidates": result.Candidates, "created": result.Created,
 				"updated": result.Updated, "skipped": result.Skipped,
 			})
@@ -305,10 +308,10 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		result, summaryErr := s.summary.Update(ctx, conversationID, assistantMessage.Sequence)
 		if summaryErr != nil {
 			// 摘要生成失败不能推翻已经成功生成并保存的回答。
-			_ = s.appendEvent(ctx, run.ID, "conversation_summary_failed", agentruntime.AgentName, "", map[string]any{"error": summaryErr.Error()})
+			_ = s.appendEvent(ctx, run.ID, "conversation_summary_failed", s.runtime.AgentName(), "", map[string]any{"error": summaryErr.Error()})
 		} else if result.Updated {
 			summaryResult = &result
-			_ = s.appendEvent(ctx, run.ID, "conversation_summary_updated", agentruntime.AgentName, "", map[string]any{
+			_ = s.appendEvent(ctx, run.ID, "conversation_summary_updated", s.runtime.AgentName(), "", map[string]any{
 				"through_sequence": result.ThroughSequence,
 				"message_count":    result.MessageCount,
 				"characters":       result.Characters,
@@ -316,7 +319,7 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		}
 	}
 	completedAt := time.Now().UTC()
-	if err := s.appendEvent(ctx, run.ID, "run_completed", agentruntime.AgentName, "", map[string]any{
+	if err := s.appendEvent(ctx, run.ID, "run_completed", s.runtime.AgentName(), "", map[string]any{
 		"assistant_message_id": assistantMessage.ID,
 	}); err != nil {
 		return s.failRun(ctx, run.ID, err)
@@ -339,7 +342,7 @@ func (s *Service) failRun(ctx context.Context, runID string, cause error) error 
 	// 确保 Run 最终落为 cancelled/failed，而不是永久停留在 running。
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	_ = s.appendEvent(persistCtx, runID, "run_"+status, agentruntime.AgentName, "", map[string]any{"error": cause.Error()})
+	_ = s.appendEvent(persistCtx, runID, "run_"+status, s.runtime.AgentName(), "", map[string]any{"error": cause.Error()})
 	_ = s.store.FinishRun(persistCtx, runID, status, "", cause.Error(), time.Now().UTC())
 	return cause
 }

@@ -1,0 +1,51 @@
+{
+  "name": "zora-multi-agent-routing-v1",
+  "description": "覆盖单专家、文档到写作的串行协作、直接回答和相似词硬负例。",
+  "minimum_route_accuracy": 1.0,
+  "maximum_unexpected_agent_rate": 0.0,
+  "minimum_answer_completion": 1.0,
+  "documents": [
+    {
+      "name": "蓝鲸项目发布计划.md",
+      "content": "蓝鲸项目计划于 2026 年 9 月 18 日正式发布。上线前必须完成灰度验证、回滚演练和负责人签字确认。"
+    }
+  ],
+  "cases": [
+    {
+      "id": "document-evidence",
+      "question": "根据我上传的蓝鲸项目发布计划，发布日期和上线要求是什么？",
+      "expected_agents": ["document_agent"],
+      "expected_answer_contains": ["2026 年 9 月 18 日", "蓝鲸项目发布计划.md"]
+    },
+    {
+      "id": "research-calculation",
+      "question": "帮我计算 (128 + 72) * 3.5",
+      "expected_agents": ["research_agent"],
+      "expected_answer_contains": ["700"]
+    },
+    {
+      "id": "writer-only",
+      "question": "帮我写一封会议延期通知",
+      "expected_agents": ["writer_agent"],
+      "expected_answer_contains": ["写作专家草稿", "会议延期通知"]
+    },
+    {
+      "id": "document-then-writer",
+      "question": "根据我上传的蓝鲸项目发布计划，写一份项目发布通知",
+      "expected_agents": ["document_agent", "writer_agent"],
+      "expected_answer_contains": ["写作专家草稿", "2026 年 9 月 18 日"]
+    },
+    {
+      "id": "direct-greeting",
+      "question": "你好，请介绍一下你自己",
+      "expected_agents": [],
+      "expected_answer_contains": ["Zora"]
+    },
+    {
+      "id": "document-word-hard-negative",
+      "question": "Go 的文档注释规范是什么？",
+      "expected_agents": [],
+      "expected_answer_contains": ["Zora"]
+    }
+  ]
+}

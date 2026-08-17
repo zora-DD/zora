@@ -33,9 +33,11 @@ type Event struct {
 
 // Runtime 持有配置完成的 Eino ChatModelAgent，并隐藏框架的具体事件结构。
 type Runtime struct {
-	runner   *adk.Runner
-	model    string
-	provider string
+	runner      *adk.Runner
+	model       string
+	provider    string
+	agentName   string
+	specialists map[string]struct{}
 }
 
 // NewChatModel 根据配置创建可复用的模型实例。主 Agent 与记忆提取器共享同一模型配置，
@@ -95,14 +97,27 @@ func NewWithModel(ctx context.Context, cfg config.Config, tools []tool.BaseTool,
 		return nil, fmt.Errorf("创建 Eino Agent 失败：%w", err)
 	}
 
-	return &Runtime{
-		runner: adk.NewRunner(ctx, adk.RunnerConfig{Agent: agent, EnableStreaming: true}),
-		model:  cfg.Model, provider: cfg.Provider,
-	}, nil
+	return newRuntime(ctx, cfg, agent, nil), nil
 }
 
-func (r *Runtime) Model() string    { return r.model }
-func (r *Runtime) Provider() string { return r.provider }
+func (r *Runtime) Model() string           { return r.model }
+func (r *Runtime) Provider() string        { return r.provider }
+func (r *Runtime) AgentName() string       { return r.agentName }
+func (r *Runtime) MultiAgentEnabled() bool { return len(r.specialists) > 0 }
+
+func newRuntime(ctx context.Context, cfg config.Config, rootAgent adk.Agent, specialistNames []string) *Runtime {
+	specialists := make(map[string]struct{}, len(specialistNames))
+	for _, name := range specialistNames {
+		specialists[name] = struct{}{}
+	}
+	return &Runtime{
+		runner:      adk.NewRunner(ctx, adk.RunnerConfig{Agent: rootAgent, EnableStreaming: true}),
+		model:       cfg.Model,
+		provider:    cfg.Provider,
+		agentName:   rootAgent.Name(ctx),
+		specialists: specialists,
+	}
+}
 
 // Execute 执行一次完整请求，并把模型增量、工具调用和工具结果实时向上层转发。
 func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit func(Event) error) (string, error) {
@@ -122,7 +137,8 @@ func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit f
 		}
 
 		variant := event.Output.MessageOutput
-		message, streamed, err := consumeVariant(ctx, variant, event.AgentName, emit)
+		rootOutput := event.AgentName == "" || event.AgentName == r.agentName
+		message, streamed, err := consumeVariant(ctx, variant, event.AgentName, rootOutput, emit)
 		if err != nil {
 			return "", err
 		}
@@ -139,15 +155,19 @@ func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit f
 		case schema.Assistant:
 			// Assistant 消息可能是最终文本，也可能只包含一个或多个 ToolCall。
 			for _, call := range message.ToolCalls {
+				eventType := "tool_call"
+				if r.isSpecialist(call.Function.Name) {
+					eventType = "agent_handoff_started"
+				}
 				if err := emit(Event{
-					Type: "tool_call", AgentName: event.AgentName,
+					Type: eventType, AgentName: event.AgentName,
 					ToolName: call.Function.Name, ToolCallID: call.ID,
 					Arguments: call.Function.Arguments,
 				}); err != nil {
 					return "", err
 				}
 			}
-			if message.Content != "" {
+			if message.Content != "" && rootOutput {
 				if answer.Len() > 0 {
 					answer.WriteString("\n")
 				}
@@ -157,6 +177,12 @@ func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit f
 						return "", err
 					}
 				}
+			} else if message.Content != "" {
+				// 子 Agent 的中间结论只进入协作审计，不拼接进最终回答，
+				// 避免用户看到“专家草稿 + Supervisor 定稿”的重复内容。
+				if err := emit(Event{Type: "agent_output", AgentName: event.AgentName, Content: message.Content}); err != nil {
+					return "", err
+				}
 			}
 		case schema.Tool:
 			// 工具结果由 Eino 自动回填给模型，同时作为可观察事件暴露给产品层。
@@ -164,8 +190,12 @@ func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit f
 			if toolName == "" {
 				toolName = message.ToolName
 			}
+			eventType := "tool_result"
+			if r.isSpecialist(toolName) {
+				eventType = "agent_handoff_completed"
+			}
 			if err := emit(Event{
-				Type: "tool_result", AgentName: event.AgentName,
+				Type: eventType, AgentName: event.AgentName,
 				ToolName: toolName, ToolCallID: message.ToolCallID,
 				Content: message.Content,
 			}); err != nil {
@@ -183,7 +213,12 @@ func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit f
 	return answer.String(), nil
 }
 
-func consumeVariant(ctx context.Context, variant *adk.MessageVariant, agentName string, emit func(Event) error) (*schema.Message, bool, error) {
+func (r *Runtime) isSpecialist(name string) bool {
+	_, ok := r.specialists[name]
+	return ok
+}
+
+func consumeVariant(ctx context.Context, variant *adk.MessageVariant, agentName string, emitDeltas bool, emit func(Event) error) (*schema.Message, bool, error) {
 	if !variant.IsStreaming {
 		return variant.Message, false, nil
 	}
@@ -207,7 +242,7 @@ func consumeVariant(ctx context.Context, variant *adk.MessageVariant, agentName 
 			return nil, true, err
 		}
 		chunks = append(chunks, chunk)
-		if variant.Role == schema.Assistant && chunk.Content != "" {
+		if emitDeltas && variant.Role == schema.Assistant && chunk.Content != "" {
 			if err := emit(Event{Type: "delta", AgentName: agentName, Content: chunk.Content}); err != nil {
 				return nil, true, err
 			}

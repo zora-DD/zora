@@ -26,6 +26,7 @@ services:
       ZORA_POSTGRES_DSN: postgres://zora:zora@postgres:5432/zora?sslmode=disable
       ZORA_POSTGRES_MAX_CONNS: 10
       ZORA_MODEL_PROVIDER: mock
+      ZORA_MULTI_AGENT_ENABLED: ${ZORA_MULTI_AGENT_ENABLED:-false}
       ZORA_EMBEDDING_PROVIDER: hash
       ZORA_EMBEDDING_DIMENSIONS: 384
     ports:

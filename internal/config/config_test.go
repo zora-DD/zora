@@ -29,6 +29,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if !cfg.SummaryEnabled || cfg.SummaryTriggerMessages != 20 || cfg.SummaryKeepRecent != 12 || cfg.SummaryMaxRunes != 4000 {
 		t.Fatalf("unexpected summary defaults: %+v", cfg)
 	}
+	if cfg.MultiAgentEnabled {
+		t.Fatal("multi-agent should be opt-in by default")
+	}
 }
 
 func TestLoadPostgresStoreRequiresDSN(t *testing.T) {
@@ -87,11 +90,24 @@ func TestLoadRejectsInvalidSummaryWindow(t *testing.T) {
 	}
 }
 
+func TestLoadMultiAgentOptIn(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ZORA_MULTI_AGENT_ENABLED", "true")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MultiAgentEnabled {
+		t.Fatal("multi-agent config should be enabled")
+	}
+}
+
 func clearEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		"ZORA_ADDR", "ZORA_DATA_DIR", "ZORA_MODEL_PROVIDER", "ZORA_MODEL", "ZORA_API_KEY",
 		"ZORA_BASE_URL", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
+		"ZORA_MULTI_AGENT_ENABLED",
 		"ZORA_STORE_PROVIDER", "ZORA_POSTGRES_DSN", "ZORA_POSTGRES_MAX_CONNS",
 		"ZORA_EMBEDDING_PROVIDER", "ZORA_EMBEDDING_MODEL", "ZORA_EMBEDDING_API_KEY",
 		"ZORA_EMBEDDING_BASE_URL", "ZORA_EMBEDDING_DIMENSIONS", "ZORA_KNOWLEDGE_CHUNK_SIZE",

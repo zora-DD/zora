@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.3 Long-term Memory（自动写入、召回注入、会话摘要与 A/B 门禁）
+> 适用版本：V0.4 Multi-Agent 第一阶段（Supervisor、专业 Agent、协作审计与路由门禁）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -24,10 +24,14 @@
 ```text
 cmd/
 ├── zora/main.go               服务启动、组装、信号和关闭
-└── zora-eval/main.go          固定 RAG 检索与答案评测命令
+├── zora-eval/main.go          固定 RAG 检索与答案评测命令
+├── zora-memory-eval/main.go   长期记忆 Control/Treatment 评测命令
+└── zora-agent-eval/main.go    多 Agent 路由与协作评测命令
 
 evals/
-└── knowledge.json             可版本化的语料、问题、事实锚点和阈值
+├── knowledge.json             RAG 语料、问题、事实锚点和阈值
+├── memory.json                长期记忆、A/B 问题和污染门禁
+└── agents.json                专家路由、答案锚点和质量阈值
 
 internal/
 ├── config/                    环境配置与启动校验
@@ -38,6 +42,7 @@ internal/
 │   └── postgres/              pgx、pgvector、FTS 和迁移
 ├── agenttools/                Eino Tool 及安全执行逻辑
 ├── agentruntime/              Eino/模型适配与统一事件
+├── agentseval/                多 Agent 路由/答案指标与门禁
 ├── knowledge/                 分块、Embedding、混合检索与 Agent Tool
 ├── rageval/                   检索指标、答案引用/忠实度指标与门禁
 ├── memory/                    Semantic/Episodic 模型、校验和 CRUD 用例
@@ -63,6 +68,10 @@ flowchart TD
     MemoryEval["cmd/zora-memory-eval"] --> MemoryAB["memoryeval"]
     MemoryEval --> Chat
     MemoryEval --> Memory
+    AgentEval["cmd/zora-agent-eval"] --> AgentsEval["agentseval"]
+    AgentEval --> Chat
+    AgentEval --> Runtime
+    AgentEval --> Knowledge
     Eval["cmd/zora-eval"] --> RAGEval["rageval"]
     Eval --> Knowledge
     HTTP --> Chat
@@ -99,7 +108,7 @@ flowchart TD
 - `httpapi` 不直接调用模型和工具；
 - `httpapi` 只通过应用 Service 调用知识库、长期记忆和会话摘要用例；
 - `chat` 只依赖 `agentruntime.Runtime` 的统一事件；
-- 工具只能从 `agenttools.Build` 的 allowlist 注入。
+- 单 Agent 工具从显式 allowlist 注入；多 Agent 模式进一步按 Research/Document/Writer 职责分组，Supervisor 不能直接调用底层工具。
 
 ## 3. 启动流程
 
@@ -113,10 +122,11 @@ flowchart TD
 6. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
 7. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
 8. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
-9. 使用共享 ChatModel 创建 Eino ChatModelAgent 和 Runner；
-10. 按配置创建 Model/Rule Summarizer 和 Summary Service；
-11. 创建 Chat Service，按开关接入 Memory Capture/Recall 与会话摘要，再创建 HTTP Handler；
-12. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
+9. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
+10. 创建 Eino Runner；多 Agent 模式开启内部 Agent 事件透传；
+11. 按配置创建 Model/Rule Summarizer 和 Summary Service；
+12. 创建 Chat Service，按开关接入 Memory Capture/Recall 与会话摘要，再创建 HTTP Handler；
+13. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
 
@@ -136,6 +146,7 @@ flowchart TD
 | `ZORA_SYSTEM_PROMPT` | 内置中文指令 | 否 | Agent 系统指令 |
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 否 | 整次消息请求与模型客户端超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | 否 | ReAct 最大迭代，允许范围 1–50 |
+| `ZORA_MULTI_AGENT_ENABLED` | `false` | 否 | 是否启用 Supervisor 与 Research/Document/Writer；默认关闭以控制模型成本 |
 | `ZORA_EMBEDDING_PROVIDER` | `hash` | 否 | `hash` 或 `openai` |
 | `ZORA_EMBEDDING_MODEL` | `text-embedding-v4` | openai Embedding 需要 | Embedding 模型名 |
 | `ZORA_EMBEDDING_API_KEY` | 复用 Chat Key | openai Embedding 需要 | 可独立的 Embedding Key |
@@ -173,6 +184,8 @@ sequenceDiagram
     participant Summary as summary.Service
     participant Store as Store
     participant Runner as Eino Runner
+    participant Supervisor as Supervisor
+    participant Specialist as Specialist Agent
     participant Model as ChatModel
     participant Tool as ToolNode
 
@@ -190,7 +203,16 @@ sequenceDiagram
     Chat->>Memory: Recall(content)
     Memory-->>Chat: Top-K + 分数组件
     Chat->>Runner: Run(summary + memory + recent history)
-    Runner->>Model: Stream(messages + tools)
+    Runner->>Supervisor: 执行根 Agent
+    Supervisor->>Model: Stream(messages + tools/agents)
+    opt 启用多 Agent 且需要专业能力
+        Model-->>Supervisor: AgentTool Call
+        Supervisor->>Specialist: AgentTool(request)
+        Specialist->>Tool: 调用职责内工具
+        Tool-->>Specialist: ToolResult
+        Specialist-->>Supervisor: 交付物
+        Runner-->>Chat: handoff/output/completed
+    end
     alt 模型调用工具
         Model-->>Runner: ToolCall
         Runner-->>Chat: tool_call
@@ -243,6 +265,8 @@ Eino Runner (EnableStreaming=true)
 
 Eino 负责 ReAct 循环：模型生成 ToolCall → ToolNode 执行 → ToolResult 回填模型 → 继续生成，直到模型输出最终回答或超过最大迭代。
 
+`agentruntime.NewMultiAgentWithModel` 则创建一个根 `zora_supervisor` 和三个 Eino ChatModelAgent，并通过 `adk.NewAgentTool` 把专家暴露给 Supervisor。项目没有采用共享完整上下文的 Agent Transfer：AgentTool 默认只发送 `{"request":"..."}`，专业 Agent 看不到主会话全部历史；需要的事实和证据必须由 Supervisor 显式交接。
+
 ### 6.2 Provider
 
 #### Mock
@@ -267,9 +291,23 @@ Eino 负责 ReAct 循环：模型生成 ToolCall → ToolNode 执行 → ToolRes
 | Assistant + ToolCalls | `tool_call` | 模型选择了某个工具 |
 | Tool Message | `tool_result` | 工具完成或返回错误 |
 | Assistant Content Chunk | `delta` | 可直接展示的文本增量 |
+| Supervisor 调用 AgentTool | `agent_handoff_started` | 记录目标专家、ToolCall ID 和结构化 request |
+| 子 Agent Assistant Content | `agent_output` | 专家交付物，只进入 Trace/审计，不拼接最终回答 |
+| AgentTool Result | `agent_handoff_completed` | 专家执行闭环，结果回填 Supervisor |
 | Iterator Error | Go error | 交给 Service 结束 Run |
 
 流式 ToolCall 可能分散在多个 chunk 中。Runtime 一边将文本 delta 发送给上层，一边收集 chunk，并使用 `schema.ConcatMessages` 合并出结构完整的 ToolCall。
+
+### 6.4 多 Agent 职责与最终答案隔离
+
+| Agent | 可调用能力 | 上下文与输出约束 |
+|---|---|---|
+| `zora_supervisor` | 三个 AgentTool | 读取主对话上下文，决定直接回答或交接，最终只输出一次答案 |
+| `research_agent` | `current_time`、`calculator`、`project_status` | 只接收 request，负责核验和分析 |
+| `document_agent` | `knowledge_search` | 只接收 request，必须返回带引用的文档证据 |
+| `writer_agent` | 无底层工具 | 只使用 request 中的任务和证据，不补造事实 |
+
+复合“根据文档写作”任务采用 `document_agent → writer_agent` 串行交接。Eino 会透传子 Agent 的流式事件；Runtime 只累计根 Agent 的文本为最终回答，子 Agent 文本统一转成单条 `agent_output`。这避免专家草稿和 Supervisor 定稿被重复拼接，同时保留调试证据。
 
 ## 7. 工具设计
 
@@ -556,6 +594,14 @@ recency = exp(-ln(2) * age / 90 days)
 
 默认 5 题包含三个正向个性化问题、一个“Go 并发模型”相似主题硬负例和一个无关问题。首次基线曾出现弱词面重合污染：重要性/时效性把个人语言和项目记忆注入通用 Go 问题。门禁失败后新增 0.20 最低主题相关性，当前结果为 Recall@K=1、意外召回率=0、Treatment 事实覆盖率=1、Control=0、覆盖增益=1、污染率=0。
 
+### 8.14 多 Agent 路由与协作评测
+
+`cmd/zora-agent-eval` 每次创建临时 SQLite，根据 `evals/agents.json` 摄取固定文档，再组装与线上相同的 Supervisor、三个 AgentTool、Chat Service 和 RunEvent Store。每题使用独立 Conversation，答案完成后从实际 RunEvent 提取 `agent_handoff_started` 顺序，并强制校验每次交接同时存在相同 ToolCall ID 的 `agent_handoff_completed` 和目标专家的 `agent_output`；因此仅让模型输出专家名称不能通过门禁。
+
+指标包括：完整路由序列准确率、实际调用中不属于预期序列的意外专家调用率、非空且包含预期事实锚点的答案完成率，以及只报告不设门禁的平均延迟。默认 6 题覆盖 Document、Research、Writer 单专家路由，`document_agent → writer_agent` 串行协作，直接回答，以及“Go 的文档注释规范”这种包含“文档”词但不应查询用户知识库的硬负例。默认 Mock 基线三项质量指标分别为 1、0、1。
+
+该评测只证明路由和协作链路符合标注，不证明多 Agent 相对单 Agent 有质量收益。后续必须在同一复合任务集上增加单 Agent Control、Token/成本和耗时统计，才能满足 V0.4 总体验收条件。
+
 ## 9. 并发、取消与错误处理
 
 ### 9.1 会话级并发
@@ -617,7 +663,7 @@ GET /api/health
 GET /api/info
 ```
 
-返回版本、Provider、Model 和已启用能力。
+返回版本、Provider、Model、根 `agent_name`、`multi_agent` 开关和已启用能力。开启多 Agent 时 capabilities 增加 `supervisor`、`specialist-agents` 和 `agent-handoff-audit`。
 
 ### 10.3 创建对话
 
@@ -713,6 +759,19 @@ data: {"type":"delta","run_id":"run_xxx","content":"计算结果"}
 
 event: done
 data: {"type":"done","run_id":"run_xxx","message":{"role":"assistant","content":"..."}}
+```
+
+多 Agent 交接会在最终 `delta` 前增加：
+
+```text
+event: agent_handoff_started
+data: {"type":"agent_handoff_started","run_id":"run_xxx","agent_name":"zora_supervisor","tool_name":"document_agent","tool_call_id":"call_xxx","arguments":"{\"request\":\"...\"}"}
+
+event: agent_output
+data: {"type":"agent_output","run_id":"run_xxx","agent_name":"document_agent","content":"带引用的文档证据"}
+
+event: agent_handoff_completed
+data: {"type":"agent_handoff_completed","run_id":"run_xxx","agent_name":"zora_supervisor","tool_name":"document_agent","tool_call_id":"call_xxx","content":"带引用的文档证据"}
 ```
 
 ### 10.9 查询执行事件
@@ -838,6 +897,9 @@ DELETE /api/memories/{memoryID}
 | `start` | `run_id`, `message` | 以 run_started 表示 | 用户消息已保存、Run 已创建 |
 | `tool_call` | `tool_name`, `tool_call_id`, `arguments` | 是 | 模型请求调用工具 |
 | `tool_result` | `tool_name`, `tool_call_id`, `content` | 是 | 工具返回结果 |
+| `agent_handoff_started` | `tool_name`, `tool_call_id`, `arguments` | 是 | Supervisor 将结构化任务交给专业 Agent |
+| `agent_output` | `agent_name`, `content` | 是 | 专家中间交付物，仅进入 Trace/审计 |
+| `agent_handoff_completed` | `tool_name`, `tool_call_id`, `content` | 是 | 专家执行完成，结果已回填 Supervisor |
 | `delta` | `content` | 否 | 文本增量，只用于实时展示 |
 | `done` | `message`, `memory`, `memory_recalled`, `summary` | 以 model_output/run_completed 表示 | 回答和 Run 已落库；附带自动记忆计数、注入数量和本轮摘要更新统计 |
 | `error` | `content` | 以 failed/cancelled 表示 | 执行失败或取消 |
@@ -852,7 +914,7 @@ DELETE /api/memories/{memoryID}
 - 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，展示手动/对话来源、人工修正状态及自动提取/召回开关状态；
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
-- 工具调用以可折叠 Trace 展示；
+- 工具调用和专业 Agent 协作均以可折叠 Trace 展示；专家中间输出不会进入最终回答气泡；
 - 模型文本先进行 HTML 转义，再做有限 Markdown 渲染；
 - 响应式侧边栏适配移动端；
 - 静态资源由 Go 二进制内嵌，未知前端路由回退到 `index.html`。
@@ -863,6 +925,7 @@ DELETE /api/memories/{memoryID}
 
 - API Key 不落库、不返回前端；
 - Tool allowlist；
+- Supervisor 只能调用专业 AgentTool；Research/Document/Writer 分别使用独立工具 allowlist，且只接收结构化 request；
 - 无 Shell、代码执行和外部写操作；
 - 计算器不使用 eval；
 - JSON 严格解码和大小限制；
@@ -906,10 +969,11 @@ DELETE /api/memories/{memoryID}
 | 层级 | 当前覆盖 |
 |---|---|
 | 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分、弱相关硬负例和人工修正保护；会话摘要阈值、窗口、序号间隔、JSON 解析、敏感信息过滤和安全注入 |
-| Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
+| Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta；Supervisor 单专家和 Document→Writer 串行协作；专家输出与最终回答隔离 |
 | Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD；ConversationSummary Upsert、消息范围、级联删除和 PostgreSQL Schema |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
 | Memory A/B 测试 | 严格数据集校验；Control/Treatment 事实覆盖；意外召回与答案污染反例；RunEvent 召回 ID 解析；完整 CLI 基线 |
+| Multi-Agent 评测测试 | 严格数据集校验；路由序列、意外专家和答案完成指标；协作事件闭环；完整 Chat/RunEvent CLI 基线 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
 | HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404、自动提取/召回，以及摘要触发、查询和 Mock 上下文作答 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
@@ -923,6 +987,7 @@ make vet
 make check
 make eval-rag
 make eval-memory
+make eval-agents
 make postgres-up
 make test-postgres
 go test -race ./internal/...
@@ -989,7 +1054,9 @@ flowchart LR
 
 ### 17.3 V0.4 Multi-Agent
 
-Supervisor 通过 Agent-as-Tool 调用 Research、Document、Writer Agent。每个子 Agent 使用独立上下文和结构化交付物，并记录 parent_run_id、预算、超时、重试和审批事件。
+当前已实现 Supervisor 通过 Agent-as-Tool 调用 Research、Document、Writer Agent；每个子 Agent 使用最小 request 上下文和独立工具权限，协作事件进入 SSE/RunEvent，固定 6 题路由门禁通过。`ZORA_MULTI_AGENT_ENABLED` 默认关闭，避免真实模型产生意外成本。
+
+剩余目标包括：独立子 AgentRun 与 `parent_run_id`、每个子任务的调用/Token/时间预算、超时与有限重试、并行任务、Human-in-the-loop，以及单 Agent Control 与多 Agent Treatment 的质量/成本/耗时对照。只有数据证明收益覆盖代价后，才考虑默认开启。
 
 ### 17.4 V0.5 Office Agent
 

@@ -80,7 +80,7 @@ func Build() ([]tool.BaseTool, error) {
 		"介绍当前 Zora 项目的已实现能力与下一个里程碑。",
 		func(_ context.Context, _ *projectStatusInput) (*projectStatusOutput, error) {
 			return &projectStatusOutput{
-				Version: "0.3.0-dev",
+				Version: "0.4.0-dev",
 				Available: []string{
 					"流式对话", "持久化会话", "Eino ReAct 循环",
 					"只读工具", "执行事件审计", "TXT/Markdown 知识库摄取",
@@ -90,8 +90,11 @@ func Build() ([]tool.BaseTool, error) {
 					"长期记忆联合召回与上下文注入",
 					"会话增量摘要与上下文压缩",
 					"长期记忆有/无 A/B 评测与质量门禁",
+					"可选 Supervisor 与研究/文档/写作专业 Agent",
+					"专业 Agent 工具隔离、结构化交接与协作事件审计",
+					"多 Agent 固定路由评测与质量门禁",
 				},
-				NextMilestone: "V0.4 Supervisor 与专业 Agent 的可评估协作",
+				NextMilestone: "V0.4 子 Agent 预算、超时、重试与父子 Run 链路",
 			}, nil
 		},
 	)

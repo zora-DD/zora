@@ -205,14 +205,14 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
 		t.Fatalf("info body = %s", response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"version":"0.3.0-dev"`) ||
+	if !strings.Contains(response.Body.String(), `"version":"0.4.0-dev"`) ||
 		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||
 		!strings.Contains(response.Body.String(), `"memory_auto_capture":true`) ||
 		!strings.Contains(response.Body.String(), `"memory_recall":true`) ||
 		!strings.Contains(response.Body.String(), `"memory-context-injection"`) ||
 		!strings.Contains(response.Body.String(), `"conversation_summary":true`) ||
 		!strings.Contains(response.Body.String(), `"context-compression"`) {
-		t.Fatalf("info does not report V0.3 memory capability: %s", response.Body.String())
+		t.Fatalf("info does not report the current runtime capabilities: %s", response.Body.String())
 	}
 }
 

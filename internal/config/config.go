@@ -17,18 +17,19 @@ const defaultInstruction = `你是 Zora，一个可靠、简洁的中文 AI 助�
 
 // Config 汇总服务启动所需的全部配置，避免业务代码直接读取环境变量。
 type Config struct {
-	Addr             string        // HTTP 监听地址，例如 :8088。
-	DataDir          string        // SQLite 等本地持久化文件的根目录。
-	StoreProvider    string        // sqlite 或 postgres；默认 sqlite 保持零依赖体验。
-	PostgresDSN      string        // PostgreSQL 连接串，只允许通过环境变量注入。
-	PostgresMaxConns int           // PostgreSQL 连接池最大连接数。
-	Provider         string        // mock 或 openai；openai 兼容通义千问等接口。
-	Model            string        // 发送给模型服务的模型名称。
-	APIKey           string        // 仅从环境变量读取，禁止写入仓库。
-	BaseURL          string        // OpenAI-compatible API 地址；留空时使用适配器默认值。
-	Instruction      string        // Agent 的系统指令。
-	RequestTimeout   time.Duration // 单次模型请求和整条消息链路的超时上限。
-	MaxIterations    int           // ReAct 最大循环次数，防止模型无限调用工具。
+	Addr              string        // HTTP 监听地址，例如 :8088。
+	DataDir           string        // SQLite 等本地持久化文件的根目录。
+	StoreProvider     string        // sqlite 或 postgres；默认 sqlite 保持零依赖体验。
+	PostgresDSN       string        // PostgreSQL 连接串，只允许通过环境变量注入。
+	PostgresMaxConns  int           // PostgreSQL 连接池最大连接数。
+	Provider          string        // mock 或 openai；openai 兼容通义千问等接口。
+	Model             string        // 发送给模型服务的模型名称。
+	APIKey            string        // 仅从环境变量读取，禁止写入仓库。
+	BaseURL           string        // OpenAI-compatible API 地址；留空时使用适配器默认值。
+	Instruction       string        // Agent 的系统指令。
+	RequestTimeout    time.Duration // 单次模型请求和整条消息链路的超时上限。
+	MaxIterations     int           // ReAct 最大循环次数，防止模型无限调用工具。
+	MultiAgentEnabled bool          // 是否启用 Supervisor + 专业 Agent；默认关闭以控制模型成本。
 
 	EmbeddingProvider   string // hash 用于本地开发，openai 用于真实语义向量。
 	EmbeddingModel      string // Embedding 模型名，如 text-embedding-v4。
@@ -66,6 +67,10 @@ func Load() (Config, error) {
 	maxIterations, err := strconv.Atoi(env("ZORA_MAX_ITERATIONS", "8"))
 	if err != nil || maxIterations < 1 || maxIterations > 50 {
 		return Config{}, fmt.Errorf("ZORA_MAX_ITERATIONS 必须在 1 到 50 之间")
+	}
+	multiAgentEnabled, err := strconv.ParseBool(env("ZORA_MULTI_AGENT_ENABLED", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_MULTI_AGENT_ENABLED 必须是 true 或 false")
 	}
 	chunkSize, err := positiveInt("ZORA_KNOWLEDGE_CHUNK_SIZE", "800")
 	if err != nil || chunkSize < 100 {
@@ -121,18 +126,19 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		Addr:             env("ZORA_ADDR", ":8088"),
-		DataDir:          env("ZORA_DATA_DIR", "./data"),
-		StoreProvider:    strings.ToLower(env("ZORA_STORE_PROVIDER", "sqlite")),
-		PostgresDSN:      strings.TrimSpace(os.Getenv("ZORA_POSTGRES_DSN")),
-		PostgresMaxConns: postgresMaxConns,
-		Provider:         strings.ToLower(env("ZORA_MODEL_PROVIDER", "mock")),
-		Model:            env("ZORA_MODEL", "qwen-plus"),
-		APIKey:           strings.TrimSpace(os.Getenv("ZORA_API_KEY")),
-		BaseURL:          strings.TrimRight(strings.TrimSpace(os.Getenv("ZORA_BASE_URL")), "/"),
-		Instruction:      env("ZORA_SYSTEM_PROMPT", defaultInstruction),
-		RequestTimeout:   timeout,
-		MaxIterations:    maxIterations,
+		Addr:              env("ZORA_ADDR", ":8088"),
+		DataDir:           env("ZORA_DATA_DIR", "./data"),
+		StoreProvider:     strings.ToLower(env("ZORA_STORE_PROVIDER", "sqlite")),
+		PostgresDSN:       strings.TrimSpace(os.Getenv("ZORA_POSTGRES_DSN")),
+		PostgresMaxConns:  postgresMaxConns,
+		Provider:          strings.ToLower(env("ZORA_MODEL_PROVIDER", "mock")),
+		Model:             env("ZORA_MODEL", "qwen-plus"),
+		APIKey:            strings.TrimSpace(os.Getenv("ZORA_API_KEY")),
+		BaseURL:           strings.TrimRight(strings.TrimSpace(os.Getenv("ZORA_BASE_URL")), "/"),
+		Instruction:       env("ZORA_SYSTEM_PROMPT", defaultInstruction),
+		RequestTimeout:    timeout,
+		MaxIterations:     maxIterations,
+		MultiAgentEnabled: multiAgentEnabled,
 
 		EmbeddingProvider:   embeddingProvider,
 		EmbeddingModel:      env("ZORA_EMBEDDING_MODEL", "text-embedding-v4"),

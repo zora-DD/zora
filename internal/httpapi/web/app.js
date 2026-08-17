@@ -8,6 +8,7 @@ const state = {
   memories: [],
 	memoryAutoCapture: false,
 	memoryRecall: false,
+  multiAgent: false,
   editingMemoryID: null,
   busy: false,
   controller: null,
@@ -86,7 +87,8 @@ async function initialize() {
       api("/api/memories?include_expired=true"),
     ]);
     elements.runtimeModel.textContent = info.model;
-    elements.runtimeProvider.textContent = `${info.provider} · ${info.version}`;
+    state.multiAgent = Boolean(info.multi_agent);
+    elements.runtimeProvider.textContent = `${info.provider} · ${info.version}${state.multiAgent ? " · 多 Agent" : ""}`;
     state.conversations = result.conversations || [];
     state.documents = knowledgeResult.documents || [];
     state.memories = memoryResult.memories || [];
@@ -514,20 +516,44 @@ function handleAgentEvent(type, event) {
     case "tool_call":
       state.draft.traces.push({
         name: event.tool_name,
+		key: event.tool_name,
         id: event.tool_call_id,
         arguments: prettyJSON(event.arguments),
         result: "执行中…",
         done: false,
       });
       break;
+	case "agent_handoff_started":
+	  state.draft.traces.push({
+		name: `协作：${agentDisplayName(event.tool_name)}`,
+		key: event.tool_name,
+		id: event.tool_call_id,
+		arguments: prettyJSON(event.arguments),
+		result: "专业 Agent 正在处理…",
+		done: false,
+	  });
+	  break;
+	case "agent_output": {
+	  const trace = [...state.draft.traces].reverse().find(item => !item.done && item.key === event.agent_name);
+	  if (trace && event.content) trace.result = event.content;
+	  break;
+	}
     case "tool_result": {
-      const trace = [...state.draft.traces].reverse().find(item => !item.done && (!event.tool_name || item.name === event.tool_name));
+	  const trace = [...state.draft.traces].reverse().find(item => !item.done && (!event.tool_name || item.key === event.tool_name));
       if (trace) {
         trace.result = prettyJSON(event.content);
         trace.done = true;
       }
       break;
     }
+	case "agent_handoff_completed": {
+	  const trace = [...state.draft.traces].reverse().find(item => !item.done && item.key === event.tool_name);
+	  if (trace) {
+		trace.result = event.content || trace.result;
+		trace.done = true;
+	  }
+	  break;
+	}
     case "done":
       if (event.message) {
         const traces = state.draft.traces;
@@ -543,6 +569,14 @@ function handleAgentEvent(type, event) {
   }
   renderMessages();
   scrollToBottom();
+}
+
+function agentDisplayName(name) {
+  return ({
+	research_agent: "研究专家",
+	document_agent: "文档专家",
+	writer_agent: "写作专家",
+  })[name] || name || "专业 Agent";
 }
 
 async function consumeSSE(stream, onEvent) {

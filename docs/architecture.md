@@ -4,7 +4,7 @@
 
 ## 1. 边界
 
-Zora 将系统划分为十个边界：
+Zora 将系统划分为十一个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
@@ -14,8 +14,9 @@ Zora 将系统划分为十个边界：
 6. `memory`：Semantic/Episodic Memory、候选提取、Consolidation、生命周期校验和用户控制。
 7. `summary`：会话增量摘要、最近消息窗口、Model/Rule Summarizer 和持久化契约。
 8. `memoryeval`：长期记忆 Control/Treatment、召回/事实/污染指标和质量门禁。
-9. `store`：对话、知识库、长期记忆与摘要的持久化边界，由 SQLite 或 PostgreSQL 实现。
-10. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
+9. `agentseval`：多 Agent 路由准确率、意外专家调用、答案完成和质量门禁。
+10. `store`：对话、知识库、长期记忆与摘要的持久化边界，由 SQLite 或 PostgreSQL 实现。
+11. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -50,7 +51,7 @@ V0.1 直接使用 `ChatModelAgent + Runner`，以获得：
 
 ### RunEvent
 
-采用 append-only 审计：`run_started`、`tool_call`、`tool_result`、`model_output`、记忆提取/召回事件、会话摘要加载/更新/失败事件、`run_completed/failed/cancelled`。流式 token 只发往客户端，不逐 token 落库；记忆和摘要正文也不会复制进事件。
+采用 append-only 审计：`run_started`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`model_output`、记忆提取/召回事件、会话摘要加载/更新/失败事件、`run_completed/failed/cancelled`。流式 token 只发往客户端，不逐 token 落库；记忆和摘要正文也不会复制进事件。专业 Agent 的交付物会进入 `agent_output`，用于核对协作事实，但不会成为下一轮主会话历史。
 
 ### Memory
 
@@ -156,15 +157,29 @@ SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_
 
 `make eval-memory` 在隔离数据库中让每个问题分别走关闭/开启召回的完整 Chat 链路，并从 RunEvent 核验实际注入 ID。默认基线覆盖三个正向问题和两个负例，门禁预期召回、错误召回、事实覆盖增益和答案污染；当前全部通过。后续先扩充真实模型样本，再用同一门禁决定是否增加 Memory 向量检索。
 
-## 8. 多 Agent 接入点
+## 8. V0.4 多 Agent 第一阶段架构
 
-单 Agent 的工具链与评估稳定后，增加 Supervisor：
+当前多 Agent 由 `ZORA_MULTI_AGENT_ENABLED=true` 显式开启：
 
 ```text
 Supervisor
-├── Research Agent
-├── Document Agent
-└── Writer Agent
+├── Research Agent  → current_time / calculator / project_status
+├── Document Agent  → knowledge_search
+└── Writer Agent    → 无底层工具，只消费任务与证据
 ```
 
-子 Agent 通过 Agent-as-Tool 返回结构化结果。共享的只有任务输入和明确交接物，不默认共享全部历史。Run Event 将增加父子 Run ID、预算、重试和审批事件。
+实现选择 Eino AgentTool，而不是依赖完整上下文共享的 Agent Transfer：Supervisor 只把 JSON `request` 交给专业 Agent，Agent 不默认继承主会话历史；底层工具也按职责分别注入。需要“根据文档写作”时先执行 Document，再把原任务和文档交付物传给 Writer，最后只由 Supervisor 输出一次最终答案。
+
+`agentruntime.Runtime` 开启嵌套事件透传并完成防重复处理：
+
+```text
+agent_handoff_started(target, request)
+  → 子 Agent tool_call/tool_result
+  → agent_output(agent, deliverable)
+  → agent_handoff_completed(target, result)
+  → Supervisor 最终 delta
+```
+
+Web 将交接事件显示为专业 Agent Trace；Chat 把非 delta 事件写入同一个顶层 Run。`make eval-agents` 在隔离 SQLite 中完整经过 Chat、Eino AgentTool 和 RunEvent，当前 6 题得到路由准确率 1、意外专家调用率 0、答案完成率 1。
+
+仍未实现父子 AgentRun、独立子任务预算/超时/重试、并行执行、审批和单/多 Agent 收益对照，因此当前只是 V0.4 第一阶段。

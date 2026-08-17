@@ -90,12 +90,16 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.chat.SummaryEnabled() {
 		capabilities = append(capabilities, "conversation-summary", "context-compression")
 	}
+	if s.chat.MultiAgentEnabled() {
+		capabilities = append(capabilities, "supervisor", "specialist-agents", "agent-handoff-audit")
+	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.3.0-dev",
+		"name": "Zora", "version": "0.4.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
+		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
 		"embedding_model":      s.knowledge.EmbeddingModel(),
 		"retrieval_backend":    s.knowledge.RetrievalBackend(),
 		"memory_auto_capture":  s.memory.AutoCaptureEnabled(),
