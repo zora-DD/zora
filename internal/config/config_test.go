@@ -41,6 +41,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if cfg.MultiAgentApprovalMode != "risky" || cfg.MultiAgentApprovalTimeout != time.Minute {
 		t.Fatalf("unexpected multi-agent approval defaults: %+v", cfg)
 	}
+	if cfg.MCPEnabled || len(cfg.MCPServers) != 0 || cfg.MCPConnectTimeout != 10*time.Second || cfg.MCPCallTimeout != 20*time.Second || cfg.MCPMaxOutputRunes != 12000 {
+		t.Fatalf("unexpected MCP defaults: %+v", cfg)
+	}
 }
 
 func TestLoadPostgresStoreRequiresDSN(t *testing.T) {
@@ -111,6 +114,28 @@ func TestLoadMultiAgentOptIn(t *testing.T) {
 	}
 }
 
+func TestLoadMCPRequiresExplicitAllowlistAndIsolatesCoreCredentials(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ZORA_MCP_ENABLED", "true")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected missing MCP server config error")
+	}
+
+	t.Setenv("ZORA_MCP_SERVERS_JSON", `[{"name":"files","command":"./bin/zora-mcp-files","allowed_tools":["list_files","read_text_file"],"pass_env":["PATH","ZORA_MCP_FILES_ROOT"]}]`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.MCPEnabled || len(cfg.MCPServers) != 1 || cfg.MCPServers[0].Name != "files" {
+		t.Fatalf("unexpected MCP config: %+v", cfg)
+	}
+
+	t.Setenv("ZORA_MCP_SERVERS_JSON", `[{"name":"files","command":"./bin/zora-mcp-files","allowed_tools":["list_files"],"pass_env":["ZORA_API_KEY"]}]`)
+	if _, err := Load(); err == nil {
+		t.Fatal("expected Zora core credential inheritance error")
+	}
+}
+
 func clearEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
@@ -126,6 +151,7 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_MEMORY_AUTO_CAPTURE", "ZORA_MEMORY_MAX_CANDIDATES",
 		"ZORA_MEMORY_RECALL_ENABLED", "ZORA_MEMORY_RECALL_LIMIT", "ZORA_MEMORY_RECALL_MIN_SCORE",
 		"ZORA_SUMMARY_ENABLED", "ZORA_SUMMARY_TRIGGER_MESSAGES", "ZORA_SUMMARY_KEEP_RECENT", "ZORA_SUMMARY_MAX_RUNES",
+		"ZORA_MCP_ENABLED", "ZORA_MCP_SERVERS_JSON", "ZORA_MCP_CONNECT_TIMEOUT", "ZORA_MCP_CALL_TIMEOUT", "ZORA_MCP_MAX_OUTPUT_RUNES",
 	} {
 		t.Setenv(key, "")
 	}

@@ -80,7 +80,7 @@ func Build() ([]tool.BaseTool, error) {
 		"介绍当前 Zora 项目的已实现能力与下一个里程碑。",
 		func(_ context.Context, _ *projectStatusInput) (*projectStatusOutput, error) {
 			return &projectStatusOutput{
-				Version: "0.4.0-dev",
+				Version: "0.5.0-dev",
 				Available: []string{
 					"流式对话", "持久化会话", "Eino ReAct 循环",
 					"只读工具", "执行事件审计", "TXT/Markdown 知识库摄取",
@@ -95,8 +95,9 @@ func Build() ([]tool.BaseTool, error) {
 					"多 Agent 交接/并行预算、超时、重试和取消",
 					"父子 Run、人工审批与 Web 恢复执行",
 					"单 Agent / 多 Agent 质量、调用成本代理和耗时对照门禁",
+					"官方 MCP Go SDK 客户端、只读文件连接器与最小环境隔离",
 				},
-				NextMilestone: "V0.5 MCP 办公连接器、草稿预览与写操作审计",
+				NextMilestone: "V0.5 邮件/日历只读连接器、草稿预览与写操作审计",
 			}, nil
 		},
 	)

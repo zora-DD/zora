@@ -1,4 +1,4 @@
-.PHONY: run run-postgres postgres-up postgres-down test-postgres eval-rag eval-memory eval-agents test fmt vet check
+.PHONY: run run-postgres build-mcp-files postgres-up postgres-down test-postgres eval-rag eval-memory eval-agents test fmt vet check
 
 run:
 	go run ./cmd/zora
@@ -7,6 +7,10 @@ run-postgres:
 	ZORA_STORE_PROVIDER=postgres \
 	ZORA_POSTGRES_DSN='postgres://zora:zora@localhost:54328/zora?sslmode=disable' \
 	go run ./cmd/zora
+
+build-mcp-files:
+	mkdir -p ./bin
+	go build -o ./bin/zora-mcp-files ./cmd/zora-mcp-files
 
 postgres-up:
 	docker compose up -d postgres

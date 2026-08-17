@@ -46,6 +46,18 @@ func TestMockRuntimeExecutesToolThroughEino(t *testing.T) {
 	}
 }
 
+func TestFormatMCPResultProducesReadableChineseOutput(t *testing.T) {
+	t.Parallel()
+	listed := formatMCPResult("mcp_files_list_files", `{"directory":".","entries":[{"path":"周报.md","is_dir":false},{"path":"docs","is_dir":true}],"truncated":false}`)
+	if !strings.Contains(listed, "[文件] 周报.md") || !strings.Contains(listed, "[目录] docs") {
+		t.Fatalf("unexpected list output: %q", listed)
+	}
+	read := formatMCPResult("mcp_files_read_text_file", `{"path":"周报.md","content":"本周完成 MCP 接入","truncated":true}`)
+	if !strings.Contains(read, "本周完成 MCP 接入") || !strings.Contains(read, "已按字符上限截断") {
+		t.Fatalf("unexpected read output: %q", read)
+	}
+}
+
 func TestMultiAgentRoutesCompositeDocumentWritingTask(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -155,6 +167,36 @@ func TestMultiAgentIssuesIndependentTasksInParallel(t *testing.T) {
 	}
 }
 
+func TestMultiAgentRoutesMCPFileRequestToDocumentAgent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	runtime, err := NewMultiAgentWithModel(ctx, config.Config{
+		Provider: "mock", Model: "zora-mock", Instruction: "请使用中文回答。",
+		RequestTimeout: time.Second, MaxIterations: 8,
+	}, SpecialistToolset{Document: []tool.BaseTool{staticMCPFileTool{}}}, newMockModel())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handoffs []string
+	answer, err := runtime.Execute(ctx, []*schema.Message{
+		schema.UserMessage("读取文件 `项目周报.md`"),
+	}, func(event Event) error {
+		if event.Type == "agent_handoff_started" {
+			handoffs = append(handoffs, event.ToolName)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(handoffs) != 1 || handoffs[0] != DocumentAgentName {
+		t.Fatalf("handoffs = %v", handoffs)
+	}
+	if !strings.Contains(answer, "本周完成 MCP 接入") || !strings.Contains(answer, "项目周报.md") {
+		t.Fatalf("unexpected MCP document answer: %q", answer)
+	}
+}
+
 type staticKnowledgeTool struct{}
 
 func (staticKnowledgeTool) Info(context.Context) (*schema.ToolInfo, error) {
@@ -169,6 +211,21 @@ func (staticKnowledgeTool) Info(context.Context) (*schema.ToolInfo, error) {
 
 func (staticKnowledgeTool) InvokableRun(context.Context, string, ...tool.Option) (string, error) {
 	return `{"results":[{"document_name":"项目发布计划.md","ordinal":0,"content":"项目计划于 2026 年 9 月 18 日正式发布，上线前需完成灰度验证。"}]}`, nil
+}
+
+type staticMCPFileTool struct{}
+
+func (staticMCPFileTool) Info(context.Context) (*schema.ToolInfo, error) {
+	return &schema.ToolInfo{
+		Name: "mcp_files_read_text_file", Desc: "读取测试办公文件。",
+		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
+			"path": {Type: schema.String, Required: true},
+		}),
+	}, nil
+}
+
+func (staticMCPFileTool) InvokableRun(context.Context, string, ...tool.Option) (string, error) {
+	return `{"path":"项目周报.md","content":"本周完成 MCP 接入。","truncated":false}`, nil
 }
 
 func containsString(values []string, expected string) bool {

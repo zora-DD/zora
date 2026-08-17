@@ -33,6 +33,8 @@ type Server struct {
 	knowledge      *knowledge.Service
 	memory         *memory.Service
 	approval       *approval.Service
+	mcpEnabled     bool
+	mcpToolCount   int
 	logger         *slog.Logger
 	requestTimeout time.Duration
 }
@@ -41,6 +43,14 @@ type Option func(*Server)
 
 func WithApprovalService(service *approval.Service) Option {
 	return func(server *Server) { server.approval = service }
+}
+
+// WithMCPInfo 只向展示层暴露启用状态和已通过门禁的工具数，不泄露命令、参数或环境变量。
+func WithMCPInfo(enabled bool, toolCount int) Option {
+	return func(server *Server) {
+		server.mcpEnabled = enabled
+		server.mcpToolCount = toolCount
+	}
 }
 
 func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryService *memory.Service, logger *slog.Logger, requestTimeout time.Duration, options ...Option) (http.Handler, error) {
@@ -112,11 +122,14 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.chat.ApprovalEnabled() {
 		capabilities = append(capabilities, "human-approval")
 	}
+	if s.mcpEnabled {
+		capabilities = append(capabilities, "mcp-client", "mcp-readonly-tools")
+	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.4.0-dev",
+		"name": "Zora", "version": "0.5.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
 		"human_approval":       s.chat.ApprovalEnabled(),
@@ -125,6 +138,9 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"memory_auto_capture":  s.memory.AutoCaptureEnabled(),
 		"memory_recall":        s.chat.MemoryRecallEnabled(),
 		"conversation_summary": s.chat.SummaryEnabled(),
+		"mcp_enabled":          s.mcpEnabled,
+		"mcp_tool_count":       s.mcpToolCount,
+		"tool_count":           4 + s.mcpToolCount,
 		"capabilities":         capabilities,
 	})
 }

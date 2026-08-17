@@ -2,6 +2,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -14,6 +15,15 @@ const defaultInstruction = `你是 Zora，一个可靠、简洁的中文 AI 助�
 优先直接解决用户的问题。需要精确计算或当前时间时必须使用工具，不要猜测工具结果。
 涉及用户上传的资料或私有知识时，优先使用 knowledge_search，并在回答中标注文档名和片段编号。
 工具失败时要如实说明。不要声称已经执行未执行的操作。`
+
+// MCPServerConfig 描述一个独立的 MCP stdio 子进程。命令和参数分开保存，启动时不会经过 Shell。
+type MCPServerConfig struct {
+	Name         string   `json:"name"`
+	Command      string   `json:"command"`
+	Args         []string `json:"args"`
+	AllowedTools []string `json:"allowed_tools"`
+	PassEnv      []string `json:"pass_env"`
+}
 
 // Config 汇总服务启动所需的全部配置，避免业务代码直接读取环境变量。
 type Config struct {
@@ -55,6 +65,12 @@ type Config struct {
 	SummaryTriggerMessages int  // 尚未摘要的消息达到该数量后触发增量摘要。
 	SummaryKeepRecent      int  // 始终保留给模型的最近原始消息数量。
 	SummaryMaxRunes        int  // 单份摘要允许的最大 Unicode 字符数。
+
+	MCPEnabled        bool              // 是否连接外部 MCP Server；默认关闭，避免隐式启动子进程。
+	MCPServers        []MCPServerConfig // MCP Server 与工具白名单；允许配置多个相互隔离的连接器。
+	MCPConnectTimeout time.Duration     // 单个 MCP Server 启动、握手和工具发现的超时。
+	MCPCallTimeout    time.Duration     // 单次 MCP 工具调用的独立超时。
+	MCPMaxOutputRunes int               // 单次 MCP 结果注入模型的最大 Unicode 字符数。
 }
 
 // Load 在启动阶段完成配置校验，让错误尽早暴露，而不是运行到模型调用时才失败。
@@ -154,6 +170,29 @@ func Load() (Config, error) {
 	if err != nil || summaryMaxRunes < 500 || summaryMaxRunes > 20_000 {
 		return Config{}, fmt.Errorf("ZORA_SUMMARY_MAX_RUNES 必须在 500 到 20000 之间")
 	}
+	mcpEnabled, err := strconv.ParseBool(env("ZORA_MCP_ENABLED", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_MCP_ENABLED 必须是 true 或 false")
+	}
+	mcpServers, err := parseMCPServers(os.Getenv("ZORA_MCP_SERVERS_JSON"))
+	if err != nil {
+		return Config{}, err
+	}
+	if mcpEnabled && len(mcpServers) == 0 {
+		return Config{}, fmt.Errorf("启用 MCP 时必须通过 ZORA_MCP_SERVERS_JSON 配置至少一个 Server")
+	}
+	mcpConnectTimeout, err := time.ParseDuration(env("ZORA_MCP_CONNECT_TIMEOUT", "10s"))
+	if err != nil || mcpConnectTimeout <= 0 {
+		return Config{}, fmt.Errorf("ZORA_MCP_CONNECT_TIMEOUT 必须是大于 0 的时间长度，例如 10s")
+	}
+	mcpCallTimeout, err := time.ParseDuration(env("ZORA_MCP_CALL_TIMEOUT", "20s"))
+	if err != nil || mcpCallTimeout <= 0 {
+		return Config{}, fmt.Errorf("ZORA_MCP_CALL_TIMEOUT 必须是大于 0 的时间长度，例如 20s")
+	}
+	mcpMaxOutputRunes, err := positiveInt("ZORA_MCP_MAX_OUTPUT_RUNES", "12000")
+	if err != nil || mcpMaxOutputRunes < 1000 || mcpMaxOutputRunes > 100_000 {
+		return Config{}, fmt.Errorf("ZORA_MCP_MAX_OUTPUT_RUNES 必须在 1000 到 100000 之间")
+	}
 
 	cfg := Config{
 		Addr:                        env("ZORA_ADDR", ":8088"),
@@ -194,6 +233,12 @@ func Load() (Config, error) {
 		SummaryTriggerMessages: summaryTriggerMessages,
 		SummaryKeepRecent:      summaryKeepRecent,
 		SummaryMaxRunes:        summaryMaxRunes,
+
+		MCPEnabled:        mcpEnabled,
+		MCPServers:        mcpServers,
+		MCPConnectTimeout: mcpConnectTimeout,
+		MCPCallTimeout:    mcpCallTimeout,
+		MCPMaxOutputRunes: mcpMaxOutputRunes,
 	}
 
 	switch cfg.StoreProvider {
@@ -236,6 +281,74 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseMCPServers(raw string) ([]MCPServerConfig, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var servers []MCPServerConfig
+	if err := json.Unmarshal([]byte(raw), &servers); err != nil {
+		return nil, fmt.Errorf("ZORA_MCP_SERVERS_JSON 必须是合法的 JSON 数组：%w", err)
+	}
+	seenServers := make(map[string]struct{}, len(servers))
+	for index := range servers {
+		server := &servers[index]
+		server.Name = strings.TrimSpace(server.Name)
+		server.Command = strings.TrimSpace(server.Command)
+		if server.Name == "" || server.Command == "" {
+			return nil, fmt.Errorf("第 %d 个 MCP Server 必须配置非空的 name 和 command", index+1)
+		}
+		if _, exists := seenServers[server.Name]; exists {
+			return nil, fmt.Errorf("MCP Server 名称不能重复：%q", server.Name)
+		}
+		seenServers[server.Name] = struct{}{}
+		if len(server.AllowedTools) == 0 {
+			return nil, fmt.Errorf("MCP Server %q 必须显式配置 allowed_tools，不能自动信任远端工具", server.Name)
+		}
+		seenTools := make(map[string]struct{}, len(server.AllowedTools))
+		for toolIndex := range server.AllowedTools {
+			server.AllowedTools[toolIndex] = strings.TrimSpace(server.AllowedTools[toolIndex])
+			name := server.AllowedTools[toolIndex]
+			if name == "" {
+				return nil, fmt.Errorf("MCP Server %q 的 allowed_tools 不能包含空名称", server.Name)
+			}
+			if _, exists := seenTools[name]; exists {
+				return nil, fmt.Errorf("MCP Server %q 的工具白名单存在重复项：%q", server.Name, name)
+			}
+			seenTools[name] = struct{}{}
+		}
+		seenEnv := make(map[string]struct{}, len(server.PassEnv))
+		for envIndex := range server.PassEnv {
+			server.PassEnv[envIndex] = strings.TrimSpace(server.PassEnv[envIndex])
+			name := server.PassEnv[envIndex]
+			if !validEnvironmentName(name) {
+				return nil, fmt.Errorf("MCP Server %q 的 pass_env 包含非法环境变量名：%q", server.Name, name)
+			}
+			if _, exists := seenEnv[name]; exists {
+				return nil, fmt.Errorf("MCP Server %q 的 pass_env 存在重复项：%q", server.Name, name)
+			}
+			seenEnv[name] = struct{}{}
+			switch name {
+			case "ZORA_API_KEY", "ZORA_EMBEDDING_API_KEY", "ZORA_POSTGRES_DSN":
+				return nil, fmt.Errorf("MCP Server %q 不允许继承 Zora 核心凭据：%s", server.Name, name)
+			}
+		}
+	}
+	return servers, nil
+}
+
+func validEnvironmentName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, char := range value {
+		if (char >= 'A' && char <= 'Z') || char == '_' || (index > 0 && char >= '0' && char <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func positiveInt(key, fallback string) (int, error) {

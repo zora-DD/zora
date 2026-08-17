@@ -4,7 +4,7 @@
 
 ## 1. 边界
 
-Zora 将系统划分为十一个边界：
+Zora 将系统划分为十三个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
@@ -17,6 +17,8 @@ Zora 将系统划分为十一个边界：
 9. `agentseval`：多 Agent 路由准确率、意外专家调用、答案完成和质量门禁。
 10. `store`：对话、知识库、长期记忆与摘要的持久化边界，由 SQLite 或 PostgreSQL 实现。
 11. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
+12. `mcpbridge`：官方 MCP Client、stdio 生命周期、工具发现/白名单和 Eino 适配。
+13. `mcpfiles`：独立文件连接器的授权目录、路径校验和只读工具实现。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -164,7 +166,7 @@ SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_
 ```text
 Supervisor
 ├── Research Agent  → current_time / calculator / project_status
-├── Document Agent  → knowledge_search
+├── Document Agent  → knowledge_search / MCP 文件只读工具（启用时）
 └── Writer Agent    → 无底层工具，只消费任务与证据
 ```
 
@@ -186,3 +188,22 @@ agent_handoff_started(target, request)
 高影响请求可由 `off/risky/all` 策略触发 `approval_requests`。Chat 发出 `approval_required` 后等待 Web 通过独立 HTTP API 提交决定；approved 恢复同一 SSE，rejected/expired 结束根 Run。当前等待通道在进程内，审批记录本身在 SQLite/PostgreSQL 持久化。
 
 Web 将交接事件显示为带 `child_run_id` 的专业 Agent Trace，并显示审批卡片。`make eval-agents` 在隔离 SQLite 中完整经过 Chat、Eino AgentTool 和 RunEvent，当前 7 题得到路由准确率 1、意外专家调用率 0、答案完成率 1；单 Agent Control 质量 0.785714，多 Agent Treatment 质量 1，质量增益 0.214286，调用次数代理比 2。真实模型仍需采集 Token Usage 并扩充业务样本。
+
+## 9. V0.5 MCP 办公连接器架构
+
+第一阶段只实现可验证的文件读取闭环：
+
+```text
+Zora 主进程
+└── mcpbridge.Manager
+    └── CommandTransport（独立最小环境）
+        └── zora-mcp-files 子进程
+            ├── list_files
+            └── read_text_file
+```
+
+启动时，`mcpbridge` 按配置逐个启动 stdio Server，执行 MCP 握手和分页工具发现。一个工具必须同时出现在部署者提供的 `allowed_tools` 中，并由 Server 声明 `readOnlyHint=true`；之后才会以 `mcp_{server}_{tool}` 名称进入 Eino。主进程不经过 Shell，子进程也不默认继承环境；模型 Key、Embedding Key 与数据库 DSN 不能透传。
+
+文件连接器在独立进程中固定授权根目录，每次请求重新解析实际路径。绝对路径、父目录逃逸、隐藏路径和逃逸符号链接都会被拒绝；只读取普通 UTF-8 文本。MCP ToolCall 仍通过既有 Runtime，因此无需旁路即可得到 SSE Trace 和持久化 RunEvent。
+
+邮件和日历将各自作为独立 MCP Server，使用各自最小 OAuth Scope。未来写操作不能直接复用只读适配器：必须先生成草稿并持久化参数摘要，再经人工决定和幂等任务执行，避免“模型产生 ToolCall”直接等于外部副作用。

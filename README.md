@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.4 Multi-Agent**。V0.1 Agent Core 已完成，V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.3 已交付可追溯、可由用户控制、可通过 A/B 数据验证收益的长期记忆；V0.4 已完成 Supervisor、专业 Agent、并行与执行保险丝、父子 Run、人工审批和单/多 Agent 对照评测。
+当前版本：**V0.5 Office Agent（第一阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已接入官方 MCP Go SDK，并交付受目录约束的只读文件连接器。邮件/日历、草稿预览和写操作审批仍在后续阶段。
 
 ## 当前能力
 
@@ -13,7 +13,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 流式对话 | 已完成 | SSE 增量回复、停止生成、超时取消 |
 | ReAct Agent | 已完成 | Eino ChatModelAgent、工具循环、最大迭代 |
 | 模型接入 | 已完成 | 本地 Mock、OpenAI-compatible、通义千问 |
-| 工具系统 | 已完成 | 时间、计算器、项目状态、知识检索四个只读工具 |
+| 工具系统 | 已完成 | 四个内置只读工具；MCP 工具通过 Server 名称空间与本地白名单动态追加 |
 | 对话管理 | 已完成 | 创建、列表、自动标题、重命名、删除 |
 | 持久化 | 已完成 | SQLite 或 PostgreSQL 保存 Conversation、Message、AgentRun 和 RunEvent |
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
@@ -30,7 +30,9 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 多 Agent 路由与协作 | 已完成 | 可选 Supervisor、Research/Document/Writer Agent、上下文隔离、串行依赖与并行独立任务 |
 | 多 Agent 生产治理 | 已完成 | 按根 Run 隔离的交接/并行预算、专家超时与有限重试、取消传播、父子 Run 和人工审批 |
 | 单/多 Agent 对照评测 | 已完成 | 7 题真实 Chat/RunEvent 链路，对比答案质量、调用次数代理和延迟比例 |
-| 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
+| MCP Client | 已完成 | 官方 Go SDK v1.7.0、stdio 子进程、工具发现、Eino 适配、超时/输出上限与生命周期关闭 |
+| 文件办公连接器 | 已完成 | 目录沙箱、只读列表/UTF-8 读取、隐藏路径/越界/符号链接逃逸防护 |
+| 邮件/日历与写操作 | V0.5 后续 | 只读查询、草稿预览、写操作审批和异步恢复尚未实现 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
 
@@ -52,6 +54,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **专家路由与收益可回归**：固定 7 题覆盖单专家、串行依赖、并行任务、直接回答和硬负例；同题运行单 Agent Control 与多 Agent Treatment，门禁质量增益、调用次数代理和延迟比例。
 - **多 Agent 有执行保险丝**：交接次数、并行度、专家超时和重试都按根 Run 隔离；专业 Agent 另存子 Run，失败和取消有明确终态。
 - **高影响请求先审批**：审批记录持久化，SSE 在 `approval_required` 后等待 Web 决策，通过后恢复原 Run，拒绝或超时进入明确终态。
+- **MCP 不是无边界插件系统**：仅连接配置中的 stdio Server；只有同时命中本地 `allowed_tools` 且声明 `readOnlyHint` 的工具才能注册，公开名称增加 Server 前缀。
+- **连接器凭据与主进程隔离**：MCP 子进程默认不继承任何环境变量，只透传 `pass_env`；模型 Key、Embedding Key 和数据库 DSN 被配置层显式拒绝。
 - **明确的终态语义**：根 Run 最终进入 completed、failed、cancelled 或 rejected。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -128,6 +132,33 @@ make eval-agents
 帮我计算 (128 + 72) * 3.5
 介绍一下这个项目现在有哪些功能
 ```
+
+### 启用 MCP 只读文件连接器
+
+先构建随项目提供的文件 MCP Server：
+
+```bash
+make build-mcp-files
+```
+
+然后只授权一个专门的办公资料目录。示例中的路径必须替换为本机绝对路径：
+
+```bash
+ZORA_MCP_ENABLED=true \
+ZORA_MCP_FILES_ROOT=/absolute/path/to/office-files \
+ZORA_MCP_SERVERS_JSON='[{"name":"files","command":"./bin/zora-mcp-files","args":[],"allowed_tools":["list_files","read_text_file"],"pass_env":["PATH","TMPDIR","ZORA_MCP_FILES_ROOT"]}]' \
+make run
+```
+
+本地 Mock 和真实模型都走同一个 MCP Client → stdio → MCP Server → Eino Tool 链路。可以询问：
+
+```text
+列出文件
+读取文件 `项目周报.md`
+读取文件 `docs/发布计划.md`
+```
+
+工具实际公开为 `mcp_files_list_files` 和 `mcp_files_read_text_file`，调用与结果继续记录为现有 `tool_call` / `tool_result` RunEvent。文件 Server 不跟随符号链接、拒绝绝对路径和 `..` 越界、隐藏路径、非 UTF-8 内容及超过 2 MiB 的文件。不要把用户主目录或包含密钥的源码目录作为授权根目录。
 
 点击侧边栏的“知识库”可上传 UTF-8 编码的 `.txt` / `.md` / `.markdown` 文件（单文件最大 5 MiB）。上传后可以询问：
 
@@ -242,6 +273,12 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_SUMMARY_TRIGGER_MESSAGES` | `20` | 未摘要消息触发阈值，范围 4–500 |
 | `ZORA_SUMMARY_KEEP_RECENT` | `12` | 始终保留原文的最近消息数，至少 2 且小于触发阈值 |
 | `ZORA_SUMMARY_MAX_RUNES` | `4000` | 单份摘要最大 Unicode 字符数，范围 500–20000 |
+| `ZORA_MCP_ENABLED` | `false` | 是否启动并连接配置的 MCP stdio Server |
+| `ZORA_MCP_SERVERS_JSON` | 空 | Server JSON 数组；每项含 name/command/args/allowed_tools/pass_env |
+| `ZORA_MCP_CONNECT_TIMEOUT` | `10s` | 单个 Server 启动、握手和工具发现超时 |
+| `ZORA_MCP_CALL_TIMEOUT` | `20s` | 单次 MCP 工具调用超时 |
+| `ZORA_MCP_MAX_OUTPUT_RUNES` | `12000` | MCP 结果注入模型的字符上限，范围 1000–100000 |
+| `ZORA_MCP_FILES_ROOT` | 空 | 内置文件 MCP Server 的授权根目录；由 `pass_env` 单独透传 |
 
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
@@ -366,6 +403,7 @@ cmd/zora/                  服务入口、依赖组装和优雅关闭
 cmd/zora-eval/             隔离运行固定 RAG 检索与答案评测
 cmd/zora-memory-eval/      隔离运行长期记忆有/无 A/B 评测
 cmd/zora-agent-eval/       隔离运行多 Agent 路由与协作评测
+cmd/zora-mcp-files/        只读文件 MCP stdio Server 入口
 evals/                     可版本化的 RAG/Memory/Multi-Agent 数据、锚点与阈值
 internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
@@ -378,6 +416,8 @@ internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/rageval/          检索指标、答案引用/忠实度指标和门禁
 internal/memory/           Semantic/Episodic 模型、提取、Consolidation、联合召回和用户 CRUD
 internal/memoryeval/       长期记忆 Control/Treatment 指标、报告和质量门禁
+internal/mcpbridge/        官方 MCP Client、工具发现、白名单和 Eino Tool 适配
+internal/mcpfiles/         文件目录沙箱、列表/读取工具和安全边界
 internal/summary/          增量摘要策略、Model/Rule 摘要器和持久化契约
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
@@ -436,6 +476,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - SQLite 摘要 Upsert/级联删除、PostgreSQL Schema，以及 HTTP 摘要查询和 Mock 端到端回忆。
 - 长期记忆 A/B 数据集校验、Control/Treatment 指标、错误召回与答案污染反例、RunEvent 召回 ID 解析和完整 CLI 基线。
 - Supervisor/AgentTool 串行与并行交接、执行预算/超时/重试/取消、子 Run、人工审批等待与恢复，以及 7 题单/多 Agent 对照 CLI 基线。
+- MCP in-memory 端到端握手、工具发现/调用、白名单缺失失败、环境变量隔离，以及文件遍历/隐藏路径/符号链接逃逸防护。
 
 ## 文档导航
 
@@ -472,7 +513,7 @@ V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
-- V0.5：MCP 办公助手
+- V0.5：MCP 办公助手——官方 SDK 和只读文件连接器已完成；邮件/日历、草稿与写操作审批继续实现
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
 

@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.4 Multi-Agent（执行治理、父子 Run、审批与对照评测）
+> 文档基线：V0.5 Office Agent 第一阶段（官方 MCP Client 与只读文件连接器）
 > 最后更新：2026-08-17
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、Research/Document/Writer Agent、权限和上下文隔离、串行/并行结构化交接、执行保险丝、父子 Run、Human-in-the-loop，以及固定单/多 Agent 对照门禁。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第一阶段已经以官方 MCP Go SDK 接入受目录约束的只读文件连接器，并建立工具/环境白名单；邮件、日历和写操作状态机尚未实现。
 
 ## 2. 背景与问题
 
@@ -113,7 +113,7 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 流式交互 | 已实现 | SSE 增量文本、工具轨迹、停止生成 |
 | Agent Runtime | 已实现 | Eino ReAct、最大迭代、上下文传递 |
 | 模型接入 | 已实现 | Mock 与 OpenAI-compatible Provider |
-| 工具系统 | 已实现 | 显式 allowlist、Schema 推断、四个只读工具 |
+| 工具系统 | 已实现 | 四个内置只读工具；MCP 工具使用 Server 名称空间、显式 allowlist 和 Schema 转换 |
 | 执行审计 | 已实现 | AgentRun 与 append-only RunEvent |
 | 本地持久化 | 已实现 | SQLite、WAL、事务与级联删除 |
 | 知识库本地 MVP | 已实现 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
@@ -128,7 +128,9 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 多 Agent 路由与协作 | 已实现 | Supervisor、三个专业 Agent、上下文/工具隔离、串行依赖、并行独立任务和协作审计 |
 | 多 Agent 生产治理 | 已实现 | 执行预算、并行限流、超时、有限重试、取消、父子 Run 和审批等待/恢复 |
 | 多 Agent 对照评测 | 已实现 | 路由闭环及单/多 Agent 的质量、调用次数代理、耗时比例门禁 |
-| 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
+| MCP 办公底座 | 已实现 | 官方 Go SDK、stdio 生命周期、只读双门禁、子进程环境隔离和 RunEvent 审计 |
+| 文件连接器 | 已实现 | 目录沙箱、列表和 UTF-8 读取；拒绝隐藏路径、越界与符号链接逃逸 |
+| 邮件/日历/写操作 | V0.5 进行中 | OAuth 只读查询、草稿、持久化审批和幂等执行仍待实现 |
 
 ## 6. 业务模型
 
@@ -142,6 +144,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | AgentTaskRun | 根 Run 下的一次专业 Agent 交接 | running → completed/failed/cancelled；保存任务与输出摘要 |
 | RunEvent | Run 内部发生的可观察事实 | append-only，随 AgentRun 删除 |
 | Tool | Agent 可选择的受控能力 | 启动时注册，当前均为只读 |
+| MCPServer | 独立运行的办公连接器进程 | 启动握手 → 工具发现/调用 → 应用退出时关闭 |
+| MCPToolAdapter | MCP Tool 到 Eino Tool 的命名空间与 Schema 适配 | 启动时创建，只允许白名单且声明只读的工具 |
 | Specialist Agent | Research/Document/Writer 专业执行单元 | 启动时组装，通过 AgentTool 接收 request，执行后返回交付物 |
 | Agent Handoff | Supervisor 与专业 Agent 的一次结构化交接 | started → agent output → completed；关联 AgentTaskRun 与顶层 RunEvent |
 | ApprovalRequest | 高影响请求的人工审批记录 | pending → approved/rejected/expired；决定可恢复等待中的 Run |
@@ -560,6 +564,8 @@ Memory 评测不是直接调用 `Recall` 后检查返回数量。Control 和 Tre
 
 V0.4 没有让多个角色共享全部历史自由对话，而是把专业 Agent 包装为 AgentTool：Supervisor 只交付最小 request，工具能力按职责隔离，子 Agent 输出作为审计事实但不直接进入用户最终答案。受控 AgentTool 在每个根 Run 上限制交接、并行、超时和重试；子 Run 与审批状态分别持久化。`make eval-agents` 通过完整 Chat/Eino/RunEvent 链路校验交接顺序和闭环；当前 7 题路由准确率 1、意外专家调用率 0、答案完成率 1。相同问题的单 Agent Control 质量 0.785714，多 Agent Treatment 为 1，增益 0.214286，调用次数代理比 2。这是可讨论的上下文工程、最小权限、执行治理与评估驱动设计；Mock 小样本不能替代真实 Token Usage 和人工业务验收。
 
+V0.5 第一阶段把“办公能力”落成独立 MCP 进程，而不是把文件系统函数直接塞进 Agent 主进程。Zora 只负责协议、工具门禁、超时、输出上限和审计；文件 Server 自己负责目录授权与内容校验。连接器新增或替换时不改 Chat/Runtime/HTTP 契约，模型凭据也不会默认进入连接器环境。这个边界既能说明 MCP 协议落地，也保留了后续邮件、日历各自使用最小 OAuth Scope 和独立凭据生命周期的空间。
+
 ## 10. 当前限制与风险
 
 | 限制/风险 | 当前影响 | 后续处理 |
@@ -580,6 +586,9 @@ V0.4 没有让多个角色共享全部历史自由对话，而是把专业 Agent
 | Multi-Agent 固定集仅 7 题 | 能验证串/并行、路由、审计和确定性质量增益，不能代表复杂业务 | 扩充对抗提示、失败恢复和真实模型人工集 |
 | 子 Run 暂不支持恢复 | 可独立查询状态和耗时，但进程重启后不能从单个子任务继续 | 引入 Checkpoint、租约任务队列和幂等 Resume |
 | 审批等待器在进程内 | 决定已持久化，但重启会丢失等待中的 SSE 恢复通道 | V0.5 将审批与异步任务状态机结合 |
+| MCP Server 属于受信部署组件 | 白名单和只读声明不能证明第三方实现绝对无副作用 | 只部署审核过的连接器；文件 Server 再用 OS 目录权限和进程隔离限制影响面 |
+| 当前只有本地文件连接器 | 尚不能完成邮箱或日历办公任务 | 为邮件/日历建立独立 OAuth Client、最小 Scope 和集成测试账号 |
+| MCP 凭据尚无统一托管 | `pass_env` 已隔离 Zora 核心凭据，但专用连接器 Token 仍依赖部署平台 | 引入 Secret 引用/短期令牌，不在 JSON、日志、RunEvent 或模型上下文保存明文 |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
 | 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
 | 尚无 token/cost 指标 | 无法比较模型成本 | 从 ResponseMeta 采集 Usage |
@@ -624,6 +633,6 @@ V0.4 没有让多个角色共享全部历史自由对话，而是把专业 Agent
 2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
 3. **V0.3 Long-term Memory（主链路完成）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入、会话增量摘要和 A/B 门禁已实现。
 4. **V0.4 Multi-Agent（已完成）**：Supervisor、三个专业 Agent、隔离交接、串/并行执行治理、父子 Run、人工审批和单/多 Agent 对照门禁已实现。
-5. **V0.5 Office Agent**：MCP、办公连接器、审批、权限和审计。
+5. **V0.5 Office Agent（进行中）**：官方 MCP Client 和文件只读连接器已完成；继续实现邮件/日历、草稿预览、持久化写操作审批、最小 OAuth Scope 和完整审计。
 
 详细任务与验收条件见 [Roadmap](roadmap.md)。

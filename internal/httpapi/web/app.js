@@ -35,6 +35,7 @@ const elements = {
   runtimeModel: document.querySelector("#runtimeModel"),
   runtimeProvider: document.querySelector("#runtimeProvider"),
   statusDot: document.querySelector("#statusDot"),
+	toolBadge: document.querySelector("#toolBadge"),
   openKnowledge: document.querySelector("#openKnowledge"),
   closeKnowledge: document.querySelector("#closeKnowledge"),
   knowledgeDialog: document.querySelector("#knowledgeDialog"),
@@ -91,6 +92,7 @@ async function initialize() {
     state.multiAgent = Boolean(info.multi_agent);
     state.humanApproval = Boolean(info.human_approval);
     elements.runtimeProvider.textContent = `${info.provider} · ${info.version}${state.multiAgent ? " · 多 Agent" : ""}`;
+	elements.toolBadge.innerHTML = `<i></i> ${Number(info.tool_count || 4)} 个只读工具${info.mcp_enabled ? " · MCP" : ""}`;
     state.conversations = result.conversations || [];
     state.documents = knowledgeResult.documents || [];
     state.memories = memoryResult.memories || [];

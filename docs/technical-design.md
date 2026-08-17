@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.4 Multi-Agent（执行治理、父子 Run、审批与对照评测）
+> 适用版本：V0.5 Office Agent 第一阶段（官方 MCP Client 与只读文件连接器）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -10,6 +10,7 @@
 |---|---|---|
 | 语言 | Go | `go.mod` 指定 Go 1.26 |
 | Agent Runtime | `github.com/cloudwego/eino` | v0.9.14 |
+| MCP | `github.com/modelcontextprotocol/go-sdk` | v1.7.0，官方 SDK，MCP 2026-07-28 |
 | 模型适配 | `eino-ext/components/model/openai` | v0.1.13 |
 | 本地数据库 | `modernc.org/sqlite` | v1.56.0，纯 Go 驱动 |
 | 生产数据库 | `pgx/v5` + `pgvector-go` | pgx v5.9.2；pgvector-go v0.4.0 |
@@ -26,7 +27,8 @@ cmd/
 ├── zora/main.go               服务启动、组装、信号和关闭
 ├── zora-eval/main.go          固定 RAG 检索与答案评测命令
 ├── zora-memory-eval/main.go   长期记忆 Control/Treatment 评测命令
-└── zora-agent-eval/main.go    多 Agent 路由与协作评测命令
+├── zora-agent-eval/main.go    多 Agent 路由与协作评测命令
+└── zora-mcp-files/main.go     只读文件 MCP stdio Server
 
 evals/
 ├── knowledge.json             RAG 语料、问题、事实锚点和阈值
@@ -49,6 +51,8 @@ internal/
 ├── memory/                    Semantic/Episodic 模型、校验和 CRUD 用例
 ├── memoryeval/                长期记忆 Control/Treatment 指标与质量门禁
 ├── summary/                   会话增量摘要、Model/Rule 摘要器与 Store 契约
+├── mcpbridge/                 MCP Client、发现/白名单与 Eino Tool 适配
+├── mcpfiles/                  文件目录沙箱与只读 MCP Tools
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
 ```
@@ -66,6 +70,9 @@ flowchart TD
     Main --> Knowledge["knowledge"]
     Main --> Memory["memory"]
     Main --> Summary["summary"]
+    Main --> MCPBridge["mcpbridge"]
+    MCPBridge --> MCPServer["MCP stdio Server"]
+    MCPServer --> MCPFiles["mcpfiles"]
     MemoryEval["cmd/zora-memory-eval"] --> MemoryAB["memoryeval"]
     MemoryEval --> Chat
     MemoryEval --> Memory
@@ -314,7 +321,7 @@ AgentTool 外层由 `controlledAgentTool` 统一治理。`Runtime.Execute` 为�
 |---|---|---|
 | `zora_supervisor` | 三个 AgentTool | 读取主对话上下文，决定直接回答或交接，最终只输出一次答案 |
 | `research_agent` | `current_time`、`calculator`、`project_status` | 只接收 request，负责核验和分析 |
-| `document_agent` | `knowledge_search` | 只接收 request，必须返回带引用的文档证据 |
+| `document_agent` | `knowledge_search`；启用后追加 MCP 文件只读工具 | 只接收 request，负责知识库证据和授权办公文件读取 |
 | `writer_agent` | 无底层工具 | 只使用 request 中的任务和证据，不补造事实 |
 
 复合“根据文档写作”任务采用 `document_agent → writer_agent` 串行交接。Eino 会透传子 Agent 的流式事件；Runtime 只累计根 Agent 的文本为最终回答，子 Agent 文本统一转成单条 `agent_output`。这避免专家草稿和 Supervisor 定稿被重复拼接，同时保留调试证据。
@@ -1113,7 +1120,37 @@ flowchart LR
 
 ### 17.4 V0.5 Office Agent
 
-使用官方 MCP Go SDK 接入文件、邮件和日历。默认只读；写操作先生成草稿，必须经过用户确认后执行，并记录请求、审批人、参数摘要和最终结果。
+第一阶段已用官方 MCP Go SDK v1.7.0 打通一条可运行链路：
+
+```mermaid
+sequenceDiagram
+    participant Boot as Zora 启动流程
+    participant Client as mcpbridge
+    participant Child as MCP stdio 子进程
+    participant Agent as Eino Agent
+    participant Audit as RunEvent
+    Boot->>Client: 读取 servers JSON
+    Client->>Child: exec.Command（不经过 Shell）
+    Client->>Child: initialize + tools/list
+    Client->>Client: allowed_tools + readOnlyHint 双重门禁
+    Client-->>Agent: mcp_{server}_{tool} + JSON Schema
+    Agent->>Client: ToolCall(JSON arguments)
+    Client->>Child: tools/call（独立超时）
+    Child-->>Client: structuredContent / content
+    Client->>Client: 中文错误归一化 + 输出截断
+    Client-->>Agent: ToolResult
+    Agent-->>Audit: tool_call / tool_result
+```
+
+配置使用 `ZORA_MCP_SERVERS_JSON` 数组，每个 Server 包含 `name`、`command`、`args`、`allowed_tools` 和 `pass_env`。命令与参数分离并直接调用 `exec.Command`，不解析 Shell 字符。子进程的 `Env` 始终设置为非 nil，只能收到 `pass_env` 指定的值；配置层额外禁止透传 `ZORA_API_KEY`、`ZORA_EMBEDDING_API_KEY` 和 `ZORA_POSTGRES_DSN`。外部工具名转换为最长 64 字节的 ASCII 名称空间，长名称使用 SHA-256 短摘要保持稳定；多 Server 名称冲突会导致启动失败。
+
+工具发现支持 MCP 分页。Server 返回的 `inputSchema` 会序列化后转为 Eino 的 JSON Schema；MCP 业务错误作为中文 ToolResult 返回模型，允许 ReAct 修正参数，传输/协议错误则中断工具调用。每次调用默认 20 秒超时，结果默认最多 12,000 个 Unicode 字符；应用退出时逆序关闭 Session，SDK 随后关闭 stdin，并在子进程不退出时执行终止流程。
+
+内置 `zora-mcp-files` 提供 `list_files` 和 `read_text_file`。Server 启动时将授权根目录绝对化并解析符号链接；每次访问再次执行 `Clean → Join → EvalSymlinks → Rel`，拒绝绝对路径、父目录越界、隐藏路径和指向根目录外的链接。列表最多 500 项且不跟随符号链接；读取仅接受普通 UTF-8 文件，单文件最大 2 MiB，返回字符最多 50,000。根目录属于部署权限边界，推荐只挂载专门的办公资料目录。
+
+当前调用继续复用已有 `tool_call` / `tool_result` RunEvent，因此无需新增 MCP 专属数据库表。`GET /api/info` 只公开 `mcp_enabled`、`mcp_tool_count` 和总工具数，不返回命令、参数、根目录或环境变量。in-memory MCP 端到端测试覆盖握手、发现、Schema 适配和调用；文件测试覆盖隐藏路径、`..` 与符号链接逃逸。
+
+后续仍需接入邮件和日历的只读 OAuth 连接器，再设计“先生成不可执行草稿 → 用户确认 → 持久化异步任务 → 幂等写入”的状态机。当前多 Agent 的通用审批门禁不能直接视为办公写操作已安全落地。
 
 ## 18. 维护约定
 

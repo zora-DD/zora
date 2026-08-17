@@ -70,6 +70,9 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 		case "knowledge_search":
 			return schema.AssistantMessage(formatKnowledgeResult(last.Content), nil), nil
 		}
+		if strings.HasPrefix(last.ToolName, "mcp_") {
+			return schema.AssistantMessage(formatMCPResult(last.ToolName, last.Content), nil), nil
+		}
 		return schema.AssistantMessage(prefix+"："+last.Content, nil), nil
 	}
 
@@ -78,6 +81,18 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	switch {
 	case systemHasAgentRole(input, "writer"):
 		return schema.AssistantMessage(formatWriterDraft(query), nil), nil
+	case hasMCPListFilesIntent(lower) && toolNameWithSuffix(availableTools, "_list_files") != "":
+		return m.toolCall(toolNameWithSuffix(availableTools, "_list_files"), `{"path":".","recursive":false,"limit":100}`), nil
+	case hasMCPReadFileIntent(lower) && toolNameWithSuffix(availableTools, "_read_text_file") != "":
+		path := extractRequestedFilePath(query)
+		if path == "" {
+			return schema.AssistantMessage("请提供要读取的相对文件路径，例如：读取文件 `docs/周报.md`。", nil), nil
+		}
+		return m.toolCall(toolNameWithSuffix(availableTools, "_read_text_file"), fmt.Sprintf(`{"path":%q}`, path)), nil
+	case (hasMCPListFilesIntent(lower) || hasMCPReadFileIntent(lower)) && hasTool(availableTools, DocumentAgentName):
+		return m.toolCall(DocumentAgentName, fmt.Sprintf(`{"request":%q}`, query)), nil
+	case hasMCPListFilesIntent(lower) || hasMCPReadFileIntent(lower):
+		return schema.AssistantMessage("MCP 文件连接器尚未启用，请先完成连接器配置。", nil), nil
 	// “发布日期”等资料字段会包含“日期”。知识库意图必须优先于时间意图，
 	// 否则本地 Mock 会错误地把“查文档里的日期”理解成“查询当前日期”。
 	case hasDocumentRetrievalIntent(lower) && hasTool(availableTools, "knowledge_search"):
@@ -143,6 +158,90 @@ func hasDocumentRetrievalIntent(query string) bool {
 	return containsAny(query,
 		"知识库", "上传的文档", "上传文档", "我上传的", "根据文档", "文档中", "文档里",
 		"资料中", "资料里", "根据资料", "手册中", "手册里", "制度中", "制度里", "knowledge")
+}
+
+func hasMCPListFilesIntent(query string) bool {
+	return containsAny(query, "列出文件", "查看文件列表", "有哪些办公文件", "办公目录", "list files")
+}
+
+func hasMCPReadFileIntent(query string) bool {
+	return containsAny(query, "读取文件", "打开文件", "读取办公文件", "查看文件内容", "read file")
+}
+
+func extractRequestedFilePath(query string) string {
+	for _, delimiters := range [][2]string{{"`", "`"}, {"“", "”"}, {`"`, `"`}, {"'", "'"}} {
+		start := strings.Index(query, delimiters[0])
+		if start < 0 {
+			continue
+		}
+		remaining := query[start+len(delimiters[0]):]
+		end := strings.Index(remaining, delimiters[1])
+		if end >= 0 {
+			return strings.TrimSpace(remaining[:end])
+		}
+	}
+	for _, marker := range []string{"读取办公文件", "查看文件内容", "读取文件", "打开文件", "read file"} {
+		if index := strings.Index(strings.ToLower(query), marker); index >= 0 {
+			value := strings.TrimSpace(query[index+len(marker):])
+			return strings.Trim(strings.TrimSpace(value), "：:。？?!！")
+		}
+	}
+	return ""
+}
+
+func toolNameWithSuffix(tools []*schema.ToolInfo, suffix string) string {
+	for _, item := range tools {
+		if item != nil && strings.HasPrefix(item.Name, "mcp_") && strings.HasSuffix(item.Name, suffix) {
+			return item.Name
+		}
+	}
+	return ""
+}
+
+func formatMCPResult(toolName, content string) string {
+	if strings.HasSuffix(toolName, "_list_files") {
+		var payload struct {
+			Directory string `json:"directory"`
+			Entries   []struct {
+				Path  string `json:"path"`
+				IsDir bool   `json:"is_dir"`
+			} `json:"entries"`
+			Truncated bool `json:"truncated"`
+		}
+		if err := json.Unmarshal([]byte(content), &payload); err == nil {
+			var builder strings.Builder
+			fmt.Fprintf(&builder, "授权目录 `%s` 中的文件：", payload.Directory)
+			if len(payload.Entries) == 0 {
+				builder.WriteString("\n\n当前目录为空。")
+			}
+			for _, entry := range payload.Entries {
+				kind := "文件"
+				if entry.IsDir {
+					kind = "目录"
+				}
+				fmt.Fprintf(&builder, "\n\n- [%s] %s", kind, entry.Path)
+			}
+			if payload.Truncated {
+				builder.WriteString("\n\n结果已达到列表上限，请指定更具体的子目录。")
+			}
+			return builder.String()
+		}
+	}
+	if strings.HasSuffix(toolName, "_read_text_file") {
+		var payload struct {
+			Path      string `json:"path"`
+			Content   string `json:"content"`
+			Truncated bool   `json:"truncated"`
+		}
+		if err := json.Unmarshal([]byte(content), &payload); err == nil {
+			answer := fmt.Sprintf("文件 `%s` 的内容：\n\n%s", payload.Path, payload.Content)
+			if payload.Truncated {
+				answer += "\n\n[内容已按字符上限截断]"
+			}
+			return answer
+		}
+	}
+	return "MCP 办公工具返回：\n\n" + content
 }
 
 func hasWritingIntent(query string) bool {
