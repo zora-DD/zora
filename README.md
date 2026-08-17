@@ -24,7 +24,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 生产知识库剩余项 | V0.2 进行中 | 文档权限、版本、PDF、更强语义评测和真实数据验收 |
 | 长期记忆底座 | 已完成 | Semantic/Episodic Schema、重要性、来源、过期时间、SQLite/PostgreSQL 和用户 CRUD |
 | 自动记忆写入 | 已完成 | 真实模型结构化提取、本地规则提取、Memory Key 去重/冲突合并、人工修正保护和 Run 审计 |
-| 记忆召回 | V0.3 进行中 | 相关性/时效性/重要性排序、上下文注入、短期摘要和 A/B 评估 |
+| 记忆召回与注入 | 已完成 | 词项相关性 + 重要性 + 时效性联合评分、Top-K 安全上下文和 Run 审计 |
+| 记忆评估与摘要 | V0.3 进行中 | 短期历史摘要、有/无记忆 A/B 数据集和质量门禁 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
 
@@ -41,6 +42,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
 - **长期记忆不是消息向量库**：Memory 拥有独立类型、稳定 Key、来源、重要性和过期时间；候选只在回答成功后提取，同 Key 冲突执行合并，人工修正不会被自动覆盖。
+- **召回可解释、可关闭**：轻量词项相关性与重要性、时效性联合评分，RunEvent 只记录 ID 和分数组件；可通过环境变量独立关闭注入做 A/B。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -72,7 +74,7 @@ make run
 我以后希望你用中文回答。
 ```
 
-前两句话最终只保留一个“主要编程语言”记忆，值更新为 Java。当前记忆尚未注入后续模型上下文，因此“记住”和“回答时真正使用”是两个独立的可验收阶段。
+前两句话最终只保留一个“主要编程语言”记忆，值更新为 Java。继续询问“我的主要编程语言是什么？”，系统会按相关性、重要性和时效性召回该记忆并注入模型上下文，本地 Mock 会确定性回答 Java。
 
 可以尝试：
 
@@ -181,6 +183,9 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 相邻分块重叠字符数 |
 | `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 成功回答后是否自动提取并合并长期记忆 |
 | `ZORA_MEMORY_MAX_CANDIDATES` | `3` | 单轮最多候选数，范围 1–10 |
+| `ZORA_MEMORY_RECALL_ENABLED` | `true` | 是否在回答前召回并注入相关记忆，可独立关闭做 A/B |
+| `ZORA_MEMORY_RECALL_LIMIT` | `5` | 单轮最多注入的记忆数，范围 1–20 |
+| `ZORA_MEMORY_RECALL_MIN_SCORE` | `0.25` | 相关性、重要性、时效性联合分数门槛 |
 
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
@@ -232,7 +237,9 @@ sequenceDiagram
     UI->>API: POST message
     API->>Service: Send
     Service->>DB: 保存 user Message 和 running Run
-    Service->>ADK: 最近对话历史
+    Service->>DB: 查询有效长期记忆
+    Service->>Service: 相关性 + 重要性 + 时效性联合排序
+    Service->>ADK: 安全记忆上下文 + 最近对话历史
     ADK->>LLM: 消息 + Tool Schema
     alt 需要工具
         LLM-->>ADK: ToolCall
@@ -269,11 +276,12 @@ sequenceDiagram
 | `POST` | `/api/knowledge/search` | 执行向量 + BM25/RRF 混合检索 |
 | `GET` | `/api/memories` | 查询长期记忆，可按类型筛选并选择是否包含已过期项 |
 | `POST` | `/api/memories` | 手动创建 Semantic/Episodic 记忆 |
+| `POST` | `/api/memories/recall` | 调试记忆联合召回，返回总分及分数组件 |
 | `GET` | `/api/memories/{id}` | 查询单条长期记忆及来源 |
 | `PUT` | `/api/memories/{id}` | 完整更新内容、类型、重要性和过期时间 |
 | `DELETE` | `/api/memories/{id}` | 用户删除长期记忆 |
 
-SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；候选正文不会写进 SSE 或 RunEvent。
+SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量。候选正文和召回正文都不会复制进 SSE 或 RunEvent。
 
 完整请求、响应和事件契约见 [项目技术文档](docs/technical-design.md)。
 
@@ -290,7 +298,7 @@ internal/agentruntime/     Eino Runtime、模型适配和事件转换
 internal/agenttools/       只读工具和安全计算器
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/rageval/          检索指标、答案引用/忠实度指标和门禁
-internal/memory/           Semantic/Episodic 模型、提取、Consolidation、校验和用户 CRUD
+internal/memory/           Semantic/Episodic 模型、提取、Consolidation、联合召回和用户 CRUD
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
 internal/store/sqlite/     对话与知识库的 SQLite 实现
@@ -372,7 +380,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 
 - V0.1：Agent Core——已完成
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
-- V0.3：长期记忆——Schema、双存储、用户 CRUD、候选提取和 Consolidation 已完成；召回注入与评测进行中
+- V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入已完成；摘要与 A/B 评测进行中
 - V0.4：多 Agent
 - V0.5：MCP 办公助手
 

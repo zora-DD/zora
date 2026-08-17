@@ -56,11 +56,14 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	lower := strings.ToLower(query)
 	// 新版 Eino 会通过调用级 Option 注入工具，不能只读取 WithTools 保存的字段。
 	availableTools := model.GetCommonOptions(&model.Options{Tools: m.tools}, opts...).Tools
+	memoryFacts := recalledMemoryFacts(input)
 	switch {
 	// “发布日期”等资料字段会包含“日期”。知识库意图必须优先于时间意图，
 	// 否则本地 Mock 会错误地把“查文档里的日期”理解成“查询当前日期”。
 	case containsAny(lower, "知识库", "文档", "资料", "上传", "knowledge") && hasTool(availableTools, "knowledge_search"):
 		return m.toolCall("knowledge_search", fmt.Sprintf(`{"query":%q,"top_k":5}`, query)), nil
+	case hasMemoryQuestionIntent(lower) && len(memoryFacts) > 0:
+		return schema.AssistantMessage("根据长期记忆，我找到了这些相关信息：\n\n- "+strings.Join(memoryFacts, "\n- "), nil), nil
 	case containsAny(lower, "几点", "时间", "日期", "date", "time") && hasTool(availableTools, "current_time"):
 		return m.toolCall("current_time", `{"timezone":"Asia/Shanghai"}`), nil
 	case containsAny(lower, "计算", "算一下", "calculator", "calculate") && hasTool(availableTools, "calculator"):
@@ -78,6 +81,38 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 			nil,
 		), nil
 	}
+}
+
+func hasMemoryQuestionIntent(query string) bool {
+	return strings.ContainsAny(query, "?？") || containsAny(query, "记得", "了解我", "关于我", "总结一下我", "我的信息")
+}
+
+func recalledMemoryFacts(input []*schema.Message) []string {
+	for _, message := range input {
+		if message.Role != schema.System || !strings.HasPrefix(message.Content, "[ZORA_RECALLED_MEMORY]") {
+			continue
+		}
+		start := strings.Index(message.Content, "{")
+		if start < 0 {
+			return nil
+		}
+		var payload struct {
+			Memories []struct {
+				Content string `json:"content"`
+			} `json:"memories"`
+		}
+		if err := json.Unmarshal([]byte(message.Content[start:]), &payload); err != nil {
+			return nil
+		}
+		facts := make([]string, 0, len(payload.Memories))
+		for _, item := range payload.Memories {
+			if content := strings.TrimSpace(item.Content); content != "" {
+				facts = append(facts, content)
+			}
+		}
+		return facts
+	}
+	return nil
 }
 
 func formatKnowledgeResult(raw string) string {

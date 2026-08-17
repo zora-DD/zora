@@ -50,7 +50,7 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 	memoryService := newTestMemoryService(t, database)
-	handler, err := New(chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService)), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	handler, err := New(chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService)), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,9 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"version":"0.3.0-dev"`) ||
 		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||
-		!strings.Contains(response.Body.String(), `"memory_auto_capture":true`) {
+		!strings.Contains(response.Body.String(), `"memory_auto_capture":true`) ||
+		!strings.Contains(response.Body.String(), `"memory_recall":true`) ||
+		!strings.Contains(response.Body.String(), `"memory-context-injection"`) {
 		t.Fatalf("info does not report V0.3 memory capability: %s", response.Body.String())
 	}
 }
@@ -286,6 +288,19 @@ func TestConversationAutomaticallyCapturesAndConsolidatesMemory(t *testing.T) {
 	if !strings.Contains(second, `"updated":1`) {
 		t.Fatalf("second SSE does not include consolidation result: %s", second)
 	}
+	third := sendMessage("我的主要编程语言是什么？")
+	if !strings.Contains(third, "根据长期记忆") ||
+		!strings.Contains(third, "用户的主要编程语言是Java。") ||
+		!strings.Contains(third, `"memory_recalled":1`) {
+		t.Fatalf("third SSE does not use recalled memory: %s", third)
+	}
+	recall := httptest.NewRequest(http.MethodPost, "/api/memories/recall", strings.NewReader(`{"query":"主要编程语言"}`))
+	recall.Header.Set("Content-Type", "application/json")
+	recalled := httptest.NewRecorder()
+	handler.ServeHTTP(recalled, recall)
+	if recalled.Code != http.StatusOK || !strings.Contains(recalled.Body.String(), `"relevance":`) || !strings.Contains(recalled.Body.String(), "Java") {
+		t.Fatalf("recall status = %d, body = %s", recalled.Code, recalled.Body.String())
+	}
 
 	list := httptest.NewRequest(http.MethodGet, "/api/memories?kind=semantic", nil)
 	listed := httptest.NewRecorder()
@@ -320,7 +335,7 @@ func newTestHandler(t *testing.T) http.Handler {
 		t.Fatal(err)
 	}
 	memoryService := newTestMemoryService(t, database)
-	handler, err := New(chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService)), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	handler, err := New(chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService)), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

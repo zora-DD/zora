@@ -40,13 +40,13 @@
 - [x] Semantic / Episodic Memory Schema（来源、重要性、可选过期时间）
 - [x] 记忆候选提取和 Consolidation（真实模型结构化提取 + 本地确定性规则）
 - [x] Memory Key 去重、冲突更新、人工修正保护和过期过滤
-- [ ] 相关性 + 时效性 + 重要性召回
+- [x] 相关性 + 时效性 + 重要性召回与安全上下文注入
 - [x] 用户创建、查看、编辑、删除记忆（REST API + Web 面板）
 - [ ] 有/无记忆 A/B 评估
 
 验收条件：长期记忆不是历史消息向量库；每条记忆可解释来源并可由用户控制。
 
-当前验证结果：已建立独立 `memories` 表和 `memory.Service`，区分 semantic/episodic，保存稳定 `memory_key`、来源会话/消息、重要性、人工修正标记和可选过期时间；SQLite 与 PostgreSQL 保持相同 Store 契约。回答成功后，真实模型使用抗指令注入的中文结构化 Prompt 提取候选，本地 Mock 使用保守的确定性规则；Service 按 Kind + Memory Key 创建、跳过重复或更新冲突，并拒绝覆盖人工修正。结果进入 RunEvent 和 SSE 计数，失败不影响正常回答。REST API 与 Web 面板继续提供完整用户控制。尚未完成相关性召回、上下文注入、短期摘要和 A/B 评估，因此 V0.3 仍在进行中。
+当前验证结果：已建立独立 `memories` 表和 `memory.Service`，区分 semantic/episodic，保存稳定 `memory_key`、来源会话/消息、重要性、人工修正标记和可选过期时间；SQLite 与 PostgreSQL 保持相同 Store 契约。回答成功后，真实模型使用抗指令注入的中文结构化 Prompt 提取候选，本地 Mock 使用保守规则；Service 按 Kind + Memory Key 创建、跳过重复或更新冲突，并拒绝覆盖人工修正。新请求执行前以词项相关性 65% + 重要性 20% + 90 天半衰期时效性 15% 联合排序，过门槛的 Top-K 记忆以不可信 JSON 数据注入独立 System Message，总正文上限 6,000 字符；本轮输入冲突时优先本轮。提取和召回失败均不影响正常回答，RunEvent 只记录 ID 和分数组件。尚未完成短期摘要和有/无记忆 A/B 质量门禁，因此 V0.3 仍在进行中。
 
 ## V0.4 Multi-Agent
 

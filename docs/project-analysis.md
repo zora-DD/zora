@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.3 Long-term Memory（自动写入与可控 Consolidation）
+> 文档基线：V0.3 Long-term Memory（自动写入、Consolidation 与召回注入）
 > 最后更新：2026-08-17
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立 Semantic/Episodic Memory Schema、双数据库持久化、REST/Web 用户控制面，以及回答后的候选提取和 Consolidation；相关性召回、上下文注入、短期摘要和 A/B 评估仍是后续子阶段。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立 Semantic/Episodic Memory Schema、双数据库持久化、REST/Web 用户控制面、回答后的候选提取/Consolidation，以及回答前的联合召回和上下文注入；短期摘要和 A/B 评估仍是后续子阶段。
 
 ## 2. 背景与问题
 
@@ -82,6 +82,13 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 3. 新事实创建、重复内容跳过、冲突值更新；用户手动修正后的记录禁止自动覆盖。
 4. 来源会话/消息写入 Memory，处理计数进入 RunEvent 和 SSE；提取失败不影响已经成功的回答。
 
+长期记忆召回场景增加一条回答前增强链：
+
+1. 用本轮问题检索未过期 Memory，计算词项相关性、重要性和时效性联合分数。
+2. 过滤低分项并选择 Top-K，总正文不超过 6,000 字符。
+3. 以不可信 JSON 背景数据注入独立 System Message；本轮输入与旧记忆冲突时优先本轮。
+4. RunEvent 只保存 Memory ID 与分数组件；召回失败退化为无记忆回答。
+
 ## 5. 业务能力模型
 
 | 能力域 | 当前状态 | 说明 |
@@ -99,7 +106,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 生产知识库剩余项 | V0.2 进行中 | 权限、文档版本/PDF、更强语义评测和生产验收 |
 | 长期记忆底座 | 已实现 | Semantic/Episodic Schema、来源/重要性/过期字段、双存储和用户 CRUD |
 | 自动记忆写入 | 已实现 | 结构化/规则提取、Memory Key 去重与冲突更新、来源追踪、人工修正保护和审计 |
-| 记忆召回 | V0.3 进行中 | 联合召回、上下文注入、短期摘要和 A/B 评估 |
+| 记忆召回与注入 | 已实现 | 相关性/重要性/时效性联合评分、Top-K 安全注入、调试 API 和 Run 审计 |
+| 记忆评估与摘要 | V0.3 进行中 | 短期历史摘要、有/无记忆 A/B 和质量门禁 |
 | 多 Agent | 规划 V0.4 | Supervisor、专业 Agent、预算和效果对比 |
 | 办公能力 | 规划 V0.5 | MCP、邮件/日历/文件、人工审批和审计 |
 
@@ -314,7 +322,7 @@ SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embe
 | `kind` | TEXT | CHECK | `semantic` 或 `episodic` |
 | `memory_key` | TEXT | NOT NULL | 自动合并的稳定事实槽位；手动创建可为空 |
 | `content` | TEXT | NOT NULL | 经筛选的记忆正文，最多 2,000 字符 |
-| `importance` | REAL/DOUBLE | CHECK 0–1 | 后续联合召回的重要性信号 |
+| `importance` | REAL/DOUBLE | CHECK 0–1 | 联合召回 20% 权重的重要性信号 |
 | `user_edited` | BOOLEAN/INTEGER | NOT NULL | 人工修正保护；为真时自动候选不得覆盖 |
 | `source_type` | TEXT | CHECK | 手动创建为 `manual`，自动提取使用 `conversation` |
 | `source_conversation_id` | TEXT | Nullable FK | 来源会话，删除会话时置空 |
@@ -366,7 +374,7 @@ flowchart LR
 | 能力层 | `internal/agenttools` | 工具 Schema、校验和安全执行 |
 | 知识库应用层 | `internal/knowledge` | 分块、Embedding 适配、混合召回、引用与 Agent Tool |
 | RAG 评测层 | `internal/rageval` | 固定集校验、检索指标、答案引用/忠实度和联合门禁 |
-| 记忆应用层 | `internal/memory` | Semantic/Episodic 模型、候选提取、Consolidation、输入校验、过期过滤和用户 CRUD |
+| 记忆应用层 | `internal/memory` | Semantic/Episodic 模型、候选提取、Consolidation、联合召回、输入校验和用户 CRUD |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
@@ -426,6 +434,8 @@ RAG 已把语料、问题、相关文档、预期事实/证据锚点和阈值作
 
 V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 Memory 生命周期和用户控制面，再接入自动写入。类型、稳定 Key、来源、重要性、人工修正和过期时间均为一等字段；自动提取通过 `source_type=conversation` 关联原始事实。真实模型 Prompt 只允许提取用户明确表达的稳定信息，Service 负责二次校验和同 Key 合并。错误记忆能够被定位、修正和删除，人工修正后不会被下一轮模型覆盖。
 
+召回也先采用可解释基线：中文双字/西文词项相关性占 65%，重要性占 20%，90 天半衰期时效性占 15%。无相关词项默认不注入，记忆正文被标记为不可信背景数据且有 6,000 字符硬上限。通过 `ZORA_MEMORY_RECALL_ENABLED` 可独立关闭注入，为后续有/无记忆 A/B 提供天然对照组。
+
 ## 10. 当前限制与风险
 
 | 限制/风险 | 当前影响 | 后续处理 |
@@ -440,7 +450,8 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 | 进程内会话锁 | 多实例之间不能互斥 | advisory lock 或带租约分布式锁 |
 | 最近 40 条上下文 | 长对话会丢失早期信息 | 摘要 + 长期记忆召回 |
 | 自动记忆仍同步执行 | 真实模型会增加一次调用延迟；多副本仅有进程内合并锁 | 后续改为任务队列，并在数据库增加唯一约束/版本号 |
-| Memory 尚未进入回答上下文 | 已能积累和管理事实，但不会自动改善后续回答 | 增加联合召回与上下文注入，并用 A/B 评估门禁上线 |
+| 轻量召回缺少深层语义 | 可解释且零额外调用，但同义改写可能漏召回 | 先建立 A/B 门禁，再评估 Memory Embedding 或 Rerank |
+| Memory 已进入回答上下文但尚无 A/B 门禁 | 相关回答可使用历史事实，也可能受错误记忆影响 | 建立正确记忆率、错误注入率和回答质量对照评测 |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
 | 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
 | 尚无 token/cost 指标 | 无法比较模型成本 | 从 ResponseMeta 采集 Usage |
@@ -483,7 +494,7 @@ V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 M
 
 1. **V0.1 Agent Core**：建立当前可运行基线。
 2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
-3. **V0.3 Long-term Memory（进行中）**：Schema、双存储、用户 CRUD、候选提取和 Consolidation 已实现；继续完成召回、短期摘要、上下文注入与评估。
+3. **V0.3 Long-term Memory（进行中）**：Schema、双存储、用户 CRUD、候选提取、Consolidation 和召回注入已实现；继续完成短期摘要与 A/B 评估。
 4. **V0.4 Multi-Agent**：Supervisor、专业 Agent、预算和对照评估。
 5. **V0.5 Office Agent**：MCP、办公连接器、审批、权限和审计。
 

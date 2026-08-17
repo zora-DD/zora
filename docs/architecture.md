@@ -52,7 +52,7 @@ V0.1 直接使用 `ChatModelAgent + Runner`，以获得：
 
 ### Memory
 
-Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episodic` 经历/事件。每条记录包含稳定 Key、来源、重要性、人工修正标记、创建/更新时间和可选过期时间。当前支持用户完整 CRUD，以及回答后的自动提取、去重和冲突更新；尚未注入模型上下文。
+Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episodic` 经历/事件。每条记录包含稳定 Key、来源、重要性、人工修正标记、创建/更新时间和可选过期时间。当前支持用户完整 CRUD、回答后的自动提取/Consolidation，以及回答前的联合召回和安全上下文注入。
 
 ## 4. 并发与取消
 
@@ -119,6 +119,7 @@ SQLite 候选召回在 Go 内最多精确扫描 10,000 个 Chunk。PostgreSQL �
 internal/memory/
 ├── types.go          Memory/Store 契约
 ├── extractor.go      真实模型结构化提取与本地保守规则
+├── retriever.go      相关性、重要性、时效性联合评分
 └── service.go        CRUD、候选校验、Key Consolidation 和人工修正保护
 
 internal/store/sqlite/memories.go
@@ -130,14 +131,14 @@ GET/PUT/DELETE /api/memories/{memoryID}
 
 SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_edited、source、created/updated/expires_at。默认查询排除过期项；Web 管理面板显式展示全部记录，确保用户仍能清理已过期记忆。
 
-长期记忆当前在回答成功落库后执行同步、失败隔离的 Consolidation，而不是把所有聊天记录向量化：
+长期记忆当前按两条失败隔离链路运行，而不是把所有聊天记录向量化：
 
 ```text
-对话结束 → 候选事实提取 → 置信度判断 → 去重/合并 → 持久化
-新请求   → 相关性 + 时效性 + 重要性召回 → 注入 Agent 上下文
+对话结束 → 候选事实提取 → 校验 → Key 去重/冲突合并 → 持久化
+新请求   → 相关性 65% + 重要性 20% + 时效性 15% → Top-K → 安全 System 上下文
 ```
 
-自动提取的 Memory 已关联来源用户消息，并按 Kind + Memory Key 跳过重复或更新冲突；用户手动修正会阻止后续自动覆盖。下一步实现相关性 + 时效性 + 重要性召回和上下文注入；这些能力尚未在界面中伪装成已生效。
+自动提取的 Memory 关联来源用户消息，并按 Kind + Memory Key 跳过重复或更新冲突；用户手动修正会阻止后续自动覆盖。召回默认排除过期/无关记忆，正文按不可信 JSON 数据注入，最多 6,000 字符；RunEvent 只记录 ID 和可解释分数。下一步是短期历史摘要和有/无记忆 A/B 评测，而不是直接增加 Memory 向量库。
 
 ## 8. 多 Agent 接入点
 

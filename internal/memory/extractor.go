@@ -181,6 +181,9 @@ func ruleCandidate(sentence string) (Candidate, bool) {
 
 	if match := profilePattern.FindStringSubmatch(sentence); len(match) == 3 {
 		subject, value := strings.TrimSpace(match[1]), strings.TrimSpace(match[2])
+		if containsAnyText(value, "什么", "多少", "哪一个", "哪种", "吗") {
+			return Candidate{}, false
+		}
 		return Candidate{
 			Kind: KindSemantic, MemoryKey: "profile:" + keyToken(subject),
 			Content: "用户的" + subject + "是" + strings.TrimRight(value, "，, ") + "。", Importance: 0.8,

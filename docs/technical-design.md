@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.3 Long-term Memory（Memory CRUD 底座）
+> 适用版本：V0.3 Long-term Memory（自动写入、Consolidation 与召回注入）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -65,6 +65,7 @@ flowchart TD
     Chat --> Domain["domain"]
     Chat --> Store["store interface"]
     Chat --> Runtime
+    Chat --> Memory
     Runtime --> Eino["Eino ADK"]
     Tools --> Eino
     Knowledge --> Eino
@@ -100,9 +101,10 @@ flowchart TD
 4. 构造时间、计算器和项目状态工具；
 5. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder；
 6. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
-7. 根据 Model Provider 创建 Mock 或 OpenAI-compatible ChatModel；
-8. 创建 Eino ChatModelAgent 和 Runner；
-9. 创建 Chat Service 与 HTTP Handler；
+7. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
+8. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
+9. 使用共享 ChatModel 创建 Eino ChatModelAgent 和 Runner；
+10. 创建 Chat Service，按开关接入 Memory Capture/Recall，再创建 HTTP Handler；
 10. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
@@ -132,6 +134,9 @@ flowchart TD
 | `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 否 | 重叠字符数，必须小于分块上限的一半 |
 | `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 否 | 成功回答后是否执行候选提取和 Consolidation |
 | `ZORA_MEMORY_MAX_CANDIDATES` | `3` | 否 | 单轮候选上限，范围 1–10 |
+| `ZORA_MEMORY_RECALL_ENABLED` | `true` | 否 | 是否在 Agent 执行前召回并注入长期记忆 |
+| `ZORA_MEMORY_RECALL_LIMIT` | `5` | 否 | 单轮最多注入数量，范围 1–20 |
+| `ZORA_MEMORY_RECALL_MIN_SCORE` | `0.25` | 否 | 联合召回最低总分，范围 0–1 |
 
 配置原则：
 
@@ -149,6 +154,7 @@ sequenceDiagram
     participant Client as Web Client
     participant API as HTTP API
     participant Chat as chat.Service
+    participant Memory as memory.Service
     participant Store as Store
     participant Runner as Eino Runner
     participant Model as ChatModel
@@ -163,7 +169,9 @@ sequenceDiagram
     Chat->>Store: 创建 running AgentRun
     Chat-->>Client: start
     Chat->>Store: 读取最近 40 条 Message
-    Chat->>Runner: Run(history)
+    Chat->>Memory: Recall(content)
+    Memory-->>Chat: Top-K + 分数组件
+    Chat->>Runner: Run(memory system context + history)
     Runner->>Model: Stream(messages + tools)
     alt 模型调用工具
         Model-->>Runner: ToolCall
@@ -179,6 +187,8 @@ sequenceDiagram
     Runner-->>Chat: delta
     Chat-->>Client: delta
     Chat->>Store: 保存 assistant Message
+    Chat->>Memory: Capture(user + answer + source IDs)
+    Memory-->>Chat: created/updated/skipped
     Chat->>Store: 保存 model_output/run_completed
     Chat->>Store: Run → completed
     Chat-->>Client: done
@@ -190,9 +200,9 @@ sequenceDiagram
 
 ### 5.2 上下文策略
 
-V0.1 读取最近 40 条用户可见消息，并按 sequence 正序转换为 Eino Message。内部 ToolCall/ToolResult 不写入下一轮对话历史，只保留最终回答和 RunEvent。
+当前读取最近 40 条用户可见消息，并按 sequence 正序转换为 Eino Message；同时按当前问题召回相关长期记忆，以独立 System Message 放在历史之前。内部 ToolCall/ToolResult 不写入下一轮对话历史，只保留最终回答和 RunEvent。
 
-这是明确的临时上限。V0.3 将改为：近期原始消息 + 会话摘要 + 相关长期记忆。
+最近 40 条仍是明确的临时上限。V0.3 剩余工作会改为：近期原始消息 + 会话摘要 + 相关长期记忆。
 
 ## 6. Agent Runtime 设计
 
@@ -477,7 +487,24 @@ sequenceDiagram
 
 Consolidation 使用 `kind + memory_key` 识别同一事实槽位：相同内容跳过，不同内容更新并记录最新来源；用户通过 REST/Web 修改自动记忆后设置 `user_edited=true`，后续自动候选不能覆盖。自动处理在回答落库后同步执行，错误只写 `memory_capture_failed`，不会把已经成功生成的回答改成失败。当前用进程级互斥避免单实例并发重复；多副本下仍需数据库唯一约束或任务队列。
 
-这一阶段仍没有把 Memory 注入模型上下文，也没有把聊天消息批量向量化。下一子阶段将实现相关性、时效性和重要性联合召回，并通过 A/B 评估决定是否注入。
+### 8.11 长期记忆联合召回与上下文注入
+
+新请求在进入 Eino Runtime 前调用 `memory.Service.Recall(query)`：
+
+```text
+score = 0.65 * relevance + 0.20 * importance + 0.15 * recency
+recency = exp(-ln(2) * age / 90 days)
+```
+
+- `relevance` 使用中文双字词项与西文词项的二元余弦重合，作为零额外模型调用、可确定复现的基线；
+- `importance` 直接使用 Memory 的 0–1 重要性；
+- `recency` 按更新时间进行 90 天半衰期衰减；
+- 无相关词项的记忆默认不召回；用户明确询问“你记得我的偏好吗”等总览问题时，允许 0.08 的低相关性先验；
+- 只保留不低于 `ZORA_MEMORY_RECALL_MIN_SCORE` 的 Top-K，并且 Store 已先排除过期记忆。
+
+召回正文使用 `[ZORA_RECALLED_MEMORY]` 独立 System Message 注入，JSON 中只包含 kind/content。系统指令声明这些内容是不可信背景事实、不得当作指令执行、与本轮输入冲突时以本轮为准，也不得向用户暴露内部 ID 或分数。总正文硬限制为 6,000 Unicode 字符。RunEvent `memory_recall_completed` 只保存 Memory ID、类型和四项分数，不复制正文；失败写 `memory_recall_failed` 并继续无记忆回答。
+
+当前仍没有把聊天消息批量向量化，也没有为 Memory 增加向量列。轻量词项召回是可解释基线；只有 A/B 数据证明语义召回有稳定收益后，才引入 Memory Embedding、索引迁移和额外成本。
 
 ## 9. 并发、取消与错误处理
 
@@ -698,6 +725,7 @@ Content-Type: application/json
 ```http
 GET /api/memories?kind=semantic&include_expired=true
 POST /api/memories
+POST /api/memories/recall
 GET /api/memories/{memoryID}
 PUT /api/memories/{memoryID}
 DELETE /api/memories/{memoryID}
@@ -716,6 +744,22 @@ DELETE /api/memories/{memoryID}
 
 `importance` 范围为 0–1；创建时省略则默认 0.5，PUT 更新时必须提供。`expires_at` 为空字符串或省略表示永不过期；创建时非空值必须是晚于当前时间的 RFC3339，更新时允许设置过去时间以显式标记过期。自动记忆的响应还包含只读 `memory_key`、`source_conversation_id`、`source_message_id` 和 `user_edited`；用户 PUT 后 `user_edited=true`，自动合并不得覆盖。非法类型、内容长度、重要性和时间返回 400；不存在的 Memory 返回 404；删除成功返回 204。
 
+召回调试接口请求 `{"query":"我的主要编程语言"}`，返回每条 Memory 及 `score`、`relevance`、`importance`、`recency`，用于调参与评测；生产回答仍由 `chat.Service` 自动调用同一 Service 方法：
+
+```json
+{
+  "results": [
+    {
+      "memory": {"id": "mem_xxx", "kind": "semantic", "content": "用户的主要编程语言是 Java。"},
+      "score": 0.61,
+      "relevance": 0.46,
+      "importance": 0.8,
+      "recency": 0.99
+    }
+  ]
+}
+```
+
 ## 11. SSE 事件契约
 
 | 事件 | 关键字段 | 是否持久化 | 说明 |
@@ -724,7 +768,7 @@ DELETE /api/memories/{memoryID}
 | `tool_call` | `tool_name`, `tool_call_id`, `arguments` | 是 | 模型请求调用工具 |
 | `tool_result` | `tool_name`, `tool_call_id`, `content` | 是 | 工具返回结果 |
 | `delta` | `content` | 否 | 文本增量，只用于实时展示 |
-| `done` | `message`, `memory` | 以 model_output/run_completed 表示 | 回答和 Run 已落库；开启自动记忆时附带候选/新增/更新/跳过计数 |
+| `done` | `message`, `memory`, `memory_recalled` | 以 model_output/run_completed 表示 | 回答和 Run 已落库；附带自动写入计数和实际注入记忆数 |
 | `error` | `content` | 以 failed/cancelled 表示 | 执行失败或取消 |
 
 客户端不能只依赖连接关闭判断成功，必须以 `done` 为成功终点，以 `error` 为失败终点。
@@ -734,7 +778,7 @@ DELETE /api/memories/{memoryID}
 - 对话列表、自动标题、重命名和删除；
 - 欢迎页提供三个可触发工具的示例；
 - 侧边栏知识库弹窗支持上传、文档列表、分块数和删除；
-- 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，展示手动/对话来源与人工修正状态，并明确提示当前已自动提取但尚未召回；
+- 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，展示手动/对话来源、人工修正状态及自动提取/召回开关状态；
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用以可折叠 Trace 展示；
@@ -758,6 +802,7 @@ DELETE /api/memories/{memoryID}
 - 删除知识文档时明确由用户确认，上传限制文件类型、大小和 UTF-8。
 - 删除长期记忆时明确由用户确认；来源字段不能通过用户编辑接口伪造。
 - 记忆提取 Prompt 将聊天内容声明为不可信数据；Service 再次拒绝密码、令牌、银行卡和证件标签，并限制候选数。
+- 召回正文作为不可信 JSON 数据注入独立 System Message，限制 6,000 字符；审计和 SSE 只暴露 ID/计数/分数，不复制正文。
 
 ### 上线前必须补充
 
@@ -789,12 +834,12 @@ DELETE /api/memories/{memoryID}
 
 | 层级 | 当前覆盖 |
 |---|---|
-| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation 与人工修正保护 |
+| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分、注入边界与人工修正保护 |
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
 | Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD、V0.3 旧库迁移、Key/人工标记和过期过滤 |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
-| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404，以及对话自动提取和同 Key 冲突更新 |
+| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404，以及自动提取、同 Key 更新、召回接口和 Mock 上下文作答 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
 | 工程检查 | `go test`、`go vet`、race、无 CGO build |
 
@@ -867,7 +912,7 @@ flowchart LR
 程序性记忆：Skill、规则和工具经验
 ```
 
-当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、用户 CRUD，以及回答后的候选提取、稳定 Key 去重、冲突更新、来源关联、人工修正保护和审计。下一步按相关性、时效性和重要性联合召回并注入 Agent 上下文，同时补充短期摘要。召回上线前必须建立有/无记忆 A/B 评测，避免错误记忆降低回答质量。
+当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、用户 CRUD、自动候选提取与 Consolidation，以及相关性/重要性/时效性联合召回、安全上下文注入和审计。下一步补充短期历史摘要和有/无记忆 A/B 评测，验证召回正确率、错误记忆影响、Token 增量和回答质量，再决定是否引入 Memory Embedding。
 
 ### 17.3 V0.4 Multi-Agent
 

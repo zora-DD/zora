@@ -6,7 +6,8 @@ const state = {
   messages: [],
   documents: [],
   memories: [],
-  memoryAutoCapture: false,
+	memoryAutoCapture: false,
+	memoryRecall: false,
   editingMemoryID: null,
   busy: false,
   controller: null,
@@ -89,10 +90,9 @@ async function initialize() {
     state.conversations = result.conversations || [];
     state.documents = knowledgeResult.documents || [];
     state.memories = memoryResult.memories || [];
-    state.memoryAutoCapture = Boolean(info.memory_auto_capture);
-    elements.memoryDescription.textContent = state.memoryAutoCapture
-      ? "已开启对话候选提取与去重/冲突合并；自动记忆会标注来源，手动修正后不会再被自动覆盖。当前尚未把记忆召回到模型上下文。"
-      : "自动提取当前已关闭，仅支持手动管理。所有记忆都可设置过期时间，并随时编辑或删除。";
+	state.memoryAutoCapture = Boolean(info.memory_auto_capture);
+	state.memoryRecall = Boolean(info.memory_recall);
+	elements.memoryDescription.textContent = memoryStatusText();
     elements.embeddingModel.textContent = `Embedding: ${info.embedding_model}`;
     renderConversations();
     renderKnowledgeDocuments();
@@ -204,6 +204,19 @@ async function refreshMemories() {
   const result = await api("/api/memories?include_expired=true");
   state.memories = result.memories || [];
   renderMemories();
+}
+
+function memoryStatusText() {
+  if (state.memoryAutoCapture && state.memoryRecall) {
+    return "已开启对话候选提取、同 Key 合并和相关记忆召回。自动记忆会标注来源，手动修正后不会被覆盖；本轮输入与旧记忆冲突时以本轮为准。";
+  }
+  if (state.memoryAutoCapture) {
+    return "已开启对话候选提取与同 Key 合并，但召回注入已关闭。所有记忆仍可随时编辑或删除。";
+  }
+  if (state.memoryRecall) {
+    return "自动提取已关闭；手动维护的相关记忆仍会在回答前召回。所有记忆都可随时编辑或删除。";
+  }
+  return "自动提取和召回当前均已关闭，仅支持手动管理长期记忆。";
 }
 
 function renderMemories() {

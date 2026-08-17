@@ -68,4 +68,8 @@ func TestRuleExtractorOnlyCapturesExplicitStableFacts(t *testing.T) {
 	if err != nil || len(sensitive) != 0 {
 		t.Fatalf("sensitive candidates = %+v, %v", sensitive, err)
 	}
+	question, err := extractor.Extract(context.Background(), ExtractionInput{UserContent: "我的主要编程语言是什么？"})
+	if err != nil || len(question) != 0 {
+		t.Fatalf("question must not become a memory: %+v, %v", question, err)
+	}
 }

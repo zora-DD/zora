@@ -23,6 +23,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if !cfg.MemoryAutoCapture || cfg.MemoryMaxCandidates != 3 {
 		t.Fatalf("unexpected memory defaults: %+v", cfg)
 	}
+	if !cfg.MemoryRecallEnabled || cfg.MemoryRecallLimit != 5 || cfg.MemoryRecallMinScore != 0.25 {
+		t.Fatalf("unexpected memory recall defaults: %+v", cfg)
+	}
 }
 
 func TestLoadPostgresStoreRequiresDSN(t *testing.T) {
@@ -64,6 +67,14 @@ func TestLoadRejectsInvalidChunkOverlap(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsInvalidMemoryRecallScore(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ZORA_MEMORY_RECALL_MIN_SCORE", "NaN")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid memory recall score error")
+	}
+}
+
 func clearEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
@@ -74,6 +85,7 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_EMBEDDING_BASE_URL", "ZORA_EMBEDDING_DIMENSIONS", "ZORA_KNOWLEDGE_CHUNK_SIZE",
 		"ZORA_KNOWLEDGE_CHUNK_OVERLAP",
 		"ZORA_MEMORY_AUTO_CAPTURE", "ZORA_MEMORY_MAX_CANDIDATES",
+		"ZORA_MEMORY_RECALL_ENABLED", "ZORA_MEMORY_RECALL_LIMIT", "ZORA_MEMORY_RECALL_MIN_SCORE",
 	} {
 		t.Setenv(key, "")
 	}

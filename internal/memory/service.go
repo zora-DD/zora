@@ -14,15 +14,19 @@ import (
 )
 
 const (
-	defaultImportance = 0.5
-	maxContentRunes   = 2_000
+	defaultImportance     = 0.5
+	maxContentRunes       = 2_000
+	defaultRecallLimit    = 5
+	defaultRecallMinScore = 0.25
 )
 
 type Service struct {
-	store     Store
-	extractor Extractor
-	now       func() time.Time
-	captureMu sync.Mutex
+	store          Store
+	extractor      Extractor
+	now            func() time.Time
+	captureMu      sync.Mutex
+	recallLimit    int
+	recallMinScore float64
 }
 
 type Option func(*Service) error
@@ -37,11 +41,28 @@ func WithExtractor(extractor Extractor) Option {
 	}
 }
 
+func WithRecallOptions(limit int, minScore float64) Option {
+	return func(service *Service) error {
+		if limit < 1 || limit > 20 {
+			return fmt.Errorf("长期记忆召回数量必须在 1 到 20 之间")
+		}
+		if math.IsNaN(minScore) || math.IsInf(minScore, 0) || minScore < 0 || minScore > 1 {
+			return fmt.Errorf("长期记忆最低召回分数必须在 0 到 1 之间")
+		}
+		service.recallLimit = limit
+		service.recallMinScore = minScore
+		return nil
+	}
+}
+
 func NewService(store Store, options ...Option) (*Service, error) {
 	if store == nil {
 		return nil, fmt.Errorf("长期记忆存储不能为空")
 	}
-	service := &Service{store: store, now: func() time.Time { return time.Now().UTC() }}
+	service := &Service{
+		store: store, now: func() time.Time { return time.Now().UTC() },
+		recallLimit: defaultRecallLimit, recallMinScore: defaultRecallMinScore,
+	}
 	for _, option := range options {
 		if err := option(service); err != nil {
 			return nil, err

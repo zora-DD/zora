@@ -89,6 +89,7 @@ func run(logger *slog.Logger) error {
 		}
 		memoryOptions = append(memoryOptions, memory.WithExtractor(extractor))
 	}
+	memoryOptions = append(memoryOptions, memory.WithRecallOptions(cfg.MemoryRecallLimit, cfg.MemoryRecallMinScore))
 	memoryService, err := memory.NewService(database, memoryOptions...)
 	if err != nil {
 		return err
@@ -97,7 +98,11 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	chatService := chat.NewService(database, runtime, chat.WithMemoryCapturer(memoryService))
+	chatOptions := []chat.Option{chat.WithMemoryCapturer(memoryService)}
+	if cfg.MemoryRecallEnabled {
+		chatOptions = append(chatOptions, chat.WithMemoryRecaller(memoryService))
+	}
+	chatService := chat.NewService(database, runtime, chatOptions...)
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout)
 	if err != nil {
 		return err
@@ -115,7 +120,7 @@ func run(logger *slog.Logger) error {
 		logger.Info("zora is ready", "addr", cfg.Addr, "store", cfg.StoreProvider,
 			"provider", cfg.Provider, "model", cfg.Model,
 			"embedding_provider", cfg.EmbeddingProvider, "embedding_model", embedder.Name(),
-			"memory_auto_capture", cfg.MemoryAutoCapture)
+			"memory_auto_capture", cfg.MemoryAutoCapture, "memory_recall", cfg.MemoryRecallEnabled)
 		serveErrors <- server.ListenAndServe()
 	}()
 

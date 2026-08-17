@@ -55,6 +55,7 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	mux.HandleFunc("POST /api/knowledge/search", server.searchKnowledge)
 	mux.HandleFunc("GET /api/memories", server.listMemories)
 	mux.HandleFunc("POST /api/memories", server.createMemory)
+	mux.HandleFunc("POST /api/memories/recall", server.recallMemories)
 	mux.HandleFunc("GET /api/memories/{memoryID}", server.getMemory)
 	mux.HandleFunc("PUT /api/memories/{memoryID}", server.replaceMemory)
 	mux.HandleFunc("DELETE /api/memories/{memoryID}", server.deleteMemory)
@@ -81,6 +82,9 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.memory.AutoCaptureEnabled() {
 		capabilities = append(capabilities, "memory-auto-capture", "memory-consolidation")
 	}
+	if s.chat.MemoryRecallEnabled() {
+		capabilities = append(capabilities, "memory-recall", "memory-context-injection")
+	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
@@ -90,6 +94,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"embedding_model":     s.knowledge.EmbeddingModel(),
 		"retrieval_backend":   s.knowledge.RetrievalBackend(),
 		"memory_auto_capture": s.memory.AutoCaptureEnabled(),
+		"memory_recall":       s.chat.MemoryRecallEnabled(),
 		"capabilities":        capabilities,
 	})
 }
@@ -309,6 +314,22 @@ func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"memories": items})
+}
+
+func (s *Server) recallMemories(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Query string `json:"query"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		s.problem(w, err)
+		return
+	}
+	results, err := s.memory.Recall(r.Context(), input.Query)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
 }
 
 func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {

@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -37,8 +38,11 @@ type Config struct {
 	KnowledgeChunkSize  int    // 按 Unicode 字符计算的分块上限。
 	KnowledgeOverlap    int    // 相邻分块的重叠字符数，避免语义在边界断开。
 
-	MemoryAutoCapture   bool // 是否在回答完成后自动提取长期记忆候选。
-	MemoryMaxCandidates int  // 单轮最多接纳的候选数，限制额外成本和错误放大。
+	MemoryAutoCapture    bool    // 是否在回答完成后自动提取长期记忆候选。
+	MemoryMaxCandidates  int     // 单轮最多接纳的候选数，限制额外成本和错误放大。
+	MemoryRecallEnabled  bool    // 是否在模型执行前召回并注入相关长期记忆。
+	MemoryRecallLimit    int     // 单轮最多注入的长期记忆数量。
+	MemoryRecallMinScore float64 // 联合分数低于该阈值的记忆不得注入。
 }
 
 // Load 在启动阶段完成配置校验，让错误尽早暴露，而不是运行到模型调用时才失败。
@@ -82,6 +86,18 @@ func Load() (Config, error) {
 	if err != nil || memoryMaxCandidates > 10 {
 		return Config{}, fmt.Errorf("ZORA_MEMORY_MAX_CANDIDATES 必须在 1 到 10 之间")
 	}
+	memoryRecallEnabled, err := strconv.ParseBool(env("ZORA_MEMORY_RECALL_ENABLED", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_RECALL_ENABLED 必须是 true 或 false")
+	}
+	memoryRecallLimit, err := positiveInt("ZORA_MEMORY_RECALL_LIMIT", "5")
+	if err != nil || memoryRecallLimit > 20 {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_RECALL_LIMIT 必须在 1 到 20 之间")
+	}
+	memoryRecallMinScore, err := strconv.ParseFloat(env("ZORA_MEMORY_RECALL_MIN_SCORE", "0.25"), 64)
+	if err != nil || math.IsNaN(memoryRecallMinScore) || math.IsInf(memoryRecallMinScore, 0) || memoryRecallMinScore < 0 || memoryRecallMinScore > 1 {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_RECALL_MIN_SCORE 必须在 0 到 1 之间")
+	}
 
 	cfg := Config{
 		Addr:             env("ZORA_ADDR", ":8088"),
@@ -105,8 +121,11 @@ func Load() (Config, error) {
 		KnowledgeChunkSize:  chunkSize,
 		KnowledgeOverlap:    chunkOverlap,
 
-		MemoryAutoCapture:   memoryAutoCapture,
-		MemoryMaxCandidates: memoryMaxCandidates,
+		MemoryAutoCapture:    memoryAutoCapture,
+		MemoryMaxCandidates:  memoryMaxCandidates,
+		MemoryRecallEnabled:  memoryRecallEnabled,
+		MemoryRecallLimit:    memoryRecallLimit,
+		MemoryRecallMinScore: memoryRecallMinScore,
 	}
 
 	switch cfg.StoreProvider {
