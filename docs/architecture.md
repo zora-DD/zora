@@ -4,15 +4,16 @@
 
 ## 1. 边界
 
-Zora 将系统划分为七个边界：
+Zora 将系统划分为八个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
 3. `agentruntime`：Eino ADK 适配，输出与传输协议无关的事件。
 4. `agenttools`：工具 Schema、输入校验和执行代码。
 5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
-6. `store`：对话与知识库的持久化边界，由 SQLite 或 PostgreSQL 实现。
-7. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
+6. `memory`：Semantic/Episodic Memory、生命周期校验和用户控制。
+7. `store`：对话、知识库与长期记忆的持久化边界，由 SQLite 或 PostgreSQL 实现。
+8. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -49,6 +50,10 @@ V0.1 直接使用 `ChatModelAgent + Runner`，以获得：
 
 采用 append-only 审计：`run_started`、`tool_call`、`tool_result`、`model_output`、`run_completed/failed/cancelled`。流式 token 只发往客户端，不逐 token 落库。
 
+### Memory
+
+Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episodic` 经历/事件。每条记录包含来源、重要性、创建/更新时间和可选过期时间；当前支持用户完整 CRUD，尚未自动提取或注入模型上下文。
+
 ## 4. 并发与取消
 
 - 同一 Conversation 同时只允许一个 Run 修改历史，避免两个请求读取相同旧上下文后交错落库。
@@ -68,6 +73,7 @@ PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业�
 - API Key 只从环境变量读取。
 - 当前没有任何写入外部系统的工具。
 - 知识文档限制为 UTF-8 TXT/Markdown 且最大 5 MiB，文档删除需要用户确认。
+- 长期记忆内容最多 2,000 字符，类型/重要性/过期时间在 Service 层校验，来源字段不可由用户伪造，删除需要确认。
 
 ## 6. V0.2 RAG 当前架构
 
@@ -105,7 +111,23 @@ SQLite 候选召回在 Go 内最多精确扫描 10,000 个 Chunk。PostgreSQL �
 
 线上 `knowledge_search` 固定使用 hybrid；离线评测通过 `SearchWithMode` 分别执行 vector、keyword 和 hybrid，再通过真实 Eino Runtime 生成答案并核对事实、有效引用及原文支持。`cmd/zora-eval` 每次在临时 SQLite 中重建固定语料，因此不会被在线历史数据污染。PostgreSQL 集成测试通过 `ZORA_TEST_POSTGRES_DSN` 显式启用。
 
-## 7. 长期记忆接入点
+## 7. V0.3 长期记忆当前架构与接入点
+
+当前已实现：
+
+```text
+internal/memory/
+├── types.go          Memory/Store 契约
+└── service.go        创建、筛选、完整更新、删除和校验
+
+internal/store/sqlite/memories.go
+internal/store/postgres/memories.go
+
+GET/POST /api/memories
+GET/PUT/DELETE /api/memories/{memoryID}
+```
+
+SQLite 与 PostgreSQL 都保存 kind、content、importance、source、created/updated/expires_at。默认查询排除过期项；Web 管理面板显式展示全部记录，确保用户仍能清理已过期记忆。
 
 长期记忆使用异步 Consolidation，而不是把所有聊天记录向量化：
 
@@ -114,7 +136,7 @@ SQLite 候选召回在 Go 内最多精确扫描 10,000 个 Chunk。PostgreSQL �
 新请求   → 相关性 + 时效性 + 重要性召回 → 注入 Agent 上下文
 ```
 
-每条 Memory 必须包含来源消息、类型、置信度、创建/更新时间和可选过期时间，并提供用户查看和删除接口。
+下一步将让自动提取的 Memory 关联来源消息，加入置信度、去重/冲突策略与相关性召回；这些能力尚未完成，也不会在当前界面中伪装成已生效。
 
 ## 8. 多 Agent 接入点
 

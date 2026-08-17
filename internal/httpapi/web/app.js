@@ -4,7 +4,9 @@ const state = {
   conversations: [],
   activeID: null,
   messages: [],
-	 documents: [],
+  documents: [],
+  memories: [],
+  editingMemoryID: null,
   busy: false,
   controller: null,
   draft: null,
@@ -29,28 +31,40 @@ const elements = {
   runtimeModel: document.querySelector("#runtimeModel"),
   runtimeProvider: document.querySelector("#runtimeProvider"),
   statusDot: document.querySelector("#statusDot"),
-	openKnowledge: document.querySelector("#openKnowledge"),
-	closeKnowledge: document.querySelector("#closeKnowledge"),
-	knowledgeDialog: document.querySelector("#knowledgeDialog"),
-	knowledgeUpload: document.querySelector("#knowledgeUpload"),
-	knowledgeFile: document.querySelector("#knowledgeFile"),
-	selectedFile: document.querySelector("#selectedFile"),
-	uploadKnowledge: document.querySelector("#uploadKnowledge"),
-	knowledgeDocuments: document.querySelector("#knowledgeDocuments"),
-	knowledgeCount: document.querySelector("#knowledgeCount"),
-	embeddingModel: document.querySelector("#embeddingModel"),
+  openKnowledge: document.querySelector("#openKnowledge"),
+  closeKnowledge: document.querySelector("#closeKnowledge"),
+  knowledgeDialog: document.querySelector("#knowledgeDialog"),
+  knowledgeUpload: document.querySelector("#knowledgeUpload"),
+  knowledgeFile: document.querySelector("#knowledgeFile"),
+  selectedFile: document.querySelector("#selectedFile"),
+  uploadKnowledge: document.querySelector("#uploadKnowledge"),
+  knowledgeDocuments: document.querySelector("#knowledgeDocuments"),
+  knowledgeCount: document.querySelector("#knowledgeCount"),
+  embeddingModel: document.querySelector("#embeddingModel"),
+  openMemory: document.querySelector("#openMemory"),
+  closeMemory: document.querySelector("#closeMemory"),
+  memoryDialog: document.querySelector("#memoryDialog"),
+  memoryForm: document.querySelector("#memoryForm"),
+  memoryKind: document.querySelector("#memoryKind"),
+  memoryContent: document.querySelector("#memoryContent"),
+  memoryImportance: document.querySelector("#memoryImportance"),
+  memoryExpiresAt: document.querySelector("#memoryExpiresAt"),
+  saveMemory: document.querySelector("#saveMemory"),
+  cancelMemoryEdit: document.querySelector("#cancelMemoryEdit"),
+  memoryList: document.querySelector("#memoryList"),
+  memoryCount: document.querySelector("#memoryCount"),
   toast: document.querySelector("#toast"),
 };
 
 async function api(path, options = {}) {
-	const headers = { ...(options.headers || {}) };
-	// multipart/form-data 的 boundary 必须由浏览器生成，不能手动覆盖 Content-Type。
-	if (!(options.body instanceof FormData) && !headers["Content-Type"]) {
-		headers["Content-Type"] = "application/json";
-	}
+  const headers = { ...(options.headers || {}) };
+  // multipart/form-data 的 boundary 必须由浏览器生成，不能手动覆盖 Content-Type。
+  if (!(options.body instanceof FormData) && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
   const response = await fetch(path, {
     ...options,
-		headers,
+    headers,
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -64,16 +78,19 @@ async function initialize() {
   bindEvents();
   resizeInput();
   try {
-		const [info, result, knowledgeResult] = await Promise.all([
-			api("/api/info"), api("/api/conversations"), api("/api/knowledge/documents"),
-		]);
+    const [info, result, knowledgeResult, memoryResult] = await Promise.all([
+      api("/api/info"), api("/api/conversations"), api("/api/knowledge/documents"),
+      api("/api/memories?include_expired=true"),
+    ]);
     elements.runtimeModel.textContent = info.model;
     elements.runtimeProvider.textContent = `${info.provider} · ${info.version}`;
     state.conversations = result.conversations || [];
-		state.documents = knowledgeResult.documents || [];
-		elements.embeddingModel.textContent = `Embedding: ${info.embedding_model}`;
+    state.documents = knowledgeResult.documents || [];
+    state.memories = memoryResult.memories || [];
+    elements.embeddingModel.textContent = `Embedding: ${info.embedding_model}`;
     renderConversations();
-		renderKnowledgeDocuments();
+    renderKnowledgeDocuments();
+    renderMemories();
     if (state.conversations.length) {
       await selectConversation(state.conversations[0].id);
     }
@@ -88,12 +105,16 @@ async function initialize() {
 
 function bindEvents() {
   elements.newConversation.addEventListener("click", () => createConversation());
-	elements.openKnowledge.addEventListener("click", openKnowledge);
-	elements.closeKnowledge.addEventListener("click", () => elements.knowledgeDialog.close());
-	elements.knowledgeUpload.addEventListener("submit", uploadKnowledgeDocument);
-	elements.knowledgeFile.addEventListener("change", () => {
-		elements.selectedFile.textContent = elements.knowledgeFile.files[0]?.name || "尚未选择";
-	});
+  elements.openKnowledge.addEventListener("click", openKnowledge);
+  elements.closeKnowledge.addEventListener("click", () => elements.knowledgeDialog.close());
+  elements.knowledgeUpload.addEventListener("submit", uploadKnowledgeDocument);
+  elements.knowledgeFile.addEventListener("change", () => {
+    elements.selectedFile.textContent = elements.knowledgeFile.files[0]?.name || "尚未选择";
+  });
+  elements.openMemory.addEventListener("click", openMemory);
+  elements.closeMemory.addEventListener("click", () => elements.memoryDialog.close());
+  elements.memoryForm.addEventListener("submit", saveMemory);
+  elements.cancelMemoryEdit.addEventListener("click", resetMemoryForm);
   elements.renameConversation.addEventListener("click", renameActiveConversation);
   elements.composer.addEventListener("submit", event => {
     event.preventDefault();
@@ -125,41 +146,173 @@ function bindEvents() {
 }
 
 async function openKnowledge() {
-	try {
-		await refreshKnowledgeDocuments();
-		elements.knowledgeDialog.showModal();
-		closeSidebar();
-	} catch (error) {
-		notify(error.message);
-	}
+  try {
+    await refreshKnowledgeDocuments();
+    elements.knowledgeDialog.showModal();
+    closeSidebar();
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function openMemory() {
+  try {
+    await refreshMemories();
+    elements.memoryDialog.showModal();
+    closeSidebar();
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function saveMemory(event) {
+  event.preventDefault();
+  const content = elements.memoryContent.value.trim();
+  if (!content) return;
+  const payload = {
+    kind: elements.memoryKind.value,
+    content,
+    importance: Number(elements.memoryImportance.value),
+    expires_at: elements.memoryExpiresAt.value ? new Date(elements.memoryExpiresAt.value).toISOString() : "",
+  };
+  const editingID = state.editingMemoryID;
+  elements.saveMemory.disabled = true;
+  elements.saveMemory.textContent = editingID ? "保存中…" : "添加中…";
+  try {
+    await api(editingID ? `/api/memories/${editingID}` : "/api/memories", {
+      method: editingID ? "PUT" : "POST",
+      body: JSON.stringify(payload),
+    });
+    resetMemoryForm();
+    await refreshMemories();
+    notify(editingID ? "长期记忆已更新" : "长期记忆已添加");
+  } catch (error) {
+    notify(error.message);
+  } finally {
+    elements.saveMemory.disabled = false;
+    elements.saveMemory.textContent = state.editingMemoryID ? "保存修改" : "添加记忆";
+  }
+}
+
+async function refreshMemories() {
+  const result = await api("/api/memories?include_expired=true");
+  state.memories = result.memories || [];
+  renderMemories();
+}
+
+function renderMemories() {
+  elements.memoryCount.textContent = `${state.memories.length} 条记忆`;
+  elements.memoryList.replaceChildren();
+  if (!state.memories.length) {
+    const empty = document.createElement("div");
+    empty.className = "document-empty";
+    empty.textContent = "还没有长期记忆。可以先手动添加一条可控记忆。";
+    elements.memoryList.append(empty);
+    return;
+  }
+  for (const item of state.memories) elements.memoryList.append(memoryNode(item));
+}
+
+function memoryNode(item) {
+  const card = document.createElement("article");
+  card.className = `memory-item${item.expires_at && new Date(item.expires_at) <= new Date() ? " expired" : ""}`;
+  const heading = document.createElement("div");
+  heading.className = "memory-item-heading";
+  const kind = document.createElement("strong");
+  kind.textContent = item.kind === "semantic" ? "Semantic" : "Episodic";
+  const importance = document.createElement("span");
+  importance.textContent = `重要性 ${Number(item.importance).toFixed(1)}`;
+  heading.append(kind, importance);
+  const content = document.createElement("p");
+  content.textContent = item.content;
+  const meta = document.createElement("small");
+  const source = item.source_type === "manual" ? "手动创建" : "对话提取";
+  const expiry = item.expires_at ? ` · 过期 ${formatDateTime(item.expires_at)}` : " · 永不过期";
+  meta.textContent = source + expiry;
+  const actions = document.createElement("div");
+  actions.className = "memory-item-actions";
+  const edit = document.createElement("button");
+  edit.type = "button";
+  edit.textContent = "编辑";
+  edit.addEventListener("click", () => startMemoryEdit(item));
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "删除";
+  remove.addEventListener("click", () => deleteMemory(item));
+  actions.append(edit, remove);
+  card.append(heading, content, meta, actions);
+  return card;
+}
+
+function startMemoryEdit(item) {
+  state.editingMemoryID = item.id;
+  elements.memoryKind.value = item.kind;
+  elements.memoryContent.value = item.content;
+  elements.memoryImportance.value = item.importance;
+  elements.memoryExpiresAt.value = item.expires_at ? toLocalDateTime(item.expires_at) : "";
+  elements.saveMemory.textContent = "保存修改";
+  elements.cancelMemoryEdit.hidden = false;
+  elements.memoryContent.focus();
+}
+
+function resetMemoryForm() {
+  state.editingMemoryID = null;
+  elements.memoryForm.reset();
+  elements.memoryKind.value = "semantic";
+  elements.memoryImportance.value = "0.5";
+  elements.saveMemory.textContent = "添加记忆";
+  elements.cancelMemoryEdit.hidden = true;
+}
+
+async function deleteMemory(item) {
+  if (!confirm(`删除这条 ${item.kind} 记忆？此操作不可恢复。`)) return;
+  try {
+    await api(`/api/memories/${item.id}`, { method: "DELETE" });
+    if (state.editingMemoryID === item.id) resetMemoryForm();
+    state.memories = state.memories.filter(memory => memory.id !== item.id);
+    renderMemories();
+    notify("长期记忆已删除");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+function toLocalDateTime(value) {
+  const date = new Date(value);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 16);
+}
+
+function formatDateTime(value) {
+  return new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
 async function uploadKnowledgeDocument(event) {
-	event.preventDefault();
-	const file = elements.knowledgeFile.files[0];
-	if (!file) return;
-	const formData = new FormData();
-	formData.append("file", file);
-	elements.uploadKnowledge.disabled = true;
-	elements.uploadKnowledge.textContent = "索引中…";
-	try {
-		const result = await api("/api/knowledge/documents", { method: "POST", body: formData });
-		await refreshKnowledgeDocuments();
-		elements.knowledgeUpload.reset();
-		elements.selectedFile.textContent = "尚未选择";
-		notify(result.deduplicated ? "文档内容已存在，未重复索引" : "文档已完成分块和索引");
-	} catch (error) {
-		notify(error.message);
-	} finally {
-		elements.uploadKnowledge.disabled = false;
-		elements.uploadKnowledge.textContent = "上传并索引";
-	}
+  event.preventDefault();
+  const file = elements.knowledgeFile.files[0];
+  if (!file) return;
+  const formData = new FormData();
+  formData.append("file", file);
+  elements.uploadKnowledge.disabled = true;
+  elements.uploadKnowledge.textContent = "索引中…";
+  try {
+    const result = await api("/api/knowledge/documents", { method: "POST", body: formData });
+    await refreshKnowledgeDocuments();
+    elements.knowledgeUpload.reset();
+    elements.selectedFile.textContent = "尚未选择";
+    notify(result.deduplicated ? "文档内容已存在，未重复索引" : "文档已完成分块和索引");
+  } catch (error) {
+    notify(error.message);
+  } finally {
+    elements.uploadKnowledge.disabled = false;
+    elements.uploadKnowledge.textContent = "上传并索引";
+  }
 }
 
 async function refreshKnowledgeDocuments() {
-	const result = await api("/api/knowledge/documents");
-	state.documents = result.documents || [];
-	renderKnowledgeDocuments();
+  const result = await api("/api/knowledge/documents");
+  state.documents = result.documents || [];
+  renderKnowledgeDocuments();
 }
 
 async function deleteKnowledgeDocument(document) {

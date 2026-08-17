@@ -13,11 +13,13 @@ import (
 	"net/http"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/knowledge"
+	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
 )
 
@@ -27,15 +29,16 @@ var webFiles embed.FS
 type Server struct {
 	chat           *chat.Service
 	knowledge      *knowledge.Service
+	memory         *memory.Service
 	logger         *slog.Logger
 	requestTimeout time.Duration
 }
 
-func New(chatService *chat.Service, knowledgeService *knowledge.Service, logger *slog.Logger, requestTimeout time.Duration) (http.Handler, error) {
-	if chatService == nil || knowledgeService == nil {
-		return nil, fmt.Errorf("对话服务和知识库服务不能为空")
+func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryService *memory.Service, logger *slog.Logger, requestTimeout time.Duration) (http.Handler, error) {
+	if chatService == nil || knowledgeService == nil || memoryService == nil {
+		return nil, fmt.Errorf("对话、知识库和长期记忆服务不能为空")
 	}
-	server := &Server{chat: chatService, knowledge: knowledgeService, logger: logger, requestTimeout: requestTimeout}
+	server := &Server{chat: chatService, knowledge: knowledgeService, memory: memoryService, logger: logger, requestTimeout: requestTimeout}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", server.health)
 	mux.HandleFunc("GET /api/info", server.info)
@@ -50,6 +53,11 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, logger 
 	mux.HandleFunc("POST /api/knowledge/documents", server.uploadKnowledgeDocument)
 	mux.HandleFunc("DELETE /api/knowledge/documents/{documentID}", server.deleteKnowledgeDocument)
 	mux.HandleFunc("POST /api/knowledge/search", server.searchKnowledge)
+	mux.HandleFunc("GET /api/memories", server.listMemories)
+	mux.HandleFunc("POST /api/memories", server.createMemory)
+	mux.HandleFunc("GET /api/memories/{memoryID}", server.getMemory)
+	mux.HandleFunc("PUT /api/memories/{memoryID}", server.replaceMemory)
+	mux.HandleFunc("DELETE /api/memories/{memoryID}", server.deleteMemory)
 
 	// 前端资源编译进 Go 二进制，部署时不需要额外静态文件服务器。
 	assets, err := fs.Sub(webFiles, "web")
@@ -68,12 +76,13 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	capabilities := []string{
 		"chat", "streaming", "tools", "persistence", "run-audit",
 		"knowledge-ingestion", "hybrid-retrieval", "knowledge-citations",
+		"semantic-memory", "episodic-memory", "memory-crud",
 	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.2.0-dev",
+		"name": "Zora", "version": "0.3.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"embedding_model":   s.knowledge.EmbeddingModel(),
 		"retrieval_backend": s.knowledge.RetrievalBackend(),
@@ -280,9 +289,104 @@ func (s *Server) searchKnowledge(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) listMemories(w http.ResponseWriter, r *http.Request) {
+	includeExpired := false
+	if raw := strings.TrimSpace(r.URL.Query().Get("include_expired")); raw != "" {
+		var err error
+		includeExpired, err = strconv.ParseBool(raw)
+		if err != nil {
+			s.problem(w, fmt.Errorf("include_expired 必须是 true 或 false"))
+			return
+		}
+	}
+	items, err := s.memory.List(r.Context(), r.URL.Query().Get("kind"), includeExpired)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"memories": items})
+}
+
+func (s *Server) createMemory(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeMemoryInput(w, r)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	item, err := s.memory.Create(r.Context(), memory.CreateInput{
+		Kind: input.Kind, Content: input.Content, Importance: input.Importance, ExpiresAt: input.ExpiresAt,
+	})
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, item)
+}
+
+func (s *Server) getMemory(w http.ResponseWriter, r *http.Request) {
+	item, err := s.memory.Get(r.Context(), r.PathValue("memoryID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) replaceMemory(w http.ResponseWriter, r *http.Request) {
+	input, err := decodeMemoryInput(w, r)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	item, err := s.memory.Replace(r.Context(), r.PathValue("memoryID"), memory.ReplaceInput{
+		Kind: input.Kind, Content: input.Content, Importance: input.Importance, ExpiresAt: input.ExpiresAt,
+	})
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
+	if err := s.memory.Delete(r.Context(), r.PathValue("memoryID")); err != nil {
+		s.problem(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type memoryRequest struct {
+	Kind       string
+	Content    string
+	Importance *float64
+	ExpiresAt  *time.Time
+}
+
+func decodeMemoryInput(w http.ResponseWriter, r *http.Request) (memoryRequest, error) {
+	var raw struct {
+		Kind       string   `json:"kind"`
+		Content    string   `json:"content"`
+		Importance *float64 `json:"importance"`
+		ExpiresAt  string   `json:"expires_at"`
+	}
+	if err := decodeJSON(w, r, &raw); err != nil {
+		return memoryRequest{}, err
+	}
+	result := memoryRequest{Kind: raw.Kind, Content: raw.Content, Importance: raw.Importance}
+	if value := strings.TrimSpace(raw.ExpiresAt); value != "" {
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return memoryRequest{}, fmt.Errorf("expires_at 必须是 RFC3339 时间，例如 2026-12-31T23:59:59+08:00")
+		}
+		result.ExpiresAt = &parsed
+	}
+	return result, nil
+}
+
 func (s *Server) problem(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
-	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) {
 		status = http.StatusNotFound
 	} else if errors.Is(err, knowledge.ErrEmbeddingMismatch) {
 		status = http.StatusConflict

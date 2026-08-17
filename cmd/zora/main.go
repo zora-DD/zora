@@ -18,6 +18,7 @@ import (
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/httpapi"
 	"github.com/zhiruo/zora/internal/knowledge"
+	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/store/postgres"
 	"github.com/zhiruo/zora/internal/store/sqlite"
@@ -26,6 +27,7 @@ import (
 type applicationStore interface {
 	store.Store
 	knowledge.Store
+	memory.Store
 }
 
 func main() {
@@ -64,6 +66,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	memoryService, err := memory.NewService(database)
+	if err != nil {
+		return err
+	}
 	// 知识库检索和时间、计算器一样走统一 Tool 协议，便于后续加入多 Agent 调度。
 	knowledgeTool, err := knowledge.NewSearchTool(knowledgeService)
 	if err != nil {
@@ -75,7 +81,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	chatService := chat.NewService(database, runtime)
-	handler, err := httpapi.New(chatService, knowledgeService, logger, cfg.RequestTimeout)
+	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout)
 	if err != nil {
 		return err
 	}

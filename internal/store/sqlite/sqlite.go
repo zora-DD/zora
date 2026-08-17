@@ -15,6 +15,7 @@ import (
 
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/knowledge"
+	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
 )
 
@@ -65,6 +66,22 @@ CREATE TABLE IF NOT EXISTS run_events (
 );
 CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence
     ON run_events(run_id, sequence);
+CREATE TABLE IF NOT EXISTS memories (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('semantic', 'episodic')),
+    content TEXT NOT NULL,
+    importance REAL NOT NULL CHECK (importance >= 0 AND importance <= 1),
+    source_type TEXT NOT NULL CHECK (source_type IN ('manual', 'conversation')),
+    source_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memories_kind_updated
+    ON memories(kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_expiry
+    ON memories(expires_at);
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -101,6 +118,8 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_document
 type SQLite struct {
 	db *sql.DB
 }
+
+var _ memory.Store = (*SQLite)(nil)
 
 // Open 创建数据库文件，并执行可重复运行的建表语句。
 func Open(path string) (*SQLite, error) {

@@ -10,6 +10,7 @@ import (
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/id"
 	"github.com/zhiruo/zora/internal/knowledge"
+	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
 )
 
@@ -43,6 +44,34 @@ func TestPostgresConversationAndKnowledgeLifecycle(t *testing.T) {
 	got, err := database.GetConversation(ctx, conversationID)
 	if err != nil || got.MessageCount != 1 {
 		t.Fatalf("get conversation = %+v, %v", got, err)
+	}
+
+	memoryItem := memory.Memory{
+		ID: id.New("pg_mem"), Kind: memory.KindSemantic,
+		Content: "用户主要使用 Go 语言。", Importance: 0.9,
+		SourceType: memory.SourceManual, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := database.CreateMemory(ctx, memoryItem); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.DeleteMemory(context.Background(), memoryItem.ID) })
+	memoryItem.Content = "用户主要使用 Go 开发 Agent。"
+	memoryItem.UpdatedAt = now.Add(time.Second)
+	if err := database.UpdateMemory(ctx, memoryItem); err != nil {
+		t.Fatal(err)
+	}
+	memories, err := database.ListMemories(ctx, memory.ListFilter{Kind: memory.KindSemantic, Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var foundMemory bool
+	for _, item := range memories {
+		if item.ID == memoryItem.ID && item.Content == memoryItem.Content {
+			foundMemory = true
+		}
+	}
+	if !foundMemory {
+		t.Fatalf("memory not found in PostgreSQL list: %+v", memories)
 	}
 
 	embedder, err := knowledge.NewHashEmbedder(384)

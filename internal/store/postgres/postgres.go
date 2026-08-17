@@ -12,6 +12,7 @@ import (
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 
 	"github.com/zhiruo/zora/internal/knowledge"
+	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
 )
 
@@ -30,6 +31,7 @@ var (
 	_ store.Store              = (*Postgres)(nil)
 	_ knowledge.Store          = (*Postgres)(nil)
 	_ knowledge.CandidateStore = (*Postgres)(nil)
+	_ memory.Store             = (*Postgres)(nil)
 )
 
 // Open 创建连接池并执行幂等迁移。每条连接先确认 vector 扩展存在，再注册其二进制类型。

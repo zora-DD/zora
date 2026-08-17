@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.2 Knowledge Base（SQLite + PostgreSQL/pgvector）
+> 适用版本：V0.3 Long-term Memory（Memory CRUD 底座）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -40,6 +40,7 @@ internal/
 ├── agentruntime/              Eino/模型适配与统一事件
 ├── knowledge/                 分块、Embedding、混合检索与 Agent Tool
 ├── rageval/                   检索指标、答案引用/忠实度指标与门禁
+├── memory/                    Semantic/Episodic 模型、校验和 CRUD 用例
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
 ```
@@ -55,10 +56,12 @@ flowchart TD
     Main --> Postgres["store/postgres"]
     Main --> Tools["agenttools"]
     Main --> Knowledge["knowledge"]
+    Main --> Memory["memory"]
     Eval["cmd/zora-eval"] --> RAGEval["rageval"]
     Eval --> Knowledge
     HTTP --> Chat
     HTTP --> Knowledge
+    HTTP --> Memory
     Chat --> Domain["domain"]
     Chat --> Store["store interface"]
     Chat --> Runtime
@@ -66,12 +69,15 @@ flowchart TD
     Tools --> Eino
     Knowledge --> Eino
     Knowledge --> KStore["knowledge.Store"]
+    Memory --> MStore["memory.Store"]
     RAGEval --> Knowledge
     SQLite --> Store
     SQLite --> KStore
+    SQLite --> MStore
     SQLite --> Domain
     Postgres --> Store
     Postgres --> KStore
+    Postgres --> MStore
     Postgres --> Domain
 ```
 
@@ -80,7 +86,7 @@ flowchart TD
 - `domain` 不依赖 Eino、HTTP 或数据库驱动；
 - `store.Store` 不暴露 SQL 类型；
 - `httpapi` 不直接调用模型和工具；
-- `httpapi` 只通过 `knowledge.Service` 调用摄取和检索用例；
+- `httpapi` 只通过 `knowledge.Service` 和 `memory.Service` 调用知识库与记忆用例；
 - `chat` 只依赖 `agentruntime.Runtime` 的统一事件；
 - 工具只能从 `agenttools.Build` 的 allowlist 注入。
 
@@ -291,12 +297,12 @@ SQL 子查询先按 sequence 倒序取最近 N 条，外层再升序输出。结
 
 ### 8.4 Store 替换策略
 
-应用层依赖 `store.Store` 与 `knowledge.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/Document 语义；`cmd/zora` 只在启动组装阶段选择实现。
+应用层依赖 `store.Store`、`knowledge.Store` 与 `memory.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/Document/Memory 语义；`cmd/zora` 只在启动组装阶段选择实现。
 
 PostgreSQL 已处理：
 
 - pgxpool 连接池和启动连通性检查；
-- `Conversation`、`Message`、`AgentRun`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk` 的事务与级联关系；
+- `Conversation`、`Message`、`AgentRun`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory` 的关系与约束；
 - advisory transaction lock 串行化多实例 DDL；
 - pgvector 类型注册、固定维度校验、HNSW cosine index；
 - 基于统一 tokenizer 词项的 `tsvector` generated column 和 GIN index。
@@ -425,6 +431,32 @@ PostgreSQL
 - vector/keyword 各最多返回 50 个候选；数据库返回原始分数和单路名次，融合公式仍在应用层；
 - Embedding 维度与现有列不一致时启动失败，禁止把不同维度静默写入同一索引；
 - `/api/info` 通过 `retrieval_backend` 返回 `sqlite-exact-scan` 或 `postgres-pgvector-fts`。
+
+### 8.10 长期记忆底座（当前实现）
+
+```mermaid
+sequenceDiagram
+    participant UI as Web Memory Panel
+    participant API as httpapi
+    participant Service as memory.Service
+    participant DB as SQLite/PostgreSQL
+
+    UI->>API: POST/PUT Memory
+    API->>API: 严格 JSON + RFC3339 解析
+    API->>Service: Create / Replace
+    Service->>Service: 类型、长度、重要性、过期时间校验
+    Service->>DB: memory.Store
+    DB-->>UI: 可追溯 Memory
+```
+
+当前 `Memory` 分为：
+
+- `semantic`：相对稳定的用户事实和偏好；
+- `episodic`：发生过的任务、经历和结果。
+
+每条记录包含来源类型、可选来源会话/消息、重要性、创建/更新时间和可选过期时间。手动创建使用 `source_type=manual`；后续自动提取将使用 `conversation` 并关联原始消息。默认列表排除过期记录，管理页面显式使用 `include_expired=true`，保证用户仍能查看和删除过期数据。
+
+这一阶段没有把 Memory 注入模型上下文，也没有把聊天消息批量向量化。自动提取、Consolidation、冲突处理和联合召回将在后续子阶段建立，并继续复用当前 Store 契约。
 
 ## 9. 并发、取消与错误处理
 
@@ -640,6 +672,29 @@ Content-Type: application/json
 
 `top_k` 默认 5，HTTP 调试接口最大 20。库中存在 Chunk 但没有与当前 Embedder 兼容的向量时返回 409，提示重建索引。
 
+### 10.13 长期记忆管理
+
+```http
+GET /api/memories?kind=semantic&include_expired=true
+POST /api/memories
+GET /api/memories/{memoryID}
+PUT /api/memories/{memoryID}
+DELETE /api/memories/{memoryID}
+```
+
+创建和完整更新请求：
+
+```json
+{
+  "kind": "semantic",
+  "content": "用户偏好使用 Go 编写后端服务。",
+  "importance": 0.8,
+  "expires_at": "2026-12-31T23:59:59+08:00"
+}
+```
+
+`importance` 范围为 0–1；创建时省略则默认 0.5，PUT 更新时必须提供。`expires_at` 为空字符串或省略表示永不过期；创建时非空值必须是晚于当前时间的 RFC3339，更新时允许设置过去时间以显式标记过期。非法类型、内容长度、重要性和时间返回 400；不存在的 Memory 返回 404；删除成功返回 204。
+
 ## 11. SSE 事件契约
 
 | 事件 | 关键字段 | 是否持久化 | 说明 |
@@ -658,6 +713,7 @@ Content-Type: application/json
 - 对话列表、自动标题、重命名和删除；
 - 欢迎页提供三个可触发工具的示例；
 - 侧边栏知识库弹窗支持上传、文档列表、分块数和删除；
+- 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，并明确提示尚未自动提取或召回；
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用以可折叠 Trace 展示；
@@ -679,6 +735,7 @@ Content-Type: application/json
 - 最大 Agent 迭代和请求超时；
 - 删除 Conversation 时明确由用户确认。
 - 删除知识文档时明确由用户确认，上传限制文件类型、大小和 UTF-8。
+- 删除长期记忆时明确由用户确认；来源字段不能通过用户编辑接口伪造。
 
 ### 上线前必须补充
 
@@ -710,12 +767,12 @@ Content-Type: application/json
 
 | 层级 | 当前覆盖 |
 |---|---|
-| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder |
+| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Memory 校验和生命周期 |
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta |
-| Store/知识库测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用和级联删除 |
+| Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD、类型和过期过滤 |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
-| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索和删除 |
+| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索，以及 Memory CRUD/404 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
 | 工程检查 | `go test`、`go vet`、race、无 CGO build |
 
@@ -788,7 +845,7 @@ flowchart LR
 程序性记忆：Skill、规则和工具经验
 ```
 
-一次对话结束后执行候选提取、置信度判断、去重/合并和过期设置。召回按相关性、时效性和重要性联合排序，用户必须能查看、修改和删除。
+当前已完成 Semantic/Episodic Schema、SQLite/PostgreSQL Store、重要性/来源/过期字段、REST API 和 Web 用户 CRUD。下一步是在一次对话成功结束后执行候选提取、置信度判断、去重/合并和过期设置，再按相关性、时效性和重要性联合召回并注入 Agent 上下文。召回上线前必须建立有/无记忆 A/B 评测，避免错误记忆降低回答质量。
 
 ### 17.3 V0.4 Multi-Agent
 

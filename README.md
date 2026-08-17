@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.2 Knowledge Base（开发中）**。V0.1 Agent Core 已完成，当前已打通本地 SQLite 与 PostgreSQL/pgvector 两种 RAG 运行模式。
+当前版本：**V0.3 Long-term Memory（开发中）**。V0.1 Agent Core 已完成，V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.3 正在建设可追溯、可由用户控制的长期记忆。
 
 ## 当前能力
 
@@ -22,7 +22,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | RAG 检索与答案评测 | 已完成 | 对比三路召回，并通过真实 Agent 链路评估事实覆盖、有效引用覆盖和引用忠实度 |
 | PostgreSQL 向量库 | 已实现 | pgx 连接池、幂等迁移、pgvector HNSW、PostgreSQL FTS、RRF 候选融合 |
 | 生产知识库剩余项 | V0.2 进行中 | 文档权限、版本、PDF、更强语义评测和真实数据验收 |
-| 长期记忆 | V0.3 | Semantic/Episodic Memory、合并、过期和用户控制 |
+| 长期记忆底座 | 已完成 | Semantic/Episodic Schema、重要性、来源、过期时间、SQLite/PostgreSQL 和用户 CRUD |
+| 自动记忆 | V0.3 进行中 | 候选提取、去重/冲突合并、召回注入、短期摘要和 A/B 评估 |
 | 多 Agent | V0.4 | Supervisor、专业 Agent、预算和对照评估 |
 | 办公助手 | V0.5 | MCP、文件/邮件/日历、审批和审计 |
 
@@ -38,6 +39,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **双存储后端**：SQLite 保留零依赖精确扫描；PostgreSQL 将向量和全文候选召回下推数据库，HTTP 与 Agent Tool 契约保持不变。
 - **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
+- **长期记忆不是消息向量库**：Memory 拥有独立类型、来源、重要性和过期时间；当前先提供用户完全可控的 CRUD，再逐步加入自动提取和召回。
 - **明确的终态语义**：每次请求最终进入 completed、failed 或 cancelled。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -58,6 +60,8 @@ make run
 ```
 
 打开 [http://localhost:8088](http://localhost:8088)。默认不需要 API Key。
+
+侧边栏“长期记忆”可手动维护 `semantic`（稳定事实/偏好）和 `episodic`（经历/事件）记忆，并设置重要性及可选过期时间。当前版本尚不会自动从对话提取记忆，也不会把这些记忆注入模型上下文。
 
 可以尝试：
 
@@ -247,6 +251,11 @@ sequenceDiagram
 | `POST` | `/api/knowledge/documents` | multipart 上传 TXT/Markdown 并同步索引 |
 | `DELETE` | `/api/knowledge/documents/{id}` | 删除文档及其分块 |
 | `POST` | `/api/knowledge/search` | 执行向量 + BM25/RRF 混合检索 |
+| `GET` | `/api/memories` | 查询长期记忆，可按类型筛选并选择是否包含已过期项 |
+| `POST` | `/api/memories` | 手动创建 Semantic/Episodic 记忆 |
+| `GET` | `/api/memories/{id}` | 查询单条长期记忆及来源 |
+| `PUT` | `/api/memories/{id}` | 完整更新内容、类型、重要性和过期时间 |
+| `DELETE` | `/api/memories/{id}` | 用户删除长期记忆 |
 
 SSE 事件：`start`、`tool_call`、`tool_result`、`delta`、`done`、`error`。
 
@@ -265,6 +274,7 @@ internal/agentruntime/     Eino Runtime、模型适配和事件转换
 internal/agenttools/       只读工具和安全计算器
 internal/knowledge/        文档分块、Embedding、混合检索和 Agent Tool
 internal/rageval/          检索指标、答案引用/忠实度指标和门禁
+internal/memory/           Semantic/Episodic 模型、校验和用户可控 CRUD
 internal/chat/             会话用例、并发控制和 Run 生命周期
 internal/store/            可替换的持久化接口
 internal/store/sqlite/     对话与知识库的 SQLite 实现
@@ -345,8 +355,8 @@ CGO_ENABLED=0 go build ./cmd/zora
 ## Roadmap
 
 - V0.1：Agent Core——已完成
-- V0.2：向量知识库与 RAG——进行中，SQLite/pgvector 双后端已实现
-- V0.3：长期记忆
+- V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
+- V0.3：长期记忆——Schema、双存储和用户 CRUD 已完成，自动提取/召回进行中
 - V0.4：多 Agent
 - V0.5：MCP 办公助手
 

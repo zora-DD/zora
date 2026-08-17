@@ -20,6 +20,10 @@ func TestSchemaUsesConfiguredVectorDimensions(t *testing.T) {
 		"embedding vector(384)",
 		"USING hnsw (embedding vector_cosine_ops)",
 		"USING gin (search_vector)",
+		"CREATE TABLE IF NOT EXISTS memories",
+		"kind IN ('semantic', 'episodic')",
+		"importance >= 0 AND importance <= 1",
+		"INSERT INTO zora_schema_versions(version) VALUES (2)",
 	} {
 		if !strings.Contains(schema, expected) {
 			t.Fatalf("schema does not contain %q", expected)

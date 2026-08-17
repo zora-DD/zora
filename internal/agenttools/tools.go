@@ -80,13 +80,14 @@ func Build() ([]tool.BaseTool, error) {
 		"介绍当前 Zora 项目的已实现能力与下一个里程碑。",
 		func(_ context.Context, _ *projectStatusInput) (*projectStatusOutput, error) {
 			return &projectStatusOutput{
-				Version: "0.2.0-dev",
+				Version: "0.3.0-dev",
 				Available: []string{
 					"流式对话", "持久化会话", "Eino ReAct 循环",
 					"只读工具", "执行事件审计", "TXT/Markdown 知识库摄取",
-					"向量与 BM25 混合检索", "知识库引用",
+					"向量与 BM25 混合检索", "知识库引用与答案评测",
+					"Semantic/Episodic 长期记忆 Schema", "长期记忆用户管理",
 				},
-				NextMilestone: "PostgreSQL + pgvector 检索与异步文档解析",
+				NextMilestone: "记忆候选提取、Consolidation 与联合召回",
 			}, nil
 		},
 	)

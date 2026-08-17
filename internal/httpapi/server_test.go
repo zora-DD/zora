@@ -20,6 +20,7 @@ import (
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/knowledge"
+	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store/sqlite"
 )
 
@@ -47,7 +48,11 @@ func TestConversationAndAgentSSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := New(chat.NewService(database, runtime), knowledgeService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	memoryService, err := memory.NewService(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := New(chat.NewService(database, runtime), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +172,9 @@ func TestEmbeddedSPA(t *testing.T) {
 		if path != "/styles.css" && !strings.Contains(response.Body.String(), "Zora Agent") {
 			t.Fatalf("GET %s did not serve the SPA entry", path)
 		}
+		if path == "/" && !strings.Contains(response.Body.String(), "长期记忆") {
+			t.Fatalf("GET / did not include the memory management entry")
+		}
 	}
 }
 
@@ -181,6 +189,65 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	}
 	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
 		t.Fatalf("info body = %s", response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"version":"0.3.0-dev"`) || !strings.Contains(response.Body.String(), `"memory-crud"`) {
+		t.Fatalf("info does not report V0.3 memory capability: %s", response.Body.String())
+	}
+}
+
+func TestMemoryCRUD(t *testing.T) {
+	t.Parallel()
+	handler := newTestHandler(t)
+
+	create := httptest.NewRequest(http.MethodPost, "/api/memories", strings.NewReader(`{
+		"kind":"semantic",
+		"content":"用户偏好使用 Go 编写后端服务。",
+		"importance":0.8
+	}`))
+	create.Header.Set("Content-Type", "application/json")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create memory status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var item memory.Memory
+	if err := json.Unmarshal(created.Body.Bytes(), &item); err != nil {
+		t.Fatal(err)
+	}
+	if item.ID == "" || item.Kind != memory.KindSemantic || item.SourceType != memory.SourceManual {
+		t.Fatalf("unexpected created memory: %+v", item)
+	}
+
+	list := httptest.NewRequest(http.MethodGet, "/api/memories?kind=semantic&include_expired=true", nil)
+	listed := httptest.NewRecorder()
+	handler.ServeHTTP(listed, list)
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), item.ID) {
+		t.Fatalf("list memories status = %d, body = %s", listed.Code, listed.Body.String())
+	}
+
+	replace := httptest.NewRequest(http.MethodPut, "/api/memories/"+item.ID, strings.NewReader(`{
+		"kind":"episodic",
+		"content":"用户在 2026 年开始开发 Zora 长期记忆。",
+		"importance":0.9
+	}`))
+	replace.Header.Set("Content-Type", "application/json")
+	replaced := httptest.NewRecorder()
+	handler.ServeHTTP(replaced, replace)
+	if replaced.Code != http.StatusOK || !strings.Contains(replaced.Body.String(), `"kind":"episodic"`) {
+		t.Fatalf("replace memory status = %d, body = %s", replaced.Code, replaced.Body.String())
+	}
+
+	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/memories/"+item.ID, nil)
+	deleted := httptest.NewRecorder()
+	handler.ServeHTTP(deleted, deleteRequest)
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("delete memory status = %d, body = %s", deleted.Code, deleted.Body.String())
+	}
+	missing := httptest.NewRequest(http.MethodGet, "/api/memories/"+item.ID, nil)
+	notFound := httptest.NewRecorder()
+	handler.ServeHTTP(notFound, missing)
+	if notFound.Code != http.StatusNotFound {
+		t.Fatalf("get deleted memory status = %d, body = %s", notFound.Code, notFound.Body.String())
 	}
 }
 
@@ -208,7 +275,11 @@ func newTestHandler(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := New(chat.NewService(database, runtime), knowledgeService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	memoryService, err := memory.NewService(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := New(chat.NewService(database, runtime), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

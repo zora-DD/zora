@@ -29,7 +29,7 @@ body {
   color: var(--text);
 }
 
-button, textarea, input { font: inherit; }
+button, textarea, input, select { font: inherit; }
 button { color: inherit; }
 
 .app-shell {
@@ -352,6 +352,38 @@ button { color: inherit; }
 .document-item span { margin-top: 5px; color: var(--muted-2); font-size: 9px; }
 .document-item button { padding: 5px 8px; border: 0; border-radius: 7px; background: transparent; color: var(--muted-2); font-size: 9px; cursor: pointer; }
 .document-item button:hover { background: rgba(255,107,125,.12); color: var(--danger); }
+.memory-form { display: grid; gap: 12px; padding: 12px 20px 18px; border-bottom: 1px solid var(--line); }
+.memory-form-row { display: grid; grid-template-columns: minmax(0, 1fr) 140px; gap: 10px; }
+.memory-form label { display: grid; gap: 6px; color: var(--muted); font-size: 10px; }
+.memory-form input, .memory-form select, .memory-form textarea {
+  width: 100%;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  outline: 0;
+  background: rgba(0,0,0,.2);
+  color: var(--text);
+}
+.memory-form input, .memory-form select { min-height: 36px; padding: 7px 9px; }
+.memory-form textarea { min-height: 76px; padding: 9px 10px; resize: vertical; line-height: 1.6; }
+.memory-form input:focus, .memory-form select:focus, .memory-form textarea:focus { border-color: rgba(124,102,255,.55); }
+.memory-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.memory-form-actions button { min-height: 34px; padding: 0 12px; border: 0; border-radius: 9px; cursor: pointer; font-size: 10px; }
+.memory-form-actions button[type="button"] { background: var(--panel-3); color: var(--muted); }
+.memory-form-actions button[type="submit"] { background: var(--accent); color: white; }
+.memory-form-actions button:disabled { opacity: .55; cursor: wait; }
+.memory-list { max-height: 330px; padding: 14px 20px 20px; overflow-y: auto; }
+.memory-item { position: relative; padding: 13px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.018); }
+.memory-item + .memory-item { margin-top: 9px; }
+.memory-item.expired { opacity: .58; }
+.memory-item-heading { display: flex; align-items: center; gap: 8px; }
+.memory-item-heading strong { padding: 3px 7px; border-radius: 6px; background: var(--accent-soft); color: #cfc9ff; font-size: 9px; text-transform: uppercase; }
+.memory-item-heading span { margin-left: auto; color: var(--muted-2); font-size: 9px; }
+.memory-item p { margin: 10px 0 8px; color: #d8d9de; font-size: 11px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.memory-item small { color: var(--muted-2); font-size: 9px; }
+.memory-item-actions { display: flex; gap: 5px; margin-top: 9px; }
+.memory-item-actions button { padding: 5px 8px; border: 0; border-radius: 7px; background: var(--panel-3); color: var(--muted); font-size: 9px; cursor: pointer; }
+.memory-item-actions button:hover { color: var(--text); }
+.memory-item-actions button:last-child:hover { background: rgba(255,107,125,.12); color: var(--danger); }
 .mobile-only { display: none; }
 .sidebar-scrim { display: none; }
 
@@ -376,6 +408,7 @@ button { color: inherit; }
   .message { grid-template-columns: 28px minmax(0, 1fr); gap: 10px; }
   .upload-form { flex-direction: column; }
   .upload-form > button { min-height: 38px; }
+  .memory-form-row { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

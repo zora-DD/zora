@@ -54,6 +54,23 @@ CREATE TABLE IF NOT EXISTS run_events (
 CREATE INDEX IF NOT EXISTS idx_run_events_run_sequence
     ON run_events(run_id, sequence);
 
+CREATE TABLE IF NOT EXISTS memories (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('semantic', 'episodic')),
+    content TEXT NOT NULL,
+    importance DOUBLE PRECISION NOT NULL CHECK (importance >= 0 AND importance <= 1),
+    source_type TEXT NOT NULL CHECK (source_type IN ('manual', 'conversation')),
+    source_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+    source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_memories_kind_updated
+    ON memories(kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_expiry
+    ON memories(expires_at);
+
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -94,4 +111,5 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_search_gin
     ON knowledge_chunks USING gin (search_vector);
 
 INSERT INTO zora_schema_versions(version) VALUES (1) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (2) ON CONFLICT DO NOTHING;
 `
