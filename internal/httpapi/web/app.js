@@ -7,6 +7,8 @@ const state = {
   documents: [],
   memories: [],
   officeDrafts: [],
+  officeOperations: [],
+  officeExecution: false,
   memoryAutoCapture: false,
   memoryRecall: false,
   multiAgent: false,
@@ -90,10 +92,11 @@ async function initialize() {
   bindEvents();
   resizeInput();
   try {
-    const [info, result, knowledgeResult, memoryResult, officeDraftResult] = await Promise.all([
+    const [info, result, knowledgeResult, memoryResult, officeDraftResult, officeOperationResult] = await Promise.all([
       api("/api/info"), api("/api/conversations"), api("/api/knowledge/documents"),
       api("/api/memories?include_expired=true"),
       api("/api/office/drafts?limit=200"),
+      api("/api/office/operations?limit=200"),
     ]);
     elements.runtimeModel.textContent = info.model;
     state.multiAgent = Boolean(info.multi_agent);
@@ -104,6 +107,8 @@ async function initialize() {
     state.documents = knowledgeResult.documents || [];
     state.memories = memoryResult.memories || [];
     state.officeDrafts = officeDraftResult.drafts || [];
+    state.officeOperations = officeOperationResult.operations || [];
+    state.officeExecution = Boolean(info.office_execution);
     state.memoryAutoCapture = Boolean(info.memory_auto_capture);
     state.memoryRecall = Boolean(info.memory_recall);
     elements.memoryDescription.textContent = memoryStatusText();
@@ -199,8 +204,12 @@ async function openOfficeDrafts() {
 }
 
 async function refreshOfficeDrafts() {
-  const result = await api("/api/office/drafts?limit=200");
-  state.officeDrafts = result.drafts || [];
+  const [draftResult, operationResult] = await Promise.all([
+    api("/api/office/drafts?limit=200"),
+    api("/api/office/operations?limit=200"),
+  ]);
+  state.officeDrafts = draftResult.drafts || [];
+  state.officeOperations = operationResult.operations || [];
   renderOfficeDrafts();
 }
 
@@ -218,6 +227,7 @@ function renderOfficeDrafts() {
 }
 
 function officeDraftNode(item) {
+  const operation = state.officeOperations.find(value => value.draft_id === item.id);
   const card = document.createElement("article");
   card.className = "office-draft-item";
   const heading = document.createElement("div");
@@ -251,12 +261,31 @@ function officeDraftNode(item) {
       officeDraftAction("拒绝", "danger", () => decideOfficeDraft(item, "rejected")),
       officeDraftAction("批准", "primary", () => decideOfficeDraft(item, "approved")),
     );
+  } else if (item.status === "approved" && !operation) {
+    actions.append(officeDraftAction("准备执行任务", "primary", () => prepareOfficeOperation(item)));
+  } else if (operation?.status === "pending" && state.officeExecution) {
+    actions.append(officeDraftAction("执行已批准草稿", "primary", () => executeOfficeOperation(item, operation)));
+  } else if (operation?.status === "failed" && state.officeExecution) {
+    actions.append(officeDraftAction("使用原幂等键重试", "primary", () => executeOfficeOperation(item, operation)));
   }
   actions.append(officeDraftAction("查看记录", "", () => showOfficeDraftEvents(item, card)));
+  if (operation) {
+    actions.append(officeDraftAction("查看执行审计", "", () => showOfficeOperationEvents(operation, card)));
+  }
   const safety = document.createElement("p");
   safety.className = "office-draft-safety";
-  safety.textContent = item.status === "approved"
-    ? "已记录批准决定，但尚未执行外部操作。"
+  safety.textContent = operation?.status === "completed"
+    ? `外部操作已完成${operation.external_reference ? `，远端引用：${operation.external_reference}` : ""}。`
+    : operation?.status === "failed"
+      ? `第 ${operation.attempt} 次执行失败：${operation.last_error || "未返回错误详情"}`
+      : operation?.status === "executing"
+        ? `第 ${operation.attempt} 次执行中，任务由数据库租约保护。`
+        : operation?.status === "pending"
+          ? state.officeExecution
+            ? "执行任务已持久化，等待你再次确认后调用外部系统。"
+            : "执行任务已持久化，但当前未配置真实外部写执行器，不能执行。"
+    : item.status === "approved"
+      ? "已记录批准决定，但尚未准备执行任务。"
     : item.status === "rejected"
       ? "已拒绝，不会产生外部操作。"
       : item.status === "pending_confirmation"
@@ -264,6 +293,65 @@ function officeDraftNode(item) {
         : "仅保存在 Zora 内部，尚未提交确认。";
   card.append(heading, title, detail, meta, safety, actions);
   return card;
+}
+
+async function prepareOfficeOperation(item) {
+  if (!confirm(`为草稿「${item.title}」创建持久化执行任务？\n\n此步骤不会调用外部系统，任务会绑定唯一幂等键。`)) return;
+  try {
+    const result = await api(`/api/office/drafts/${item.id}/operation`, { method: "POST" });
+    await refreshOfficeDrafts();
+    notify(result.execution_enabled
+      ? "执行任务已准备，请核对后再执行"
+      : "执行任务已准备；真实写执行器尚未配置");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function executeOfficeOperation(item, operation) {
+  const action = operation.status === "failed" ? "重试" : "执行";
+  if (!confirm(`${action}草稿「${item.title}」？\n\n确认后将调用真实外部系统。失败重试会继续使用原幂等键，避免重复业务操作。`)) return;
+  try {
+    const result = await api(`/api/office/operations/${operation.id}/execute`, { method: "POST" });
+    await refreshOfficeDrafts();
+    notify(result.message);
+  } catch (error) {
+    await refreshOfficeDrafts().catch(() => {});
+    notify(error.message);
+  }
+}
+
+async function showOfficeOperationEvents(operation, card) {
+  try {
+    const result = await api(`/api/office/operations/${operation.id}/events`);
+    card.querySelector(".office-operation-events")?.remove();
+    const list = document.createElement("ol");
+    list.className = "office-draft-events office-operation-events";
+    const events = result.events || [];
+    for (const event of events) {
+      const row = document.createElement("li");
+      const from = event.from_status ? officeOperationStatusText(event.from_status) : "任务创建";
+      row.textContent = `${formatDateTime(event.created_at)} · ${from} → ${officeOperationStatusText(event.to_status)} · 第 ${event.attempt} 次${event.reason ? ` · ${event.reason}` : ""}`;
+      list.append(row);
+    }
+    if (!events.length) {
+      const row = document.createElement("li");
+      row.textContent = "尚无执行审计记录";
+      list.append(row);
+    }
+    card.append(list);
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+function officeOperationStatusText(status) {
+  return ({
+    pending: "等待执行",
+    executing: "执行中",
+    completed: "执行完成",
+    failed: "执行失败",
+  })[status] || status;
 }
 
 function officeDraftStatusText(status) {
@@ -302,7 +390,9 @@ async function submitOfficeDraft(item) {
 async function decideOfficeDraft(item, decision) {
   const approved = decision === "approved";
   const action = approved ? "批准" : "拒绝";
-  const warning = approved ? "批准只记录决定，当前版本不会立即发送或创建日程。" : "拒绝后不会产生外部操作。";
+  const warning = approved
+    ? "批准只记录决定；之后还要创建持久化执行任务并再次确认，不会立即发送或创建日程。"
+    : "拒绝后不会产生外部操作。";
   if (!confirm(`${action}草稿「${item.title}」？\n\n${warning}`)) return;
   try {
     const result = await api(`/api/office/drafts/${item.id}/decision`, {

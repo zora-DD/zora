@@ -182,11 +182,11 @@
     <div class="dialog-heading">
       <div>
         <strong>办公草稿</strong>
-        <span>邮件 / 日程 · 持久化人工确认</span>
+        <span>邮件 / 日程 · 确认、执行与审计</span>
       </div>
       <button class="icon-button" id="closeOfficeDrafts" aria-label="关闭办公草稿">×</button>
     </div>
-    <p class="dialog-description">这里的内容只保存在 Zora 数据库中，不会发送邮件或写入日历。你可以提交、批准或拒绝草稿；即使批准，当前版本仍不会执行外部操作。</p>
+    <p class="dialog-description">草稿批准后会先生成带唯一幂等键的持久化执行任务，再由已配置的真实写连接器执行。未配置连接器时只能准备任务；系统不会把预览或模拟结果标记为已发送。</p>
     <div class="office-draft-list" id="officeDraftList"></div>
   </dialog>
 

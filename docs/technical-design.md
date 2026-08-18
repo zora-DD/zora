@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.5 Office Agent 第四阶段（草稿级持久化人工确认）
+> 适用版本：V0.5 Office Agent 第五阶段（幂等可恢复执行内核）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -679,22 +679,49 @@ recency = exp(-ln(2) * age / 90 days)
 
 ### 8.15 Office 草稿状态与一致性
 
-`office_drafts` 同时支持 SQLite JSON 文本和 PostgreSQL JSONB，保存 `kind`、`status`、归属 Conversation、来源 Agent Run、规范化 Payload、内容哈希和时间戳。当前 Service 支持 `draft`、`pending_confirmation`、`approved`、`rejected`；Schema 为后续执行预留 `executing`、`completed`、`failed`、`cancelled`，但当前 Service 不允许进入执行状态，避免把目标设计误当成交付能力。
+`office_drafts` 同时支持 SQLite JSON 文本和 PostgreSQL JSONB，保存 `kind`、`status`、归属 Conversation、来源 Agent Run、规范化 Payload、内容哈希和时间戳。`office_operations` 保存草稿唯一任务、稳定幂等键、执行器、attempt、租约、错误、远端引用和完成时间；两者分别使用追加式事件表审计。
 
 ```text
-当前阶段：
 draft → pending_confirmation → approved（已批准、未执行）
                             └→ rejected
 
-下一阶段目标：
-approved → executing → completed
-                    ├→ cancelled
-                    └→ failed
+approved → Operation(pending)
+                    └→ executing → completed
+                                 └→ failed → executing（原幂等键重试）
+```
+
+```mermaid
+sequenceDiagram
+    participant User as Web / API
+    participant Office as office.Service
+    participant Store as SQLite / PostgreSQL
+    participant Executor as 幂等外部执行器
+    User->>Office: PrepareOperation(approved draft)
+    Office->>Store: 创建或返回唯一 pending Operation
+    User->>Office: ExecuteOperation(operationID)
+    alt Executor 未配置
+        Office-->>User: 503，任务保持 pending
+    else Executor 已通过幂等门禁
+        Office->>Store: 原子领取租约 + Draft/Operation → executing
+        Office->>Executor: Execute(draft, stable idempotency key)
+        alt 真实成功且有远端引用
+            Office->>Store: 原子提交 completed + 双审计
+        else 调用失败或结果不可核验
+            Office->>Store: 原子提交 failed + 双审计
+        end
+        Office-->>User: 持久化后的任务与草稿状态
+    end
 ```
 
 Conversation 或 Agent Run 删除时，草稿通过 `ON DELETE SET NULL` 保留，避免审计对象随聊天清理而消失。只有 `draft` 状态允许删除；进入确认链后必须通过显式状态迁移处理。`source_run_id + content_hash` 唯一约束为同一 Run 内的工具重试提供幂等性。
 
 人工确认使用 compare-and-swap：SQL 只有在当前状态等于预期状态时才更新。提交确认要求 `draft`，决定要求 `pending_confirmation`；重复或并发请求返回 409。状态更新与 `office_draft_events` 插入在同一事务提交，事件记录 from/to、actor、原因和时间，避免状态与审计半完成。当前没有身份系统，actor 固定为 `user`；生产接入后必须替换为真实主体 ID。
+
+准备执行先按 `draft_id` 查询已有任务；不存在时为 approved 草稿生成 `SHA-256(draft_id + content_hash)`，数据库同时对 draft_id 与 idempotency_key 建唯一约束。并发准备只有一个创建成功，其余返回同一任务。执行器未配置时返回 503，Operation 保持 pending、attempt=0。
+
+执行前由 Store 在单事务锁定/串行读取 Operation 和 Draft：只允许 pending+approved 或 failed+failed 组合进入 executing，同时写 executor_name、attempt+1、lease owner/until 和两类事件。执行结束再次校验状态与 lease owner，原子提交 completed/failed。成功必须同时满足 `ExternalEffect=true` 与非空 `ExternalReference`；否则按失败落库。HTTP Context 即使已取消，Service 仍使用最长 5 秒的无取消 Context 尽力释放租约并保存结果。
+
+Executor 在 Service 组装时必须通过 `IdempotencySafe()` 门禁。进程启动查询 lease_until 已过期的 executing 任务并恢复为 failed；重试继续使用原幂等键。该契约要求具体 Graph 适配器能够安全重放，接口声明本身不能替代真实故障注入和租户验收。
 
 ## 9. 并发、取消与错误处理
 
@@ -1017,6 +1044,11 @@ DELETE /api/office/drafts/{draftID}
 POST /api/office/drafts/{draftID}/confirmation
 POST /api/office/drafts/{draftID}/decision
 GET /api/office/drafts/{draftID}/events
+POST /api/office/drafts/{draftID}/operation
+GET /api/office/operations?draft_id={draftID}&status=pending&limit=100
+GET /api/office/operations/{operationID}
+GET /api/office/operations/{operationID}/events
+POST /api/office/operations/{operationID}/execute
 ```
 
 列表默认最多返回 100 条、按更新时间倒序，`kind` 可选 `email`/`calendar`，`status` 当前使用 `draft`。详情响应为完整 Draft；邮件 Payload 包含 `to`、`cc`、`subject`、`body`，日历 Payload 包含 `attendees`、`subject`、`start`、`end`、`timezone`、`location`、`body` 和 `is_all_day`。
@@ -1024,6 +1056,10 @@ GET /api/office/drafts/{draftID}/events
 只有内部预览状态的草稿可以删除；成功返回 204，不存在返回 404，非法筛选参数返回 400。创建不开放独立 REST API，只能由 Agent 在有效 Run 中调用草稿预览 Tool，确保每条草稿都有可信 `source_run_id`。
 
 `POST .../confirmation` 无请求体，把 `draft` 原子推进到 `pending_confirmation`。决定请求为 `{"decision":"approved","reason":"收件人和正文已核对"}`，decision 只允许 approved/rejected，reason 最多 500 字符。重复提交或重复决定返回 409；成功响应固定包含 `external_effect:false` 和“尚未执行”提示。事件接口按时间返回不可变迁移记录。
+
+`POST .../operation` 只接受 approved 草稿，首次返回 201，重复准备返回 200 和同一 Operation，响应始终为 `external_effect:false`。任务列表支持 draft_id/status/limit；详情返回 attempt、lease_until、last_error 和 external_reference，但 `lease_owner` 不序列化。事件按时间返回 from/to、attempt、actor 与中文原因。
+
+`POST .../execute` 没有请求体。未配置 Executor 返回 503，任务不变；状态冲突返回 409。配置执行器后同步领取租约并执行：业务调用失败返回 200 + failed Operation + `external_effect:false`，便于 Web 直接展示可重试状态；真实成功返回 completed + `external_effect:true` 和远端引用。已完成任务重复调用直接返回持久化结果，不会再次调用 Executor。
 
 ## 11. SSE 事件契约
 
@@ -1049,7 +1085,7 @@ GET /api/office/drafts/{draftID}/events
 - 欢迎页提供三个可触发工具的示例；
 - 侧边栏知识库弹窗支持上传、文档列表、分块数和删除；
 - 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，展示手动/对话来源、人工修正状态及自动提取/召回开关状态；
-- 侧边栏办公草稿面板展示持久化邮件/日历预览、来源 Run、更新时间和中文状态；支持删除 draft、提交确认、一次性批准/拒绝及查看迁移记录；
+- 侧边栏办公草稿面板展示持久化邮件/日历预览、来源 Run、更新时间和中文状态；支持删除 draft、提交确认、一次性批准/拒绝、准备唯一执行任务，并查看草稿/Operation 双审计；仅在真实 Executor 启用时展示执行或原幂等键重试按钮；
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用和专业 Agent 协作均以可折叠 Trace 展示；专家中间输出不会进入最终回答气泡；
@@ -1065,7 +1101,7 @@ GET /api/office/drafts/{draftID}/events
 - API Key 不落库、不返回前端；
 - Tool allowlist；
 - Supervisor 只能调用专业 AgentTool；Research/Document/Writer 分别使用独立工具 allowlist，且只接收结构化 request；
-- 无 Shell、代码执行和外部写操作；
+- 无 Shell、代码执行；默认未配置真实外部写 Executor；
 - 计算器不使用 eval；
 - JSON 严格解码和大小限制；
 - 模型输出 HTML 转义；
@@ -1206,7 +1242,7 @@ flowchart LR
 
 ### 17.4 V0.5 Office Agent
 
-第四阶段在官方 MCP 只读链路和持久化邮件/日历草稿预览基础上，增加了草稿级人工确认。现有只读连接器链路如下：
+第五阶段在官方 MCP 只读链路、持久化邮件/日历草稿预览和草稿级人工确认基础上，增加了幂等可恢复执行内核。现有只读连接器链路如下：
 
 ```mermaid
 sequenceDiagram
@@ -1255,7 +1291,9 @@ Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，�
 
 第四阶段将确认直接绑定到 OfficeDraft，而不是复用会暂停 Agent Run 的通用审批等待器。独立 REST/Web 流程执行 `draft → pending_confirmation → approved/rejected`，数据库 CAS 保证决定一次性，`office_draft_events` 与状态原子落库。该能力仍没有调用 `sendMail`、`events POST` 等外部写接口，因此“草稿已批准”也不能表述为“邮件已发送”或“日程已创建”。
 
-下一阶段需要从 approved 草稿创建独立幂等 Operation，增加执行租约、失败恢复、结果回写，并补齐 OAuth 登录/刷新、Secret 托管、最小 Graph 写权限和真实租户集成测试。当前人工确认完成不代表办公写操作已安全落地。
+第五阶段从 approved 草稿幂等创建唯一 OfficeOperation。SQLite/PostgreSQL 使用草稿唯一约束、稳定 SHA-256 幂等键、租约和 attempt 控制并发/重试；领取、完成、失败与 Draft 状态及双事件表原子提交。启动恢复过期 executing，执行器门禁拒绝不支持幂等重放的实现，成功还必须提供可核验远端引用。REST/Web 已支持任务准备、状态、双审计和条件执行，默认未配置 Executor 时明确返回 503 且不改变任务。
+
+下一阶段需要在 Executor 权限边界后实现 Microsoft Graph 写适配，并补齐 OAuth 登录/刷新、Secret 托管、最小 Graph 写权限、故障注入和真实租户集成测试。当前 Operation 内核通过不代表真实办公写操作已经上线。
 
 ## 18. 维护约定
 

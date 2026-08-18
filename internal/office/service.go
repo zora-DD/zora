@@ -25,15 +25,39 @@ const (
 )
 
 type Service struct {
-	store Store
-	now   func() time.Time
+	store         Store
+	executor      Executor
+	workerID      string
+	leaseDuration time.Duration
+	now           func() time.Time
 }
 
-func NewService(store Store) (*Service, error) {
+type ServiceOption func(*Service)
+
+// WithExecutor 注入真实外部写执行器。执行器不满足幂等重放契约时拒绝启动。
+func WithExecutor(executor Executor) ServiceOption {
+	return func(service *Service) { service.executor = executor }
+}
+
+func NewService(store Store, options ...ServiceOption) (*Service, error) {
 	if store == nil {
 		return nil, fmt.Errorf("办公草稿存储不能为空")
 	}
-	return &Service{store: store, now: time.Now}, nil
+	service := &Service{
+		store: store, workerID: id.New("office_worker"), leaseDuration: 2 * time.Minute, now: time.Now,
+	}
+	for _, option := range options {
+		option(service)
+	}
+	if service.executor != nil {
+		if strings.TrimSpace(service.executor.Name()) == "" {
+			return nil, fmt.Errorf("办公执行器名称不能为空")
+		}
+		if !service.executor.IdempotencySafe() {
+			return nil, fmt.Errorf("办公执行器 %q 不支持幂等重放，已拒绝启用", service.executor.Name())
+		}
+	}
+	return service, nil
 }
 
 // CreateEmailDraft 创建内部邮件预览；该方法不会连接邮箱，也不会发送邮件。

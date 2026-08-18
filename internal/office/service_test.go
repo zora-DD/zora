@@ -143,14 +143,149 @@ func TestDraftConfirmationStateMachineIsAuditableAndOneShot(t *testing.T) {
 	}
 }
 
+func TestOperationExecutionRetriesWithStableIdempotencyKey(t *testing.T) {
+	t.Parallel()
+	memoryStore := newMemoryDraftStore()
+	executor := &sequenceExecutor{errors: []error{errors.New("Graph 暂时不可用"), nil}}
+	service, err := NewService(memoryStore, WithExecutor(executor))
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return time.Date(2026, 8, 18, 8, 0, 0, 0, time.UTC) }
+	draft := createApprovedEmailDraft(t, service, "run-operation")
+	operation, created, err := service.PrepareOperation(context.Background(), draft.ID)
+	if err != nil || !created || operation.Status != OperationPending || len(operation.IdempotencyKey) != 64 {
+		t.Fatalf("operation = %+v, created=%v, err=%v", operation, created, err)
+	}
+	same, created, err := service.PrepareOperation(context.Background(), draft.ID)
+	if err != nil || created || same.ID != operation.ID || same.IdempotencyKey != operation.IdempotencyKey {
+		t.Fatalf("idempotent prepare = %+v, created=%v, err=%v", same, created, err)
+	}
+	failed, err := service.ExecuteOperation(context.Background(), operation.ID)
+	if err != nil || failed.Operation.Status != OperationFailed || failed.Draft.Status != StatusFailed || failed.ExternalEffect {
+		t.Fatalf("failed outcome = %+v, err=%v", failed, err)
+	}
+	completed, err := service.ExecuteOperation(context.Background(), operation.ID)
+	if err != nil || completed.Operation.Status != OperationCompleted || completed.Draft.Status != StatusCompleted || !completed.ExternalEffect {
+		t.Fatalf("completed outcome = %+v, err=%v", completed, err)
+	}
+	if completed.Operation.Attempt != 2 || completed.Operation.ExternalReference != "remote-2" || len(executor.keys) != 2 || executor.keys[0] != executor.keys[1] {
+		t.Fatalf("unexpected retry state: operation=%+v keys=%v", completed.Operation, executor.keys)
+	}
+	// 已完成任务重复请求直接返回持久化结果，不能再次调用外部执行器。
+	if _, err := service.ExecuteOperation(context.Background(), operation.ID); err != nil || len(executor.keys) != 2 {
+		t.Fatalf("completed retry err=%v calls=%d", err, len(executor.keys))
+	}
+	events, err := service.ListOperationEvents(context.Background(), operation.ID)
+	if err != nil || len(events) != 5 || events[0].ToStatus != OperationPending || events[4].ToStatus != OperationCompleted {
+		t.Fatalf("operation events = %+v, err=%v", events, err)
+	}
+}
+
+func TestOperationExecutorSafetyGateAndUnavailableState(t *testing.T) {
+	t.Parallel()
+	if _, err := NewService(newMemoryDraftStore(), WithExecutor(&sequenceExecutor{unsafe: true})); err == nil || !strings.Contains(err.Error(), "不支持幂等重放") {
+		t.Fatalf("expected unsafe executor rejection, got %v", err)
+	}
+	service, err := NewService(newMemoryDraftStore())
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := createApprovedEmailDraft(t, service, "run-no-executor")
+	operation, _, err := service.PrepareOperation(context.Background(), draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ExecuteOperation(context.Background(), operation.ID); !errors.Is(err, ErrExecutorUnavailable) {
+		t.Fatalf("expected executor unavailable, got %v", err)
+	}
+	stored, err := service.GetOperation(context.Background(), operation.ID)
+	if err != nil || stored.Status != OperationPending || stored.Attempt != 0 {
+		t.Fatalf("unavailable executor mutated operation: %+v, err=%v", stored, err)
+	}
+}
+
+func TestExpiredOperationIsRecoveredAsRetryableFailure(t *testing.T) {
+	t.Parallel()
+	memoryStore := newMemoryDraftStore()
+	service, err := NewService(memoryStore, WithExecutor(&sequenceExecutor{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC)
+	service.now = func() time.Time { return now }
+	draft := createApprovedEmailDraft(t, service, "run-recovery")
+	operation, _, err := service.PrepareOperation(context.Background(), draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, _, err := memoryStore.ClaimOperation(
+		context.Background(), operation.ID, "test-executor", service.workerID,
+		now.Add(-2*time.Minute), now.Add(-time.Minute), OperationEvent{}, DraftEvent{},
+	)
+	if err != nil || claimed.Status != OperationExecuting {
+		t.Fatalf("claimed = %+v, err=%v", claimed, err)
+	}
+	recovered, err := service.RecoverExpiredOperations(context.Background())
+	if err != nil || recovered != 1 {
+		t.Fatalf("recovered=%d, err=%v", recovered, err)
+	}
+	stored, err := service.GetOperation(context.Background(), operation.ID)
+	if err != nil || stored.Status != OperationFailed || stored.Attempt != 1 || !strings.Contains(stored.LastError, "租约超时") {
+		t.Fatalf("recovered operation = %+v, err=%v", stored, err)
+	}
+}
+
+func createApprovedEmailDraft(t *testing.T, service *Service, runID string) Draft {
+	t.Helper()
+	ctx := agentruntime.WithExecutionIdentity(context.Background(), "conv-1", runID)
+	draft, _, err := service.CreateEmailDraft(ctx, EmailDraft{
+		To: []string{"dev@example.com"}, Subject: "发布通知", Body: "项目将在周五发布。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SubmitForConfirmation(ctx, draft.ID); err != nil {
+		t.Fatal(err)
+	}
+	draft, err = service.Decide(ctx, draft.ID, StatusApproved, "测试批准")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return draft
+}
+
+type sequenceExecutor struct {
+	unsafe bool
+	errors []error
+	keys   []string
+}
+
+func (e *sequenceExecutor) Name() string          { return "test-executor" }
+func (e *sequenceExecutor) IdempotencySafe() bool { return !e.unsafe }
+func (e *sequenceExecutor) Execute(_ context.Context, _ Draft, key string) (ExecutionResult, error) {
+	e.keys = append(e.keys, key)
+	index := len(e.keys) - 1
+	if index < len(e.errors) && e.errors[index] != nil {
+		return ExecutionResult{}, e.errors[index]
+	}
+	return ExecutionResult{ExternalEffect: true, ExternalReference: fmt.Sprintf("remote-%d", len(e.keys))}, nil
+}
+
 type memoryDraftStore struct {
-	items  map[string]Draft
-	keys   map[string]string
-	events map[string][]DraftEvent
+	items            map[string]Draft
+	keys             map[string]string
+	events           map[string][]DraftEvent
+	operations       map[string]Operation
+	operationByDraft map[string]string
+	operationEvents  map[string][]OperationEvent
 }
 
 func newMemoryDraftStore() *memoryDraftStore {
-	return &memoryDraftStore{items: make(map[string]Draft), keys: make(map[string]string), events: make(map[string][]DraftEvent)}
+	return &memoryDraftStore{
+		items: make(map[string]Draft), keys: make(map[string]string), events: make(map[string][]DraftEvent),
+		operations: make(map[string]Operation), operationByDraft: make(map[string]string), operationEvents: make(map[string][]OperationEvent),
+	}
 }
 
 func (s *memoryDraftStore) SaveDraft(_ context.Context, draft Draft) (Draft, bool, error) {
@@ -210,4 +345,117 @@ func (s *memoryDraftStore) TransitionDraft(_ context.Context, id, expectedStatus
 
 func (s *memoryDraftStore) ListDraftEvents(_ context.Context, draftID string) ([]DraftEvent, error) {
 	return append([]DraftEvent(nil), s.events[draftID]...), nil
+}
+
+func (s *memoryDraftStore) CreateOperation(_ context.Context, operation Operation, event OperationEvent) (Operation, bool, error) {
+	if existingID := s.operationByDraft[operation.DraftID]; existingID != "" {
+		return s.operations[existingID], false, nil
+	}
+	draft, ok := s.items[operation.DraftID]
+	if !ok {
+		return Operation{}, false, store.ErrNotFound
+	}
+	if draft.Status != StatusApproved {
+		return Operation{}, false, fmt.Errorf("%w：当前为 %s", ErrStateConflict, draft.Status)
+	}
+	s.operations[operation.ID] = operation
+	s.operationByDraft[operation.DraftID] = operation.ID
+	s.operationEvents[operation.ID] = append(s.operationEvents[operation.ID], event)
+	return operation, true, nil
+}
+
+func (s *memoryDraftStore) GetOperation(_ context.Context, id string) (Operation, error) {
+	item, ok := s.operations[id]
+	if !ok {
+		return Operation{}, store.ErrNotFound
+	}
+	return item, nil
+}
+
+func (s *memoryDraftStore) GetOperationByDraft(_ context.Context, draftID string) (Operation, error) {
+	return s.GetOperation(context.Background(), s.operationByDraft[draftID])
+}
+
+func (s *memoryDraftStore) ListOperations(_ context.Context, filter OperationFilter) ([]Operation, error) {
+	items := make([]Operation, 0)
+	for _, item := range s.operations {
+		if (filter.DraftID == "" || item.DraftID == filter.DraftID) && (filter.Status == "" || item.Status == filter.Status) {
+			items = append(items, item)
+		}
+	}
+	return items, nil
+}
+
+func (s *memoryDraftStore) ClaimOperation(_ context.Context, id, executorName, leaseOwner string, now, leaseUntil time.Time, operationEvent OperationEvent, draftEvent DraftEvent) (Operation, Draft, error) {
+	item, ok := s.operations[id]
+	if !ok {
+		return Operation{}, Draft{}, store.ErrNotFound
+	}
+	if item.Status != OperationPending && item.Status != OperationFailed {
+		return Operation{}, Draft{}, fmt.Errorf("%w：当前为 %s", ErrStateConflict, item.Status)
+	}
+	draft := s.items[item.DraftID]
+	expectedDraftStatus := StatusApproved
+	if item.Status == OperationFailed {
+		expectedDraftStatus = StatusFailed
+	}
+	if draft.Status != expectedDraftStatus {
+		return Operation{}, Draft{}, fmt.Errorf("%w：草稿当前为 %s", ErrStateConflict, draft.Status)
+	}
+	from := item.Status
+	item.Status, item.ExecutorName, item.LeaseOwner = OperationExecuting, executorName, leaseOwner
+	item.Attempt++
+	item.LeaseUntil, item.UpdatedAt, item.LastError = &leaseUntil, now, ""
+	draft.Status, draft.UpdatedAt = StatusExecuting, now
+	s.operations[id], s.items[draft.ID] = item, draft
+	operationEvent.FromStatus, operationEvent.ToStatus, operationEvent.Attempt = from, OperationExecuting, item.Attempt
+	s.operationEvents[id] = append(s.operationEvents[id], operationEvent)
+	s.events[draft.ID] = append(s.events[draft.ID], draftEvent)
+	return item, draft, nil
+}
+
+func (s *memoryDraftStore) FinishOperation(_ context.Context, id, leaseOwner, nextStatus, externalReference, lastError string, now time.Time, operationEvent OperationEvent, draftEvent DraftEvent) (Operation, Draft, error) {
+	item, ok := s.operations[id]
+	if !ok {
+		return Operation{}, Draft{}, store.ErrNotFound
+	}
+	if item.Status != OperationExecuting || item.LeaseOwner != leaseOwner {
+		return Operation{}, Draft{}, fmt.Errorf("%w：租约已失效", ErrStateConflict)
+	}
+	item.Status, item.LeaseOwner, item.LeaseUntil = nextStatus, "", nil
+	item.ExternalReference, item.LastError, item.UpdatedAt = externalReference, lastError, now
+	if nextStatus == OperationCompleted {
+		item.CompletedAt = &now
+	}
+	draft := s.items[item.DraftID]
+	if draft.Status != StatusExecuting {
+		return Operation{}, Draft{}, fmt.Errorf("%w：草稿当前为 %s", ErrStateConflict, draft.Status)
+	}
+	draft.Status = StatusFailed
+	if nextStatus == OperationCompleted {
+		draft.Status = StatusCompleted
+	}
+	draft.UpdatedAt = now
+	s.operations[id], s.items[draft.ID] = item, draft
+	operationEvent.FromStatus, operationEvent.ToStatus, operationEvent.Attempt = OperationExecuting, nextStatus, item.Attempt
+	s.operationEvents[id] = append(s.operationEvents[id], operationEvent)
+	s.events[draft.ID] = append(s.events[draft.ID], draftEvent)
+	return item, draft, nil
+}
+
+func (s *memoryDraftStore) ListOperationEvents(_ context.Context, operationID string) ([]OperationEvent, error) {
+	return append([]OperationEvent(nil), s.operationEvents[operationID]...), nil
+}
+
+func (s *memoryDraftStore) ListExpiredOperations(_ context.Context, now time.Time, limit int) ([]Operation, error) {
+	items := make([]Operation, 0)
+	for _, item := range s.operations {
+		if item.Status == OperationExecuting && item.LeaseUntil != nil && !item.LeaseUntil.After(now) {
+			items = append(items, item)
+			if len(items) == limit {
+				break
+			}
+		}
+	}
+	return items, nil
 }

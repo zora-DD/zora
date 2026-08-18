@@ -67,7 +67,11 @@ Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episo
 
 ### OfficeDraft
 
-OfficeDraft 是尚未产生外部影响的邮件或日程参数快照。它保存类型、状态、标题、规范化 JSON Payload、内容哈希、来源 Conversation/Run 和时间戳。当前 Service 支持 `draft → pending_confirmation → approved/rejected`，只允许删除 `draft`；每次迁移同时追加 OfficeDraftEvent。`executing/completed/failed/cancelled` 仍为后续外部执行预留，模型不能直接修改。
+OfficeDraft 是邮件或日程参数快照。它保存类型、状态、标题、规范化 JSON Payload、内容哈希、来源 Conversation/Run 和时间戳。Service 支持 `draft → pending_confirmation → approved/rejected`，只允许删除 `draft`；执行时由独立 Operation 原子推进为 `executing → completed/failed`。每次迁移追加 OfficeDraftEvent，模型不能直接修改状态。
+
+### OfficeOperation
+
+OfficeOperation 是 approved 草稿对应的唯一持久化执行任务，保存稳定幂等键、执行器名称、attempt、租约、错误和远端引用。任务按 `pending/failed → executing → completed/failed` 迁移，并追加带 attempt 的 OfficeOperationEvent。默认不配置 Executor；只有声明支持幂等重放且返回可核验远端引用的实现才能完成任务。
 
 ## 4. 并发与取消
 
@@ -76,6 +80,7 @@ OfficeDraft 是尚未产生外部影响的邮件或日程参数快照。它保�
 - 浏览器 Abort、HTTP Context 取消和服务端 Deadline 会传入 Eino 与模型请求。
 - 模型客户端和整个消息请求都有超时。
 - 草稿状态迁移使用数据库 compare-and-swap；状态与审计事件在同一事务提交，重复或并发人工决定只有一个成功。
+- Operation 使用数据库唯一约束和租约防止重复创建/领取；任务、草稿和双审计原子迁移，启动时回收过期执行租约。
 
 PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业务对话锁仍是进程内 Mutex，多实例部署前还应升级为数据库 advisory lock 或带租约的分布式锁。
 
@@ -200,7 +205,7 @@ Web 将交接事件显示为带 `child_run_id` 的专业 Agent Trace，并显示
 
 ## 9. V0.5 MCP 办公连接器架构
 
-第四阶段在文件与 Microsoft Graph 两类只读连接器和内部草稿层之上增加持久化人工确认：
+第五阶段在文件与 Microsoft Graph 两类只读连接器、内部草稿和人工确认之上增加持久化执行任务内核：
 
 ```text
 Zora 主进程
@@ -218,7 +223,9 @@ Writer Agent / 单 Agent
     ├── preview_email_draft
     ├── preview_calendar_draft
     ├── draft → pending_confirmation → approved / rejected
-    └── office_drafts + office_draft_events（SQLite / PostgreSQL）
+    ├── approved → Operation(pending) → executing → completed / failed
+    ├── Executor（默认未配置；实现必须支持幂等重放）
+    └── office_drafts / office_operations + 双事件表（SQLite / PostgreSQL）
 ```
 
 启动时，`mcpbridge` 按配置逐个启动 stdio Server，执行 MCP 握手和分页工具发现。一个工具必须同时出现在部署者提供的 `allowed_tools` 中，并由 Server 声明 `readOnlyHint=true`；之后才会以 `mcp_{server}_{tool}` 名称进入 Eino。主进程不经过 Shell，子进程也不默认继承环境；模型 Key、Embedding Key 与数据库 DSN 不能透传。
@@ -229,4 +236,6 @@ Microsoft 连接器使用 Graph REST 统一查询邮件和日历。OAuth 登录�
 
 `preview_email_draft` 和 `preview_calendar_draft` 会先校验邮箱、长度、RFC3339 时间窗与 IANA 时区，再保存结构化草稿。`source_run_id + content_hash` 唯一约束吸收 Agent/Writer 重试。REST/Web 可把 `draft` 提交为 `pending_confirmation`，再一次性批准或拒绝；Store 用预期状态条件更新，并把状态和 `office_draft_events` 记录放在同一事务中。只有 `draft` 可以删除，终态记录保留用于审计。
 
-当前没有 Graph 写接口，`approved` 明确表示“已批准、未执行”。下一阶段必须在批准快照之上建立独立幂等 Operation、失败恢复和凭据边界，避免“人工确认成功”直接等于一次不可追踪的外部副作用。
+approved 草稿可幂等创建唯一 Operation。领取任务时 Operation 与 Draft 原子进入 executing，并保存执行器、attempt、lease owner/until；成功或失败时两者与 `office_draft_events`、`office_operation_events` 同事务提交。失败和启动时回收的过期租约继续复用原 SHA-256 幂等键。Executor 必须声明幂等安全，且返回真实副作用标记和非空远端引用后才能完成。
+
+当前默认没有 Graph 写 Executor，`approved` 和 `pending` 均明确表示“未执行”；执行 API 返回 503 且不领取任务。下一阶段在这一权限边界后实现 Graph 写适配、OAuth/Secret 生命周期和最小权限，不允许用本地 Mock 冒充真实发送。

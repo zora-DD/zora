@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -259,6 +260,120 @@ func TestOfficeDraftLifecycleAndRunIdempotency(t *testing.T) {
 	if _, err := service.Get(ctx, deletable.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("get deleted draft error = %v", err)
 	}
+}
+
+func TestOfficeOperationPersistsAtomicCompletionAndAudit(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "office-operation.db")
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	conversation := domain.Conversation{ID: "conv_operation", Title: "执行任务测试", CreatedAt: now, UpdatedAt: now}
+	if err := database.CreateConversation(ctx, conversation); err != nil {
+		t.Fatal(err)
+	}
+	message, err := database.AddMessage(ctx, domain.Message{
+		ID: "msg_operation", ConversationID: conversation.ID, Role: domain.RoleUser, Content: "发送邮件", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := domain.AgentRun{
+		ID: "run_operation", ConversationID: conversation.ID, UserMessageID: message.ID,
+		Status: domain.RunRunning, Model: "zora-mock", StartedAt: now,
+	}
+	if err := database.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	executor := &sqliteOfficeExecutor{}
+	service, err := office.NewService(database, office.WithExecutor(executor))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionCtx := agentruntime.WithExecutionIdentity(ctx, conversation.ID, run.ID)
+	draft, _, err := service.CreateEmailDraft(executionCtx, office.EmailDraft{
+		To: []string{"dev@example.com"}, Subject: "发布通知", Body: "项目将在周五发布。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SubmitForConfirmation(ctx, draft.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Decide(ctx, draft.ID, office.StatusApproved, "已核对"); err != nil {
+		t.Fatal(err)
+	}
+	type prepareResult struct {
+		item office.Operation
+		err  error
+	}
+	results := make(chan prepareResult, 2)
+	for range 2 {
+		go func() {
+			item, _, prepareErr := service.PrepareOperation(ctx, draft.ID)
+			results <- prepareResult{item: item, err: prepareErr}
+		}()
+	}
+	first := <-results
+	second := <-results
+	if first.err != nil || second.err != nil || first.item.ID != second.item.ID || first.item.IdempotencyKey != second.item.IdempotencyKey {
+		t.Fatalf("concurrent prepare = %+v / %+v", first, second)
+	}
+	type executionResult struct {
+		outcome office.ExecutionOutcome
+		err     error
+	}
+	executions := make(chan executionResult, 2)
+	for range 2 {
+		go func() {
+			outcome, executeErr := service.ExecuteOperation(ctx, first.item.ID)
+			executions <- executionResult{outcome: outcome, err: executeErr}
+		}()
+	}
+	successes := 0
+	for range 2 {
+		result := <-executions
+		if result.err == nil && result.outcome.ExternalEffect && result.outcome.Operation.Status == office.OperationCompleted {
+			successes++
+		} else if !errors.Is(result.err, office.ErrStateConflict) {
+			t.Fatalf("unexpected concurrent execution result = %+v, err=%v", result.outcome, result.err)
+		}
+	}
+	if successes == 0 || executor.calls.Load() != 1 {
+		t.Fatalf("execution successes=%d, executor calls=%d", successes, executor.calls.Load())
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	reloaded, err := database.GetOperation(ctx, first.item.ID)
+	if err != nil || reloaded.Status != office.OperationCompleted || reloaded.Attempt != 1 || reloaded.ExternalReference != "sqlite-remote-reference" {
+		t.Fatalf("reloaded operation = %+v, err=%v", reloaded, err)
+	}
+	events, err := database.ListOperationEvents(ctx, first.item.ID)
+	if err != nil || len(events) != 3 || events[2].ToStatus != office.OperationCompleted {
+		t.Fatalf("operation events = %+v, err=%v", events, err)
+	}
+	draftEvents, err := database.ListDraftEvents(ctx, draft.ID)
+	if err != nil || len(draftEvents) != 4 || draftEvents[3].ToStatus != office.StatusCompleted {
+		t.Fatalf("draft events = %+v, err=%v", draftEvents, err)
+	}
+}
+
+type sqliteOfficeExecutor struct{ calls atomic.Int32 }
+
+func (*sqliteOfficeExecutor) Name() string          { return "sqlite-test-executor" }
+func (*sqliteOfficeExecutor) IdempotencySafe() bool { return true }
+func (e *sqliteOfficeExecutor) Execute(_ context.Context, _ office.Draft, _ string) (office.ExecutionResult, error) {
+	e.calls.Add(1)
+	return office.ExecutionResult{ExternalEffect: true, ExternalReference: "sqlite-remote-reference"}, nil
 }
 
 func TestMemoryLifecycleAndExpiryFilter(t *testing.T) {

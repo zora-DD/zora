@@ -69,6 +69,14 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// 进程异常退出可能遗留 executing 租约；启动时先恢复为 failed，后续仍复用原幂等键。
+	recoveredOperations, err := officeService.RecoverExpiredOperations(startupCtx)
+	if err != nil {
+		return fmt.Errorf("恢复过期办公执行任务失败：%w", err)
+	}
+	if recoveredOperations > 0 {
+		logger.Warn("已恢复租约过期的办公执行任务", "任务数", recoveredOperations)
+	}
 	draftTools, err := office.NewDraftTools(officeService)
 	if err != nil {
 		return err

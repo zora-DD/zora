@@ -32,9 +32,14 @@ func TestSchemaUsesConfiguredVectorDimensions(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS office_drafts",
 		"CREATE TABLE IF NOT EXISTS office_draft_events",
 		"idx_office_draft_events_draft_created",
+		"CREATE TABLE IF NOT EXISTS office_operations",
+		"CREATE TABLE IF NOT EXISTS office_operation_events",
+		"idempotency_key TEXT NOT NULL UNIQUE",
+		"idx_office_operation_events_operation_created",
 		"UNIQUE(source_run_id, content_hash)",
 		"INSERT INTO zora_schema_versions(version) VALUES (6)",
 		"INSERT INTO zora_schema_versions(version) VALUES (7)",
+		"INSERT INTO zora_schema_versions(version) VALUES (8)",
 	} {
 		if !strings.Contains(schema, expected) {
 			t.Fatalf("schema does not contain %q", expected)

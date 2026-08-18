@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.5 Office Agent（第四阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已接入官方 MCP Go SDK，交付文件、Microsoft Graph 邮件/日历只读连接器、持久化草稿预览和草稿级人工确认。批准目前只记录内部决定，外部幂等执行仍在后续阶段。
+当前版本：**V0.5 Office Agent（第五阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已交付官方 MCP Client、文件与 Microsoft Graph 只读连接器、持久化草稿、人工确认，以及独立、幂等、可恢复的 Office Operation 执行内核。默认仍不配置真实外部写执行器，不会把模拟结果冒充邮件已发送或日程已创建。
 
 ## 当前能力
 
@@ -35,7 +35,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | Microsoft 邮件/日历连接器 | 已完成 | Graph REST + MCP，支持邮件搜索/详情和日历窗口查询/详情；只返回摘要和元数据 |
 | 邮件/日程草稿预览 | 已完成 | 结构化校验、SQLite/PostgreSQL 持久化、Run 来源追踪、重试幂等、REST API 和 Web 草稿箱 |
 | 草稿人工确认 | 已完成 | `draft → pending_confirmation → approved/rejected`、数据库 CAS、不可变迁移审计、REST 和 Web 一次性决策 |
-| 外部写操作 | V0.5 后续 | 已批准草稿的幂等执行、失败恢复和完整凭据审计尚未实现 |
+| Office Operation 执行内核 | 已完成 | 每份 approved 草稿唯一任务、稳定幂等键、执行租约、失败重试、启动恢复、双审计、REST/Web 状态展示 |
+| 真实外部写连接器 | V0.5 后续 | Microsoft Graph 写适配、OAuth 生命周期、Secret 托管、最小权限和真实租户验收尚未实现 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
 
@@ -61,7 +62,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **连接器凭据与主进程隔离**：MCP 子进程默认不继承任何环境变量，只透传 `pass_env`；模型 Key、Embedding Key 和数据库 DSN 被配置层显式拒绝。
 - **外部办公内容按不可信数据处理**：邮件、日历和外部文件的正文不能改变系统规则，也不能触发其中嵌入的链接、权限请求或工具指令。
 - **草稿不等于执行**：`preview_*` 工具只在 Zora 内部保存不可执行快照；同一 Run 的相同参数按内容哈希幂等复用，回答必须明确“尚未发送/创建”。
-- **确认不等于执行**：草稿状态由数据库 compare-and-swap 原子推进，每次人工决定写入不可变事件；即使状态为 approved，当前版本也不会调用外部写接口。
+- **确认不等于执行**：草稿批准后还要显式创建 Operation 并再次确认；默认未配置写执行器，系统不会把 approved 或 pending 表述为已经发送。
+- **外部执行可恢复且不假完成**：Operation 使用稳定幂等键、数据库租约和重试次数；草稿、任务与双审计在同一事务迁移。执行器必须声明支持幂等重放，并返回可核验远端引用，否则任务只能进入 failed。
 - **明确的终态语义**：根 Run 最终进入 completed、failed、cancelled 或 rejected。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -206,7 +208,9 @@ make run
 
 邮件地址会被解析、去重并规范化；邮件主题最多 200 字符，正文最多 20,000 字符。日程开始/结束时间必须是带时区的 RFC3339，结束时间必须更晚，单次持续时间最多 31 天。每份草稿关联可信的 `conversation_id` 和 `source_run_id`，模型无法自行伪造；同一 Run 用相同参数重试时返回原草稿，不会重复创建。
 
-侧边栏“办公草稿”展示全部状态。`draft` 可以删除或提交人工确认；`pending_confirmation` 只能被批准或拒绝一次；每次迁移都可查看审计记录。批准只把草稿标记为 `approved`，当前阶段没有发送邮件或创建日程的 Graph 写工具，也没有“批准即执行”的入口。
+侧边栏“办公草稿”展示全部状态。`draft` 可以删除或提交人工确认；`pending_confirmation` 只能被批准或拒绝一次。批准后需要点击“准备执行任务”，系统为该草稿创建唯一 Operation 和稳定幂等键；重复准备返回原任务。默认运行配置未接入真实 Graph 写执行器，因此页面只显示“任务已持久化、执行器未配置”，不会出现执行按钮，也不会产生外部副作用。
+
+执行器接入后，Operation 按 `pending → executing → completed/failed` 迁移。领取任务时写入租约和重试次数；失败可复用原幂等键重试；进程启动会把过期 `executing` 恢复为 `failed`。执行器必须保证同一幂等键可安全重放，并返回非空远端引用，才能标记 completed。这一阶段完成的是可测试的执行内核，Microsoft Graph 真实写适配和 OAuth/Secret 生命周期仍是下一阶段。
 
 点击侧边栏的“知识库”可上传 UTF-8 编码的 `.txt` / `.md` / `.markdown` 文件（单文件最大 5 MiB）。上传后可以询问：
 
@@ -450,6 +454,11 @@ sequenceDiagram
 | `POST` | `/api/office/drafts/{id}/confirmation` | 原子提交草稿进入 `pending_confirmation` |
 | `POST` | `/api/office/drafts/{id}/decision` | 对等待确认的草稿提交一次 `approved` 或 `rejected` 决定 |
 | `GET` | `/api/office/drafts/{id}/events` | 查询按时间排序的草稿状态迁移审计记录 |
+| `POST` | `/api/office/drafts/{id}/operation` | 为 approved 草稿幂等创建唯一持久化执行任务，不产生外部副作用 |
+| `GET` | `/api/office/operations` | 查询执行任务，可按 `draft_id`、`status` 和 `limit` 筛选 |
+| `GET` | `/api/office/operations/{id}` | 查询任务状态、重试次数、租约、错误和远端引用 |
+| `GET` | `/api/office/operations/{id}/events` | 查询追加式执行审计记录 |
+| `POST` | `/api/office/operations/{id}/execute` | 通过已配置的幂等写执行器领取并执行任务；未配置时返回 503 且不改变任务 |
 
 SSE 事件：`start`、`approval_required`、`approval_approved/rejected/expired`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`delta`、`done`、`error`。交接事件包含 `child_run_id`；`agent_output` 只显示在协作 Trace，不拼入最终回答。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
 
@@ -577,7 +586,7 @@ V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
-- V0.5：MCP 办公助手——官方 SDK、文件与 Microsoft Graph 邮件/日历只读连接器、持久化草稿预览和草稿级人工确认已完成；外部幂等执行继续实现
+- V0.5：MCP 办公助手——只读连接器、持久化草稿、人工确认和幂等可恢复 Operation 内核已完成；继续实现 Graph 真实写适配、OAuth/Secret 和真实租户验收
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
 

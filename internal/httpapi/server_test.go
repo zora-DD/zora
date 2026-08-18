@@ -192,6 +192,34 @@ func TestAgentCreatesPersistedEmailDraftPreview(t *testing.T) {
 	if eventsResponse.Code != http.StatusOK || !strings.Contains(eventsResponse.Body.String(), `"to_status":"approved"`) {
 		t.Fatalf("events status = %d, body = %s", eventsResponse.Code, eventsResponse.Body.String())
 	}
+	prepareRequest := httptest.NewRequest(http.MethodPost, "/api/office/drafts/"+draftID+"/operation", nil)
+	prepared := httptest.NewRecorder()
+	handler.ServeHTTP(prepared, prepareRequest)
+	if prepared.Code != http.StatusCreated || !strings.Contains(prepared.Body.String(), `"status":"pending"`) ||
+		!strings.Contains(prepared.Body.String(), `"execution_enabled":false`) {
+		t.Fatalf("prepare operation status = %d, body = %s", prepared.Code, prepared.Body.String())
+	}
+	var preparedBody struct {
+		Operation office.Operation `json:"operation"`
+	}
+	if err := json.Unmarshal(prepared.Body.Bytes(), &preparedBody); err != nil {
+		t.Fatal(err)
+	}
+	duplicatePrepare := httptest.NewRecorder()
+	handler.ServeHTTP(duplicatePrepare, httptest.NewRequest(http.MethodPost, "/api/office/drafts/"+draftID+"/operation", nil))
+	if duplicatePrepare.Code != http.StatusOK || !strings.Contains(duplicatePrepare.Body.String(), preparedBody.Operation.ID) {
+		t.Fatalf("duplicate prepare status = %d, body = %s", duplicatePrepare.Code, duplicatePrepare.Body.String())
+	}
+	executeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(executeResponse, httptest.NewRequest(http.MethodPost, "/api/office/operations/"+preparedBody.Operation.ID+"/execute", nil))
+	if executeResponse.Code != http.StatusServiceUnavailable || !strings.Contains(executeResponse.Body.String(), "执行器尚未配置") {
+		t.Fatalf("disabled execute status = %d, body = %s", executeResponse.Code, executeResponse.Body.String())
+	}
+	operationEvents := httptest.NewRecorder()
+	handler.ServeHTTP(operationEvents, httptest.NewRequest(http.MethodGet, "/api/office/operations/"+preparedBody.Operation.ID+"/events", nil))
+	if operationEvents.Code != http.StatusOK || !strings.Contains(operationEvents.Body.String(), `"to_status":"pending"`) {
+		t.Fatalf("operation events status = %d, body = %s", operationEvents.Code, operationEvents.Body.String())
+	}
 }
 
 func TestMultiAgentWriterPreservesTrustedDraftIdentity(t *testing.T) {

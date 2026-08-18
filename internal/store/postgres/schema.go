@@ -100,6 +100,38 @@ CREATE TABLE IF NOT EXISTS office_draft_events (
 CREATE INDEX IF NOT EXISTS idx_office_draft_events_draft_created
     ON office_draft_events(draft_id, created_at, id);
 
+CREATE TABLE IF NOT EXISTS office_operations (
+    id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL UNIQUE REFERENCES office_drafts(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('email', 'calendar')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'completed', 'failed')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    executor_name TEXT NOT NULL DEFAULT '',
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_until TIMESTAMPTZ,
+    external_reference TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_office_operations_status_updated
+    ON office_operations(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS office_operation_events (
+    id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL REFERENCES office_operations(id) ON DELETE CASCADE,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_office_operation_events_operation_created
+    ON office_operation_events(operation_id, created_at, id);
+
 CREATE TABLE IF NOT EXISTS run_events (
     sequence BIGSERIAL PRIMARY KEY,
     id TEXT NOT NULL UNIQUE,
@@ -192,4 +224,5 @@ INSERT INTO zora_schema_versions(version) VALUES (4) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (5) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (6) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (7) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (8) ON CONFLICT DO NOTHING;
 `

@@ -1,7 +1,7 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.5 Office Agent 第四阶段（草稿级持久化人工确认）
-> 最后更新：2026-08-17
+> 文档基线：V0.5 Office Agent 第五阶段（幂等可恢复执行内核）
+> 最后更新：2026-08-18
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
 ## 1. 项目概述
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第四阶段已经接入文件与 Microsoft Graph 邮件/日历只读连接器，并建立邮件/日程结构化草稿、双数据库持久化、可信 Run 来源、Web 预览和一次性人工确认；外部幂等执行尚未实现。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第五阶段已在只读连接器、结构化草稿和一次性人工确认之上，实现独立 Office Operation、稳定幂等键、数据库租约、失败重试、启动恢复和双审计；默认仍无真实外部写执行器，Graph 写适配与凭据生命周期尚未实现。
 
 ## 2. 背景与问题
 
@@ -141,7 +141,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | Microsoft 邮件/日历连接器 | 已实现 | Graph 邮件搜索/详情、日历窗口查询/详情；只返回摘要和元数据 |
 | 邮件/日程草稿预览 | 已实现 | 结构化校验、双数据库、可信 Run 来源、内容哈希幂等、REST 与 Web 草稿箱 |
 | 草稿级人工确认 | 已实现 | CAS 状态迁移、一次性批准/拒绝、不可变事件、REST/Web 与无外部副作用提示 |
-| 外部写操作 | V0.5 进行中 | 已批准草稿的幂等执行、OAuth 生命周期和完整凭据审计仍待实现 |
+| Office Operation 执行内核 | 已实现 | 草稿唯一任务、稳定幂等键、租约/attempt、失败重试、启动恢复、SQLite/PostgreSQL 双审计 |
+| 真实外部写操作 | V0.5 进行中 | Graph 写适配、OAuth 生命周期、Secret 托管、最小权限和真实租户验收仍待实现 |
 
 ## 6. 业务模型
 
@@ -158,8 +159,10 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | MCPServer | 独立运行的办公连接器进程 | 启动握手 → 工具发现/调用 → 应用退出时关闭 |
 | MCPToolAdapter | MCP Tool 到 Eino Tool 的命名空间与 Schema 适配 | 启动时创建，只允许白名单且声明只读的工具 |
 | MicrosoftConnector | Graph 邮件和日历的只读适配器 | 进程启动后持有短期 Token；Token 不进入数据库、日志或 ToolResult |
-| OfficeDraft | 尚未执行的邮件或日程参数快照 | draft → pending_confirmation → approved/rejected；批准仍未执行 |
-| OfficeDraftEvent | 草稿状态迁移的不可变审计记录 | 每次提交/决定追加一条，随草稿级联删除 |
+| OfficeDraft | 邮件或日程参数快照 | draft → pending_confirmation → approved/rejected；执行时再进入 executing/completed/failed |
+| OfficeDraftEvent | 草稿状态迁移的不可变审计记录 | 每次提交、决定和执行迁移追加一条，随草稿级联删除 |
+| OfficeOperation | approved 草稿对应的唯一持久化外部写任务 | pending/failed → executing → completed/failed；重试复用幂等键 |
+| OfficeOperationEvent | 执行任务状态与 attempt 的追加式审计 | 创建、领取、失败、重试和完成各追加一条 |
 | Specialist Agent | Research/Document/Writer 专业执行单元 | 启动时组装，通过 AgentTool 接收 request，执行后返回交付物 |
 | Agent Handoff | Supervisor 与专业 Agent 的一次结构化交接 | started → agent output → completed；关联 AgentTaskRun 与顶层 RunEvent |
 | ApprovalRequest | 高影响请求的人工审批记录 | pending → approved/rejected/expired；决定可恢复等待中的 Run |
@@ -285,6 +288,30 @@ erDiagram
         int message_count
         string model
         datetime updated_at
+    }
+```
+
+办公写链路把草稿、执行任务和两类审计分开；确认成功不会直接触发外部副作用：
+
+```mermaid
+erDiagram
+    OFFICE_DRAFT ||--o| OFFICE_OPERATION : prepares
+    OFFICE_DRAFT ||--o{ OFFICE_DRAFT_EVENT : records
+    OFFICE_OPERATION ||--o{ OFFICE_OPERATION_EVENT : records
+    OFFICE_DRAFT {
+        string id PK
+        string status
+        string content_hash
+        json payload
+    }
+    OFFICE_OPERATION {
+        string id PK
+        string draft_id UK
+        string idempotency_key UK
+        string status
+        int attempt
+        datetime lease_until
+        string external_reference
     }
 ```
 
@@ -450,7 +477,7 @@ SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embe
 |---|---|---|---|
 | `id` | TEXT | PK | `draft_` 前缀 ID |
 | `kind` | TEXT | CHECK | `email` 或 `calendar` |
-| `status` | TEXT | CHECK | 当前支持 `draft/pending_confirmation/approved/rejected`；执行状态仍预留 |
+| `status` | TEXT | CHECK | `draft/pending_confirmation/approved/executing/completed/rejected/failed/cancelled` |
 | `conversation_id` | TEXT | Nullable FK | 来源会话，删除会话时置空而不删除用户草稿 |
 | `source_run_id` | TEXT | Nullable FK | 创建草稿的可信根 Run，由 Chat Context 注入 |
 | `title` | TEXT | NOT NULL | 邮件主题或日程主题 |
@@ -458,7 +485,7 @@ SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embe
 | `content_hash` | TEXT | NOT NULL | Kind + 规范化 Payload 的 SHA-256 |
 | `created_at` / `updated_at` | 时间 | NOT NULL | 创建和最近更新时间 |
 
-`UNIQUE(source_run_id, content_hash)` 使同一 Agent Run 的工具重试返回已有草稿。Store 使用 `WHERE id=? AND status=?` compare-and-swap 推进状态，删除 SQL 再次限制 `status='draft'`；`approved` 只表示人工决定已记录，预留执行枚举不等于外部写操作已经实现。
+`UNIQUE(source_run_id, content_hash)` 使同一 Agent Run 的工具重试返回已有草稿。Store 使用 compare-and-swap 推进状态，删除 SQL 再次限制 `status='draft'`；`approved` 只表示人工决定已记录，只有 Operation 成功提交后才进入 `completed`。
 
 ### 7.10 office_draft_events
 
@@ -472,6 +499,32 @@ SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embe
 | `created_at` | 时间 | NOT NULL | 决定时间 |
 
 状态更新与事件插入在同一 SQLite/PostgreSQL 事务提交；状态不匹配返回 409。因此两个并发决定不会同时成功，也不会出现“状态已变但审计事件丢失”的半完成结果。
+
+### 7.11 office_operations
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | TEXT | PK | `office_operation_` 前缀任务 ID |
+| `draft_id` | TEXT | UNIQUE/FK | 每份草稿最多一个执行任务 |
+| `kind` / `status` | TEXT | CHECK | 邮件/日程；pending、executing、completed、failed |
+| `idempotency_key` | TEXT | UNIQUE | 草稿 ID + 内容哈希生成的 SHA-256，所有重试保持不变 |
+| `executor_name` / `attempt` | TEXT/INTEGER | NOT NULL | 最近执行器与领取次数 |
+| `lease_owner` / `lease_until` | TEXT/时间 | 内部字段 | 防止并发重复领取，API 不暴露 owner |
+| `external_reference` | TEXT | NOT NULL | 成功后的远端邮件/日程引用 |
+| `last_error` | TEXT | NOT NULL | 最近一次失败原因，最多保存 2,000 字符 |
+| `created_at` / `updated_at` / `completed_at` | 时间 |  | 生命周期时间 |
+
+创建使用 `draft_id` 唯一约束吸收并发请求。领取时 Operation 与 Draft 同时进入 executing；完成或失败时两者和两类事件同事务提交。执行器未配置时不会领取任务，pending 与 attempt=0 保持不变。
+
+### 7.12 office_operation_events
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| `id` | TEXT | PK | `operation_event_` 前缀事件 ID |
+| `operation_id` | TEXT | FK | 归属执行任务 |
+| `from_status` / `to_status` | TEXT | NOT NULL | 任务状态迁移 |
+| `attempt` | INTEGER | >= 0 | 对应领取次数；创建事件为 0 |
+| `actor` / `reason` / `created_at` | TEXT/时间 | NOT NULL | 操作者、中文原因和时间 |
 
 ## 8. 技术架构
 
@@ -543,7 +596,7 @@ flowchart LR
 | 摘要应用层 | `internal/summary` | 触发窗口、增量摘要、Model/Rule Summarizer 和持久化边界 |
 | MCP 适配层 | `internal/mcpbridge` | stdio 生命周期、工具发现、只读白名单、Schema 与 Eino 适配 |
 | MCP 连接器层 | `internal/mcpfiles`、`internal/mcpmicrosoft` | 文件目录沙箱；Graph 邮件/日历只读查询、Token 隔离与外部内容标记 |
-| 办公应用层 | `internal/office` | 邮件/日程草稿校验、可信来源、内容哈希幂等、生命周期与 Agent Tool |
+| 办公应用层 | `internal/office` | 草稿校验、确认状态机、Operation 幂等键、执行器门禁、租约恢复与双审计 |
 | 领域层 | `internal/domain` | Conversation、Message、Run、Event |
 | 持久化抽象 | `internal/store` | Store 接口和统一错误 |
 | 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
@@ -633,6 +686,8 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 
 草稿工具固定返回 `external_effect=false`，Web 使用“仅预览”标记。独立 REST/Web 操作把草稿从 draft 提交到 pending_confirmation，再以数据库 CAS 一次性批准或拒绝；迁移和事件原子落库。approved 在页面和 API 中仍明确标注“尚未执行”，因此不会把“生成预览”“人工确认”和“执行外部操作”混为一谈。
 
+第五阶段再把 approved 与执行拆成唯一 `OfficeOperation`。任务持有稳定幂等键、租约、attempt、执行器名称、错误和远端引用；失败重试和重启恢复不生成第二个业务任务。Executor 若未声明幂等安全会在组装时被拒绝，若未返回真实副作用标记和可核验引用则只能落为 failed。该边界让项目可以单测故障恢复，同时诚实保留“Graph 真实写适配尚未交付”的状态。
+
 ## 10. 当前限制与风险
 
 | 限制/风险 | 当前影响 | 后续处理 |
@@ -657,7 +712,8 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 | Graph 只完成模拟集成验收 | 代码和协议测试已通过，但没有真实 Microsoft 租户凭据的在线验收记录 | 建立最小权限 Entra 测试应用和专用测试账号，执行真实邮件/日历冒烟 |
 | 邮件/日历仅支持 Microsoft | Google Workspace 等来源尚不能接入 | 保持 MCP 工具语义稳定，新增独立 Provider 连接器而不修改 Chat 主链路 |
 | MCP 凭据尚无统一托管 | `pass_env` 已隔离 Zora 核心凭据，但专用连接器 Token 仍依赖部署平台 | 引入 Secret 引用/短期令牌，不在 JSON、日志、RunEvent 或模型上下文保存明文 |
-| 草稿批准后尚未执行 | 已有持久化一次性确认，但不会发送邮件或创建日程 | 下一阶段增加幂等 Operation、租约、失败恢复和外部结果审计 |
+| 默认没有真实写执行器 | Operation 内核已完成，但本地运行只能把 approved 草稿准备为 pending 任务 | 下一阶段实现 Graph 幂等写适配，完成最小权限与真实租户验收 |
+| 执行器幂等契约依赖实现正确性 | 内核拒绝未声明幂等的执行器，但无法仅靠接口证明远端绝不重复 | Graph 适配使用可重放资源 ID/transactionId，并增加故障注入与真实租户测试 |
 | 草稿 Payload 尚未加密 | 本地数据库读取者可以看到邮件正文和日程内容 | 生产环境增加磁盘/列加密、数据保留策略和 Tenant ACL |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
 | 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
@@ -703,6 +759,6 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
 3. **V0.3 Long-term Memory（主链路完成）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入、会话增量摘要和 A/B 门禁已实现。
 4. **V0.4 Multi-Agent（已完成）**：Supervisor、三个专业 Agent、隔离交接、串/并行执行治理、父子 Run、人工审批和单/多 Agent 对照门禁已实现。
-5. **V0.5 Office Agent（进行中）**：官方 MCP Client、文件与 Microsoft Graph 邮件/日历只读连接器、持久化草稿预览和草稿级人工确认已完成；继续实现异步幂等执行、OAuth 生命周期和完整凭据审计。
+5. **V0.5 Office Agent（进行中）**：只读连接器、持久化草稿、草稿级人工确认，以及幂等可恢复 Operation 内核已完成；继续实现 Graph 真实写适配、OAuth/Secret 生命周期、最小权限和真实租户验收。
 
 详细任务与验收条件见 [Roadmap](roadmap.md)。

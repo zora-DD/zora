@@ -90,6 +90,11 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 		mux.HandleFunc("POST /api/office/drafts/{draftID}/confirmation", server.submitOfficeDraftConfirmation)
 		mux.HandleFunc("POST /api/office/drafts/{draftID}/decision", server.decideOfficeDraft)
 		mux.HandleFunc("GET /api/office/drafts/{draftID}/events", server.listOfficeDraftEvents)
+		mux.HandleFunc("POST /api/office/drafts/{draftID}/operation", server.prepareOfficeOperation)
+		mux.HandleFunc("GET /api/office/operations", server.listOfficeOperations)
+		mux.HandleFunc("GET /api/office/operations/{operationID}", server.getOfficeOperation)
+		mux.HandleFunc("GET /api/office/operations/{operationID}/events", server.listOfficeOperationEvents)
+		mux.HandleFunc("POST /api/office/operations/{operationID}/execute", server.executeOfficeOperation)
 	}
 	mux.HandleFunc("GET /api/knowledge/documents", server.listKnowledgeDocuments)
 	mux.HandleFunc("POST /api/knowledge/documents", server.uploadKnowledgeDocument)
@@ -141,7 +146,10 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "mcp-client", "mcp-readonly-tools")
 	}
 	if s.office != nil {
-		capabilities = append(capabilities, "office-draft-preview", "email-draft", "calendar-draft", "office-draft-confirmation")
+		capabilities = append(capabilities, "office-draft-preview", "email-draft", "calendar-draft", "office-draft-confirmation", "office-durable-operation")
+		if s.office.ExecutionEnabled() {
+			capabilities = append(capabilities, "office-external-execution")
+		}
 		toolCount += 2
 	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
@@ -159,8 +167,15 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"conversation_summary": s.chat.SummaryEnabled(),
 		"mcp_enabled":          s.mcpEnabled,
 		"mcp_tool_count":       s.mcpToolCount,
-		"tool_count":           toolCount,
-		"capabilities":         capabilities,
+		"office_execution":     s.office != nil && s.office.ExecutionEnabled(),
+		"office_executor": func() string {
+			if s.office == nil {
+				return ""
+			}
+			return s.office.ExecutorName()
+		}(),
+		"tool_count":   toolCount,
+		"capabilities": capabilities,
 	})
 }
 
@@ -558,7 +573,10 @@ func (s *Server) decideOfficeDraft(w http.ResponseWriter, r *http.Request) {
 	}
 	message := "草稿已拒绝，不会产生外部操作。"
 	if item.Status == office.StatusApproved {
-		message = "草稿已批准，但尚未执行；当前版本不会发送邮件或创建日程。"
+		message = "草稿已批准，但尚未执行；请先创建持久化执行任务并再次确认。"
+		if !s.office.ExecutionEnabled() {
+			message = "草稿已批准，但尚未执行；当前未配置真实外部写执行器。"
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"draft": item, "external_effect": false, "message": message,
@@ -572,6 +590,81 @@ func (s *Server) listOfficeDraftEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": items})
+}
+
+func (s *Server) prepareOfficeOperation(w http.ResponseWriter, r *http.Request) {
+	item, created, err := s.office.PrepareOperation(r.Context(), r.PathValue("draftID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, map[string]any{
+		"operation": item, "external_effect": false,
+		"execution_enabled": s.office.ExecutionEnabled(),
+		"message":           "执行任务已持久化，尚未调用外部系统。",
+	})
+}
+
+func (s *Server) listOfficeOperations(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			s.problem(w, fmt.Errorf("limit 必须是整数"))
+			return
+		}
+		limit = parsed
+	}
+	items, err := s.office.ListOperations(r.Context(), office.OperationFilter{
+		DraftID: strings.TrimSpace(r.URL.Query().Get("draft_id")),
+		Status:  strings.TrimSpace(r.URL.Query().Get("status")),
+		Limit:   limit,
+	})
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"operations": items, "execution_enabled": s.office.ExecutionEnabled(),
+	})
+}
+
+func (s *Server) getOfficeOperation(w http.ResponseWriter, r *http.Request) {
+	item, err := s.office.GetOperation(r.Context(), r.PathValue("operationID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
+}
+
+func (s *Server) listOfficeOperationEvents(w http.ResponseWriter, r *http.Request) {
+	items, err := s.office.ListOperationEvents(r.Context(), r.PathValue("operationID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": items})
+}
+
+func (s *Server) executeOfficeOperation(w http.ResponseWriter, r *http.Request) {
+	outcome, err := s.office.ExecuteOperation(r.Context(), r.PathValue("operationID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	message := "外部操作已完成，执行结果和远端引用已持久化。"
+	if outcome.Operation.Status == office.OperationFailed {
+		message = "外部操作执行失败，任务已安全落库；可使用原幂等键重试。"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"operation": outcome.Operation, "draft": outcome.Draft,
+		"external_effect": outcome.ExternalEffect, "message": message,
+	})
 }
 
 type memoryRequest struct {
@@ -608,6 +701,8 @@ func (s *Server) problem(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	} else if errors.Is(err, knowledge.ErrEmbeddingMismatch) || errors.Is(err, office.ErrStateConflict) {
 		status = http.StatusConflict
+	} else if errors.Is(err, office.ErrExecutorUnavailable) {
+		status = http.StatusServiceUnavailable
 	}
 	if status >= 500 {
 		s.logger.Error("请求处理失败", "错误", err)
