@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.5 Office Agent 第六阶段 + V0.2 知识库生产化收口
+> 适用版本：V0.5 Office Agent 上线准备阶段 + V0.2 知识库生产化收口
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -198,12 +198,21 @@ flowchart TD
 | `ZORA_MCP_CALL_TIMEOUT` | `20s` | 否 | 单次 MCP 工具调用超时 |
 | `ZORA_MCP_MAX_OUTPUT_RUNES` | `12000` | 否 | 注入模型的 MCP 结果字符上限 |
 | `ZORA_MCP_FILES_ROOT` | 空 | 文件连接器必填 | 文件 Server 唯一授权根目录 |
-| `ZORA_MCP_MICROSOFT_ACCESS_TOKEN` | 空 | Microsoft 连接器必填 | Graph 短期访问令牌，只透传给连接器子进程 |
+| `ZORA_MCP_MICROSOFT_ACCESS_TOKEN` | 空 | 三种鉴权方式选一 | reader 开发期短期 Graph 令牌，只透传给子进程 |
+| `ZORA_MCP_MICROSOFT_ACCESS_TOKEN_FILE` | 空 | 三种鉴权方式选一 | 可轮换 reader 令牌文件 |
+| `ZORA_MCP_MICROSOFT_TENANT_ID` | 空 | OAuth 模式必填 | reader 单租户 Entra Tenant ID |
+| `ZORA_MCP_MICROSOFT_CLIENT_ID` | 空 | OAuth 模式必填 | reader Entra Application Client ID |
+| `ZORA_MCP_MICROSOFT_CLIENT_SECRET_FILE` | 空 | OAuth 模式必填 | reader Secret 文件；内容只由子进程读取 |
+| `ZORA_MCP_MICROSOFT_OAUTH_BASE_URL` | Entra login | 否 | OAuth authority 根地址；生产必须 HTTPS |
+| `ZORA_MCP_MICROSOFT_OAUTH_SCOPE` | Graph `/.default` | 否 | 固定应用身份 scope，不允许任意 scope |
 | `ZORA_MCP_MICROSOFT_BASE_URL` | Graph v1.0 | 否 | Graph API 根地址；非测试场景必须 HTTPS |
 | `ZORA_MCP_MICROSOFT_USER_ID` | `me` | 否 | 委托令牌使用 `me`；应用令牌填写明确用户 ID |
+| `ZORA_MCP_MICROSOFT_WRITE_ENABLED` | `false` | 否 | reader 必须保持 false，默认只注册四个只读工具 |
 | `ZORA_OFFICE_EXECUTOR` | `disabled` | 否 | `disabled` 或 `microsoft_graph`；真实写必须显式启用 |
 | `ZORA_OFFICE_EXECUTOR_COMMAND` | 空 | Graph 写开启时必填 | 专用 Microsoft MCP 子进程命令，不经过 Shell |
 | `ZORA_OFFICE_EXECUTOR_ARGS_JSON` | 空数组 | 否 | 专用执行器子进程参数 JSON 数组 |
+| `ZORA_OFFICE_MICROSOFT_*` | 空 | Graph 写开启时必填 | writer 独立 tenant/client/secret-file/user；后缀与 reader 相同 |
+| `ZORA_OFFICE_MICROSOFT_WRITE_ENABLED` | `false` | Graph 写开启时必填 | 必须显式为 true，与 OfficeExecutor 形成双门禁 |
 
 配置原则：
 
@@ -1259,7 +1268,7 @@ flowchart LR
 
 ### 17.4 V0.5 Office Agent
 
-第六阶段在官方 MCP 只读链路、持久化邮件/日历草稿预览、草稿级人工确认和幂等执行内核基础上，增加了 Microsoft Graph 可恢复写执行器。只读连接器链路如下：
+第六阶段在官方 MCP 只读链路、持久化邮件/日历草稿预览、草稿级人工确认和幂等执行内核基础上，增加了 Microsoft Graph 可恢复写执行器；上线准备阶段继续补齐 OAuth/Secret 和读写身份隔离。只读连接器链路如下：
 
 ```mermaid
 sequenceDiagram
@@ -1300,7 +1309,11 @@ sequenceDiagram
 
 Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，响应最多读取 2 MiB。用户输入的 ID 会执行长度/换行校验并按路径转义；查询上限固定，关键词在有限返回集内本地大小写不敏感过滤。Graph 非预期响应会提取错误码和最多 300 字符消息并转为中文错误；即使上游错误消息回显令牌，连接器也会在返回主进程前替换为“凭据已隐藏”。
 
-连接器不实现 OAuth 登录与刷新：部署平台负责取得短期令牌，并通过 `pass_env` 只注入 Microsoft 子进程。当前读取正文摘要，建议使用 `Mail.Read` 和 `Calendars.Read`；委托令牌访问 `/me`，应用令牌必须配置明确的 User ID。工具输出含 `content_warning`，系统 Prompt 也把邮件、日历和外部文件声明为不可信数据。
+`TokenSource` 支持三种互斥模式：直接短期令牌、每次读取的可轮换令牌文件、client credentials。生产模式只把 tenant/client ID、Secret 文件路径和目标 User ID 透传给 Microsoft 子进程；子进程读取单行 Secret，以 Graph `/.default` 请求 access token。Token 持有互斥缓存，最多提前 2 分钟刷新；Graph 401 使当前 token 失效并重放一次可重建请求。该流程没有 refresh token，过期后用客户端凭据重新获取。OAuth/Graph 错误最多保留 300 字符并替换 Secret/Token。
+
+reader 和 writer 使用 `ZORA_MCP_MICROSOFT_` / `ZORA_OFFICE_MICROSOFT_` 两套前缀。reader 默认只注册四个只读工具，建议只授予 `Application Mail.Read` 与 `Application Calendars.Read`；writer 只有在进程级写开关打开时才注册执行协议，建议只授予 `Application Mail.ReadWrite`、`Application Mail.Send` 和 `Application Calendars.ReadWrite`。两者都通过 Exchange Application RBAC 收敛到专用邮箱，且 writer 写工具仍不进入 Agent 工具集合。完整部署命令与负向验证见 [Microsoft Entra Runbook](microsoft-entra-deployment.md)。
+
+当前只读工具读取正文摘要；应用身份必须配置明确 User ID，不能访问 `/me`。工具输出含 `content_warning`，系统 Prompt 也把邮件、日历和外部文件声明为不可信数据。
 
 当前调用继续复用已有 `tool_call` / `tool_result` RunEvent，因此无需新增 MCP 专属数据库表。`GET /api/info` 只公开 `mcp_enabled`、`mcp_tool_count` 和总工具数，不返回命令、参数、根目录或环境变量。in-memory MCP 端到端测试覆盖握手、发现、Schema 适配和调用；文件测试覆盖隐藏路径、`..` 与符号链接逃逸；Graph 使用纯内存 HTTP Transport 验证鉴权、查询、四工具只读标注与错误脱敏。由于当前开发环境没有 Microsoft 租户凭据，真实账号集成验收仍待专用测试租户完成。
 
@@ -1310,11 +1323,11 @@ Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，�
 
 第五阶段从 approved 草稿幂等创建唯一 OfficeOperation。SQLite/PostgreSQL 使用草稿唯一约束、稳定 SHA-256 幂等键、租约和 attempt 控制并发/重试；领取、完成、失败与 Draft 状态及双事件表原子提交。启动恢复过期 executing，执行器门禁拒绝不支持幂等重放的实现，成功还必须提供可核验远端引用。REST/Web 已支持任务准备、状态、双审计和条件执行，默认未配置 Executor 时明确返回 503 且不改变任务。
 
-第六阶段新增 `mcpbridge.OfficeExecutor`。它启动独立 Microsoft MCP 会话，但不把工具适配成 Eino Tool；启动时只接受固定的 `create_email_draft`、`get_email_delivery_state`、`send_email_draft`、`create_calendar_event`，并核对 readOnly/destructive 声明。子进程仅继承 Graph Token、BaseURL 和 UserID，写执行器默认 `disabled`。
+第六阶段新增 `mcpbridge.OfficeExecutor`。它启动独立 Microsoft MCP 会话，但不把工具适配成 Eino Tool；启动时只接受固定的 `create_email_draft`、`get_email_delivery_state`、`send_email_draft`、`create_calendar_event`，并核对 readOnly/destructive 声明。writer 子进程只继承 `ZORA_OFFICE_MICROSOFT_*`，不会继承 reader 或模型/数据库凭据；写执行器默认 `disabled`，并额外要求 `ZORA_OFFICE_MICROSOFT_WRITE_ENABLED=true`。
 
 邮件不会直接调用 `sendMail`：执行器先 `POST /messages` 创建远端草稿并请求不可变 ID，随后通过 `CheckpointOperation` 原子保存 `microsoft-graph:message:*` 引用；只有检查点成功后才调用 `POST /messages/{id}/send`。检查点使用最长 5 秒的无取消 Context 尽力落库。发送失败或进程重启后，重试复用该 ID，并查询 `isDraft`：仍为草稿则继续发送，已不是草稿则认为上次远端发送已经完成，不再重复发送。日程使用 Operation 幂等键派生固定 UUID 作为 Graph `transactionId`，`POST /events` 成功后保存事件引用。跨 Graph/数据库无法建立单一 ACID 事务：若进程恰好在 Graph 返回草稿 ID 后、检查点调用前被强杀，可能留下未发送的孤立草稿；当前协议保证该窗口不会发送邮件，后续应通过远端幂等标记与对账进一步收敛。
 
-测试使用内存 MCP Transport 与内存 HTTP Transport 覆盖 Graph 方法、路径、Bearer/Prefer Header、请求体、写工具声明、检查点先于发送、第一次发送失败后的重试不重复创建草稿、已发送恢复和稳定 transactionId。当前未提供真实租户 Token，因此只能说明适配器协议与故障恢复已实现，不能声称在线发送验收通过。下一阶段继续补齐 OAuth 登录/刷新、Secret 托管、最小权限部署和真实租户集成测试。
+测试使用内存 MCP Transport 与内存 HTTP Transport 覆盖 Graph 方法、路径、Bearer/Prefer Header、请求体、写工具声明、检查点先于发送、第一次发送失败后的重试不重复创建草稿、已发送恢复和稳定 transactionId；OAuth 测试覆盖 `/.default` 表单、Secret 文件、缓存/提前刷新、401 失效重试、文件轮换、错误脱敏、应用身份拒绝 `/me` 和默认不注册写工具。当前未提供真实租户资源，因此只能说明适配器协议、OAuth 生命周期与故障恢复已实现，不能声称在线发送验收通过。
 
 ## 18. 维护约定
 

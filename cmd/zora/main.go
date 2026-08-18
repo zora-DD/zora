@@ -72,9 +72,16 @@ func run(logger *slog.Logger) error {
 			Args:    cfg.OfficeExecutorArgs,
 			// 只把 Microsoft Graph 专用变量交给子进程，模型密钥和数据库连接串不会被继承。
 			PassEnv: []string{
-				"ZORA_MCP_MICROSOFT_ACCESS_TOKEN",
-				"ZORA_MCP_MICROSOFT_BASE_URL",
-				"ZORA_MCP_MICROSOFT_USER_ID",
+				"ZORA_OFFICE_MICROSOFT_ACCESS_TOKEN",
+				"ZORA_OFFICE_MICROSOFT_ACCESS_TOKEN_FILE",
+				"ZORA_OFFICE_MICROSOFT_TENANT_ID",
+				"ZORA_OFFICE_MICROSOFT_CLIENT_ID",
+				"ZORA_OFFICE_MICROSOFT_CLIENT_SECRET_FILE",
+				"ZORA_OFFICE_MICROSOFT_OAUTH_BASE_URL",
+				"ZORA_OFFICE_MICROSOFT_OAUTH_SCOPE",
+				"ZORA_OFFICE_MICROSOFT_BASE_URL",
+				"ZORA_OFFICE_MICROSOFT_USER_ID",
+				"ZORA_OFFICE_MICROSOFT_WRITE_ENABLED",
 			},
 		}, mcpbridge.Options{
 			ConnectTimeout: cfg.MCPConnectTimeout,

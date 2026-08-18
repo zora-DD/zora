@@ -50,6 +50,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if cfg.OfficeExecutor != "disabled" || cfg.OfficeExecutorCommand != "" || len(cfg.OfficeExecutorArgs) != 0 {
 		t.Fatalf("office executor must be disabled by default: %+v", cfg)
 	}
+	if cfg.OfficeMicrosoftWrite {
+		t.Fatal("Microsoft write protocol must be disabled by default")
+	}
 }
 
 func TestLoadMicrosoftOfficeExecutorRequiresExplicitCommand(t *testing.T) {
@@ -60,6 +63,10 @@ func TestLoadMicrosoftOfficeExecutorRequiresExplicitCommand(t *testing.T) {
 	}
 	t.Setenv("ZORA_OFFICE_EXECUTOR_COMMAND", "./bin/zora-mcp-microsoft")
 	t.Setenv("ZORA_OFFICE_EXECUTOR_ARGS_JSON", `["--stdio"]`)
+	if _, err := Load(); err == nil {
+		t.Fatal("expected explicit Microsoft write protocol error")
+	}
+	t.Setenv("ZORA_OFFICE_MICROSOFT_WRITE_ENABLED", "true")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -176,6 +183,7 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_SUMMARY_ENABLED", "ZORA_SUMMARY_TRIGGER_MESSAGES", "ZORA_SUMMARY_KEEP_RECENT", "ZORA_SUMMARY_MAX_RUNES",
 		"ZORA_MCP_ENABLED", "ZORA_MCP_SERVERS_JSON", "ZORA_MCP_CONNECT_TIMEOUT", "ZORA_MCP_CALL_TIMEOUT", "ZORA_MCP_MAX_OUTPUT_RUNES",
 		"ZORA_OFFICE_EXECUTOR", "ZORA_OFFICE_EXECUTOR_COMMAND", "ZORA_OFFICE_EXECUTOR_ARGS_JSON",
+		"ZORA_OFFICE_MICROSOFT_WRITE_ENABLED",
 	} {
 		t.Setenv(key, "")
 	}

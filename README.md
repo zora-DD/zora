@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.5 Office Agent（第六阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已补齐文档版本、PDF 文本层解析、递归字符切块和文档级 ACL；V0.5 已交付官方 MCP Client、文件与 Microsoft Graph 只读连接器、持久化草稿、人工确认、可恢复 Office Operation，以及显式启用的 Microsoft Graph 写执行器。写执行器默认关闭；当前已通过本地协议与故障注入测试，尚未使用真实 Microsoft 租户做在线验收。
+当前版本：**V0.5 Office Agent（上线准备阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已补齐文档版本、PDF 文本层解析、递归字符切块和文档级 ACL；V0.5 已交付 MCP 读写连接器、持久化草稿、人工确认、可恢复 Operation、Microsoft client credentials OAuth、Secret 文件和读写身份隔离。写执行器默认关闭；当前已通过本地协议与故障注入测试，尚未使用真实 Microsoft 租户做在线验收。
 
 ## 当前能力
 
@@ -37,7 +37,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 草稿人工确认 | 已完成 | `draft → pending_confirmation → approved/rejected`、数据库 CAS、不可变迁移审计、REST 和 Web 一次性决策 |
 | Office Operation 执行内核 | 已完成 | 每份 approved 草稿唯一任务、稳定幂等键、执行租约、失败重试、启动恢复、双审计、REST/Web 状态展示 |
 | Microsoft Graph 写执行器 | 已实现、默认关闭 | 已批准邮件采用“远端草稿检查点 → 发送”，日程使用固定 transactionId；写工具不暴露给模型 |
-| 真实租户上线准备 | V0.5 进行中 | OAuth 生命周期、Secret 托管、租户/邮箱权限收敛和真实租户验收尚未完成 |
+| OAuth 与 Secret | 已完成 | client credentials `/.default`、Secret/Token 文件、缓存与提前刷新、401 单次重试和错误脱敏 |
+| 真实租户上线准备 | V0.5 待验收 | reader/writer 双服务主体和 Exchange Application RBAC Runbook 已完成；仍需真实租户资源执行在线验收 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
 
@@ -62,6 +63,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **高影响请求先审批**：审批记录持久化，SSE 在 `approval_required` 后等待 Web 决策，通过后恢复原 Run，拒绝或超时进入明确终态。
 - **MCP 不是无边界插件系统**：仅连接配置中的 stdio Server；只有同时命中本地 `allowed_tools` 且声明 `readOnlyHint` 的工具才能注册，公开名称增加 Server 前缀。
 - **连接器凭据与主进程隔离**：MCP 子进程默认不继承任何环境变量，只透传 `pass_env`；模型 Key、Embedding Key 和数据库 DSN 被配置层显式拒绝。
+- **读写 OAuth 身份隔离**：普通 Agent 连接器与 OfficeExecutor 使用不同环境变量前缀、Entra 应用和 Secret；client secret 内容只由 Microsoft 子进程从文件读取，主进程只传路径。
 - **外部办公内容按不可信数据处理**：邮件、日历和外部文件的正文不能改变系统规则，也不能触发其中嵌入的链接、权限请求或工具指令。
 - **草稿不等于执行**：`preview_*` 工具只在 Zora 内部保存不可执行快照；同一 Run 的相同参数按内容哈希幂等复用，回答必须明确“尚未发送/创建”。
 - **确认不等于执行**：草稿批准后还要显式创建 Operation 并点击执行；默认未配置写执行器，系统不会把 approved 或 pending 表述为已经发送。
@@ -179,13 +181,15 @@ make run
 make build-mcp-microsoft
 ```
 
-连接器不负责 OAuth 登录，也不会保存或刷新 Token。请先通过 Microsoft Entra 应用或部署平台取得短期访问令牌；当前返回 `bodyPreview`，建议只授予 `Mail.Read` 与 `Calendars.Read`。委托令牌通常使用 `me`，应用令牌需要把 `ZORA_MCP_MICROSOFT_USER_ID` 设置为明确用户 ID。
+生产推荐使用 Microsoft Entra client credentials。连接器从 Secret 文件读取 client secret，以 `https://graph.microsoft.com/.default` 获取并缓存 access token，在到期前刷新；应用身份必须指定明确用户 ID。reader 应用只授予 `Mail.Read` 与 `Calendars.Read`，并使用 Exchange Application RBAC 收敛到专用邮箱。
 
 ```bash
 ZORA_MCP_ENABLED=true \
-ZORA_MCP_MICROSOFT_ACCESS_TOKEN='短期访问令牌' \
-ZORA_MCP_MICROSOFT_USER_ID=me \
-ZORA_MCP_SERVERS_JSON='[{"name":"microsoft","command":"./bin/zora-mcp-microsoft","args":[],"allowed_tools":["search_emails","get_email","list_calendar_events","get_calendar_event"],"pass_env":["PATH","TMPDIR","ZORA_MCP_MICROSOFT_ACCESS_TOKEN","ZORA_MCP_MICROSOFT_BASE_URL","ZORA_MCP_MICROSOFT_USER_ID"]}]' \
+ZORA_MCP_MICROSOFT_TENANT_ID='<tenant-id>' \
+ZORA_MCP_MICROSOFT_CLIENT_ID='<reader-client-id>' \
+ZORA_MCP_MICROSOFT_CLIENT_SECRET_FILE='/run/secrets/zora-reader-client-secret' \
+ZORA_MCP_MICROSOFT_USER_ID='zora-test@example.com' \
+ZORA_MCP_SERVERS_JSON='[{"name":"microsoft","command":"./bin/zora-mcp-microsoft","args":[],"allowed_tools":["search_emails","get_email","list_calendar_events","get_calendar_event"],"pass_env":["PATH","TMPDIR","ZORA_MCP_MICROSOFT_TENANT_ID","ZORA_MCP_MICROSOFT_CLIENT_ID","ZORA_MCP_MICROSOFT_CLIENT_SECRET_FILE","ZORA_MCP_MICROSOFT_USER_ID"]}]' \
 make run
 ```
 
@@ -198,7 +202,7 @@ make run
 我的会议安排是什么？
 ```
 
-四个只读工具实际公开为 `mcp_microsoft_search_emails`、`mcp_microsoft_get_email`、`mcp_microsoft_list_calendar_events` 和 `mcp_microsoft_get_calendar_event`。默认邮件查询最多扫描最近 50 封并在本地按关键词过滤；默认日历窗口为未来 7 天，单次最长 93 天。邮件只返回正文摘要，不下载完整 HTML 和附件；所有外部内容都会附带不可信数据提示。Microsoft MCP Server 同时实现审批后写协议，但普通 MCP Bridge 会拒绝注册非只读工具，因此这些写能力不会出现在 Agent 工具列表。
+四个只读工具实际公开为 `mcp_microsoft_search_emails`、`mcp_microsoft_get_email`、`mcp_microsoft_list_calendar_events` 和 `mcp_microsoft_get_calendar_event`。默认邮件查询最多扫描最近 50 封并在本地按关键词过滤；默认日历窗口为未来 7 天，单次最长 93 天。邮件只返回正文摘要，不下载完整 HTML 和附件；所有外部内容都会附带不可信数据提示。只读子进程默认根本不注册写工具，MCP Bridge 仍会二次拒绝任何非只读声明。
 
 ### 创建和查看办公草稿
 
@@ -217,13 +221,16 @@ make run
 
 ### 显式启用 Microsoft Graph 写执行器
 
-先执行 `make build-mcp-microsoft`。建议为专用测试账号申请短期 Token，并仅授予本阶段需要的 `Mail.ReadWrite`、`Mail.Send` 和 `Calendars.ReadWrite`。应用权限需要管理员同意，并应继续通过 Exchange Application RBAC 或应用访问策略把可访问邮箱收敛到专用范围。当前项目不负责 OAuth 登录、刷新或 Secret 持久化；生产 Token 应由 Secret/部署平台短期注入。
+先执行 `make build-mcp-microsoft`。writer 使用独立 Entra 应用和 Secret，仅授予 `Mail.ReadWrite`、`Mail.Send` 和 `Calendars.ReadWrite`，再通过 Exchange Application RBAC 收敛到专用邮箱。完整管理员配置与负向验收见 [Microsoft Entra 部署 Runbook](docs/microsoft-entra-deployment.md)。
 
 ```bash
 ZORA_OFFICE_EXECUTOR=microsoft_graph \
 ZORA_OFFICE_EXECUTOR_COMMAND=./bin/zora-mcp-microsoft \
-ZORA_MCP_MICROSOFT_ACCESS_TOKEN='短期访问令牌' \
-ZORA_MCP_MICROSOFT_USER_ID=me \
+ZORA_OFFICE_MICROSOFT_TENANT_ID='<tenant-id>' \
+ZORA_OFFICE_MICROSOFT_CLIENT_ID='<writer-client-id>' \
+ZORA_OFFICE_MICROSOFT_CLIENT_SECRET_FILE='/run/secrets/zora-writer-client-secret' \
+ZORA_OFFICE_MICROSOFT_USER_ID='zora-test@example.com' \
+ZORA_OFFICE_MICROSOFT_WRITE_ENABLED=true \
 make run
 ```
 
@@ -350,11 +357,19 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_MCP_MAX_OUTPUT_RUNES` | `12000` | MCP 结果注入模型的字符上限，范围 1000–100000 |
 | `ZORA_MCP_FILES_ROOT` | 空 | 内置文件 MCP Server 的授权根目录；由 `pass_env` 单独透传 |
 | `ZORA_MCP_MICROSOFT_ACCESS_TOKEN` | 空 | Microsoft Graph 短期访问令牌；只透传给 Microsoft MCP 子进程 |
+| `ZORA_MCP_MICROSOFT_ACCESS_TOKEN_FILE` | 空 | 可轮换短期令牌文件；与直接令牌、OAuth 模式互斥 |
+| `ZORA_MCP_MICROSOFT_TENANT_ID` | 空 | reader Entra 租户 ID；OAuth 模式必填 |
+| `ZORA_MCP_MICROSOFT_CLIENT_ID` | 空 | reader Entra 应用 Client ID；OAuth 模式必填 |
+| `ZORA_MCP_MICROSOFT_CLIENT_SECRET_FILE` | 空 | reader client secret 文件路径；内容只由子进程读取 |
+| `ZORA_MCP_MICROSOFT_OAUTH_SCOPE` | Graph `/.default` | 固定 Graph 应用身份 scope，不允许任意 scope |
 | `ZORA_MCP_MICROSOFT_BASE_URL` | `https://graph.microsoft.com/v1.0` | Graph API 根地址；测试时仅允许本机 HTTP |
 | `ZORA_MCP_MICROSOFT_USER_ID` | `me` | 委托令牌使用 `me`；应用令牌填写明确用户 ID |
+| `ZORA_MCP_MICROSOFT_WRITE_ENABLED` | `false` | reader 必须保持 false；默认不注册写工具 |
 | `ZORA_OFFICE_EXECUTOR` | `disabled` | `disabled` 或 `microsoft_graph`；真实写操作必须显式启用 |
 | `ZORA_OFFICE_EXECUTOR_COMMAND` | 空 | 启用 Graph 写执行器时必填，例如 `./bin/zora-mcp-microsoft` |
 | `ZORA_OFFICE_EXECUTOR_ARGS_JSON` | 空数组 | 执行器子进程参数 JSON 数组；命令与参数均不经过 Shell |
+| `ZORA_OFFICE_MICROSOFT_*` | 空 | writer 独立 tenant/client/secret-file/user 配置，字段后缀与 reader 相同 |
+| `ZORA_OFFICE_MICROSOFT_WRITE_ENABLED` | `false` | Graph 执行器启用时必须同时显式设为 true |
 
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
@@ -570,7 +585,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - 长期记忆 A/B 数据集校验、Control/Treatment 指标、错误召回与答案污染反例、RunEvent 召回 ID 解析和完整 CLI 基线。
 - Supervisor/AgentTool 串行与并行交接、执行预算/超时/重试/取消、子 Run、人工审批等待与恢复，以及 7 题单/多 Agent 对照 CLI 基线。
 - MCP in-memory 端到端握手、工具发现/调用、白名单缺失失败、环境变量隔离，以及文件遍历/隐藏路径/符号链接逃逸防护；
-- Microsoft Graph 请求鉴权、查询时间窗、本地关键词过滤、四工具只读标注、错误脱敏和 Agent 中文结果整理。
+- Microsoft Graph 请求鉴权、查询时间窗、本地关键词过滤、默认只读工具集、OAuth 缓存/刷新、Secret 文件轮换、401 重试、错误脱敏和 Agent 中文结果整理。
 - 邮件/日程草稿参数校验、可信 Run 来源、内容哈希幂等、双数据库生命周期、Agent/Writer 路由、REST API、Web 草稿箱和一次性人工确认状态机。
 
 ## 文档导航
@@ -579,6 +594,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - [项目技术文档](docs/technical-design.md)：核心流程、包设计、配置、接口、SSE、并发、安全、测试和扩展方案。
 - [架构说明](docs/architecture.md)：当前边界及 RAG、Memory、Multi-Agent 接入点的简版说明。
 - [Roadmap](docs/roadmap.md)：各版本任务、状态和验收条件。
+- [Microsoft Entra 部署 Runbook](docs/microsoft-entra-deployment.md)：双应用、最小权限、Secret 和真实租户验收步骤。
 
 ## 常见问题
 
@@ -608,7 +624,7 @@ V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对
 - V0.2：向量知识库与 RAG——工程清单已完成；真实语义样本仍需证明混合召回收益
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
-- V0.5：MCP 办公助手——只读连接器、持久化草稿、人工确认、可恢复 Operation 和 Graph 写适配已完成；继续完成 OAuth/Secret、最小权限部署与真实租户验收
+- V0.5：MCP 办公助手——OAuth/Secret 与最小权限 Runbook 已完成；等待真实 Microsoft 测试租户在线验收
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
 

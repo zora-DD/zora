@@ -130,7 +130,7 @@ func TestOfficeExecutorReusesEmailCheckpointAcrossRetries(t *testing.T) {
 		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
 	})}
 	server, err := mcpmicrosoft.New(mcpmicrosoft.Config{
-		AccessToken: "test-token", BaseURL: "http://127.0.0.1/v1.0", HTTPClient: httpClient,
+		AccessToken: "test-token", BaseURL: "http://127.0.0.1/v1.0", WriteEnabled: true, HTTPClient: httpClient,
 	})
 	if err != nil {
 		t.Fatal(err)

@@ -83,7 +83,8 @@ func Build() ([]tool.BaseTool, error) {
 				Version: "0.5.0-dev",
 				Available: []string{
 					"流式对话", "持久化会话", "Eino ReAct 循环",
-					"只读工具", "执行事件审计", "TXT/Markdown 知识库摄取",
+					"只读工具", "执行事件审计", "TXT/Markdown/PDF 知识库摄取",
+					"知识库版本链、递归切块与文档级权限",
 					"向量与 BM25 混合检索", "知识库引用与答案评测",
 					"Semantic/Episodic 长期记忆 Schema", "长期记忆用户管理",
 					"对话记忆候选提取", "基于 Memory Key 的去重与冲突合并",
@@ -99,8 +100,10 @@ func Build() ([]tool.BaseTool, error) {
 					"Microsoft Graph 邮件/日历只读连接器与外部内容安全标记",
 					"邮件/日程结构化草稿预览、持久化与 Run 来源追踪",
 					"Office 草稿持久化人工确认、一次性决策与状态迁移审计",
+					"可恢复 Office Operation 与 Microsoft Graph 幂等写执行器",
+					"Microsoft client credentials OAuth、Secret 文件与读写身份隔离",
 				},
-				NextMilestone: "V0.5 OAuth/Secret 生命周期、最小权限部署与真实租户验收",
+				NextMilestone: "V0.5 真实 Microsoft 租户读写与最小权限范围验收",
 			}, nil
 		},
 	)

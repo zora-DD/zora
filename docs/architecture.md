@@ -237,7 +237,7 @@ Writer Agent / 单 Agent
 
 文件连接器在独立进程中固定授权根目录，每次请求重新解析实际路径。绝对路径、父目录逃逸、隐藏路径和逃逸符号链接都会被拒绝；只读取普通 UTF-8 文本。MCP ToolCall 仍通过既有 Runtime，因此无需旁路即可得到 SSE Trace 和持久化 RunEvent。
 
-Microsoft 连接器使用 Graph REST 统一查询邮件和日历。OAuth 登录、刷新和 Secret 保存不进入连接器：部署平台只向子进程注入短期 Token，委托访问使用 `me`，应用访问必须指定用户 ID。四个工具仅返回元数据和正文摘要，不下载邮件附件；默认日历窗口为 7 天、最长 93 天。外部内容始终附带不可信数据提示，系统 Prompt 也要求忽略其中的工具指令、链接和权限请求。
+Microsoft 连接器使用 Graph REST 统一查询邮件和日历。生产模式由子进程从 Secret 文件读取 client secret，通过 client credentials `/.default` 获取、缓存并提前刷新 access token；应用身份必须指定用户 ID，不能使用 `me`。reader 与 writer 使用不同环境前缀、Entra 应用和 Secret，普通 reader 默认不注册写工具。四个只读工具仅返回元数据和正文摘要，不下载邮件附件；默认日历窗口为 7 天、最长 93 天。外部内容始终附带不可信数据提示，系统 Prompt 也要求忽略其中的工具指令、链接和权限请求。
 
 `preview_email_draft` 和 `preview_calendar_draft` 会先校验邮箱、长度、RFC3339 时间窗与 IANA 时区，再保存结构化草稿。`source_run_id + content_hash` 唯一约束吸收 Agent/Writer 重试。REST/Web 可把 `draft` 提交为 `pending_confirmation`，再一次性批准或拒绝；Store 用预期状态条件更新，并把状态和 `office_draft_events` 记录放在同一事务中。只有 `draft` 可以删除，终态记录保留用于审计。
 
@@ -247,4 +247,4 @@ Graph 写工具虽然由同一 Microsoft MCP Server 声明，但普通 `mcpbridg
 
 邮件执行使用两段式恢复协议：Graph 先创建远端邮件草稿并返回不可变 ID，Store 在 Operation 仍持有 executing 租约时原子写入 `external_reference` 和 `executing → executing` 检查点事件，之后才允许发送。发送失败时 failed 状态保留远端引用；重试先查询 `isDraft`，仍为草稿则继续发送，已不是草稿则把上次执行恢复为 completed，不再重复发送。日程以稳定幂等键派生 UUID `transactionId`，Graph 成功返回事件 ID 后同样保存检查点。
 
-默认仍没有 Graph 写 Executor，`approved` 和 `pending` 均明确表示“未执行”；执行 API 返回 503 且不领取任务。当前已完成本地协议和故障注入测试，尚未完成 OAuth/Secret 生命周期、权限范围收敛和真实 Microsoft 租户在线验收，不允许把测试结果描述成真实发送成功。
+默认仍没有 Graph 写 Executor，`approved` 和 `pending` 均明确表示“未执行”；执行 API 返回 503 且不领取任务。OAuth/Secret、写工具双门禁和 Exchange Application RBAC 部署方案已完成，本地协议与故障注入测试通过；尚未完成真实 Microsoft 租户在线验收，不允许把测试结果描述成真实发送成功。

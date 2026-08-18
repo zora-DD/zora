@@ -79,6 +79,7 @@ type Config struct {
 	OfficeExecutor        string   // disabled 或 microsoft_graph；默认关闭所有真实外部写操作。
 	OfficeExecutorCommand string   // Microsoft Graph MCP 子进程命令，不经过 Shell。
 	OfficeExecutorArgs    []string // 子进程参数，使用 JSON 数组配置以避免 Shell 注入。
+	OfficeMicrosoftWrite  bool     // Microsoft 子进程是否注册写协议；必须与执行器双重开启。
 }
 
 // Load 在启动阶段完成配置校验，让错误尽早暴露，而不是运行到模型调用时才失败。
@@ -213,6 +214,13 @@ func Load() (Config, error) {
 	if officeExecutor == "microsoft_graph" && officeExecutorCommand == "" {
 		return Config{}, fmt.Errorf("启用 Microsoft Graph 办公执行器时必须配置 ZORA_OFFICE_EXECUTOR_COMMAND")
 	}
+	officeMicrosoftWrite, err := strconv.ParseBool(env("ZORA_OFFICE_MICROSOFT_WRITE_ENABLED", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_OFFICE_MICROSOFT_WRITE_ENABLED 必须是 true 或 false")
+	}
+	if officeExecutor == "microsoft_graph" && !officeMicrosoftWrite {
+		return Config{}, fmt.Errorf("启用 Microsoft Graph 办公执行器时必须显式设置 ZORA_OFFICE_MICROSOFT_WRITE_ENABLED=true")
+	}
 
 	cfg := Config{
 		Addr:                        env("ZORA_ADDR", ":8088"),
@@ -264,6 +272,7 @@ func Load() (Config, error) {
 		OfficeExecutor:        officeExecutor,
 		OfficeExecutorCommand: officeExecutorCommand,
 		OfficeExecutorArgs:    officeExecutorArgs,
+		OfficeMicrosoftWrite:  officeMicrosoftWrite,
 	}
 
 	switch cfg.StoreProvider {

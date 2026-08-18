@@ -96,7 +96,7 @@ func TestMicrosoftServerSeparatesReadAndWriteTools(t *testing.T) {
 	httpClient := graphHTTPClient(func(_ *http.Request) (int, string) {
 		return http.StatusOK, `{"value":[]}`
 	})
-	server, err := New(Config{AccessToken: "test-token", BaseURL: "http://127.0.0.1/v1.0", HTTPClient: httpClient})
+	server, err := New(Config{AccessToken: "test-token", BaseURL: "http://127.0.0.1/v1.0", WriteEnabled: true, HTTPClient: httpClient})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +141,36 @@ func TestMicrosoftServerSeparatesReadAndWriteTools(t *testing.T) {
 	encoded, err := json.Marshal(result.StructuredContent)
 	if err != nil || !strings.Contains(string(encoded), "content_warning") {
 		t.Fatalf("unexpected structured content: %s, err=%v", encoded, err)
+	}
+}
+
+func TestMicrosoftServerDoesNotExposeWriteToolsByDefault(t *testing.T) {
+	t.Parallel()
+	server, err := New(Config{AccessToken: "test-token", BaseURL: "http://127.0.0.1/v1.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = server.Run(ctx, serverTransport) }()
+	client := mcp.NewClient(&mcp.Implementation{Name: "zora-test", Version: "0.0.0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	listed, err := session.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Tools) != 4 {
+		t.Fatalf("default tool count = %d, want 4", len(listed.Tools))
+	}
+	for _, item := range listed.Tools {
+		if item.Annotations == nil || !item.Annotations.ReadOnlyHint {
+			t.Fatalf("default tool %q is not read-only", item.Name)
+		}
 	}
 }
 
