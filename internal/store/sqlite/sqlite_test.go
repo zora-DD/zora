@@ -141,6 +141,49 @@ func TestConversationLifecycle(t *testing.T) {
 	}
 }
 
+func TestAgentRunQueryLifecycle(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "agent-runs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	conversation := domain.Conversation{ID: "conv_runs", Title: "运行记录", CreatedAt: now, UpdatedAt: now}
+	if err := database.CreateConversation(ctx, conversation); err != nil {
+		t.Fatal(err)
+	}
+	message, err := database.AddMessage(ctx, domain.Message{
+		ID: "msg_runs", ConversationID: conversation.ID, Role: domain.RoleUser, Content: "测试运行", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := domain.AgentRun{
+		ID: "run_query", ConversationID: conversation.ID, UserMessageID: message.ID,
+		Status: domain.RunRunning, Model: "zora-mock", StartedAt: now,
+	}
+	if err := database.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	completedAt := now.Add(2 * time.Second)
+	if err := database.FinishRun(ctx, run.ID, domain.RunCompleted, "", "", completedAt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := database.GetRun(ctx, run.ID)
+	if err != nil || got.Status != domain.RunCompleted || got.CompletedAt == nil || !got.CompletedAt.Equal(completedAt) {
+		t.Fatalf("get run = %+v, %v", got, err)
+	}
+	runs, err := database.ListRuns(ctx, 10)
+	if err != nil || len(runs) != 1 || runs[0].ID != run.ID {
+		t.Fatalf("list runs = %+v, %v", runs, err)
+	}
+	if _, err := database.GetRun(ctx, "missing"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing run error = %v", err)
+	}
+}
+
 func TestAgentTaskRunLifecycle(t *testing.T) {
 	t.Parallel()
 	database, err := Open(filepath.Join(t.TempDir(), "agent-task-run.db"))

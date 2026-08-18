@@ -4,7 +4,7 @@
 
 ## 1. 边界
 
-Zora 将系统划分为十五个边界：
+Zora 将系统划分为十六个边界：
 
 1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
 2. `chat`：用例编排、事务顺序、并发保护和执行审计。
@@ -21,6 +21,7 @@ Zora 将系统划分为十五个边界：
 13. `mcpfiles`：独立文件连接器的授权目录、路径校验和只读工具实现。
 14. `mcpmicrosoft`：独立 Microsoft Graph 连接器的 Token 边界、邮件/日历只读查询和外部内容安全标记。
 15. `office`：邮件/日程草稿模型、结构化校验、可信 Run 来源、重试幂等、人工确认状态机和内部预览工具。
+16. `observability`：从 AgentRun 与 append-only RunEvent 派生 TTFT、真实 Usage、工具/交接耗时等统一运行指标。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -55,7 +56,11 @@ V0.1 直接使用 `ChatModelAgent + Runner`，以获得：
 
 ### RunEvent
 
-采用 append-only 审计：`run_started`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`model_output`、记忆提取/召回事件、会话摘要加载/更新/失败事件、`run_completed/failed/cancelled`。流式 token 只发往客户端，不逐 token 落库；记忆和摘要正文也不会复制进事件。专业 Agent 的交付物会进入 `agent_output`，用于核对协作事实，但不会成为下一轮主会话历史。
+采用 append-only 审计：`run_started`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`model_call_completed`、`first_token`、`model_output`、记忆提取/召回事件、会话摘要加载/更新/失败事件、`run_completed/failed/cancelled`。流式 token 只发往客户端，不逐 token 落库；每次完整模型回复只写一次调用完成事件。记忆和摘要正文也不会复制进事件。专业 Agent 的交付物会进入 `agent_output`，用于核对协作事实，但不会成为下一轮主会话历史。
+
+### RunMetrics
+
+RunMetrics 不是独立事实表，而是 `AgentRun + RunEvent` 的查询时投影。它统一计算总耗时、首字延迟、模型调用与 Usage 完整度、真实 Token、工具调用/耗时和 Agent 交接/耗时。SSE 完成事件、REST API 和 Web 运行监控都复用同一个聚合器；Provider 未返回 Usage 时明确标记不完整，不进行字符数估算。
 
 ### Memory
 
@@ -92,7 +97,7 @@ PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业�
 - Web UI 对模型输出做 HTML 转义。
 - 默认 Content Security Policy 只允许同源资源。
 - API Key 只从环境变量读取。
-- 当前没有任何写入外部系统的工具。
+- 外部写能力不注册为 Agent Tool；只有显式启用的审批后 OfficeExecutor 可以执行固定 Microsoft Graph 写协议。
 - 草稿工具只能从 Chat 注入的可信 Conversation/Run Context 取得来源，并固定返回 `external_effect=false`。
 - 草稿提交、批准和拒绝只能通过独立 REST/Web 操作；批准状态也不触发外部写入，避免把“确认”误当成“执行”。
 - 知识文档限制为 UTF-8 TXT/Markdown 且最大 5 MiB，文档删除需要用户确认。
@@ -247,4 +252,19 @@ Graph 写工具虽然由同一 Microsoft MCP Server 声明，但普通 `mcpbridg
 
 邮件执行使用两段式恢复协议：Graph 先创建远端邮件草稿并返回不可变 ID，Store 在 Operation 仍持有 executing 租约时原子写入 `external_reference` 和 `executing → executing` 检查点事件，之后才允许发送。发送失败时 failed 状态保留远端引用；重试先查询 `isDraft`，仍为草稿则继续发送，已不是草稿则把上次执行恢复为 completed，不再重复发送。日程以稳定幂等键派生 UUID `transactionId`，Graph 成功返回事件 ID 后同样保存检查点。
 
-默认仍没有 Graph 写 Executor，`approved` 和 `pending` 均明确表示“未执行”；执行 API 返回 503 且不领取任务。OAuth/Secret、写工具双门禁和 Exchange Application RBAC 部署方案已完成，本地协议与故障注入测试通过；尚未完成真实 Microsoft 租户在线验收，不允许把测试结果描述成真实发送成功。
+默认仍没有 Graph 写 Executor，`approved` 和 `pending` 均明确表示“未执行”；执行 API 返回 503 且不领取任务。OAuth/Secret、写工具双门禁和 Exchange Application RBAC 部署方案已完成，本地协议与故障注入测试通过；真实 Microsoft 租户在线验收因外部资源暂缓，不允许把测试结果描述成真实发送成功。
+
+## 10. V0.6 运行指标架构
+
+```text
+agentruntime.Event
+      ↓ chat 持久化
+AgentRun + RunEvent
+      ↓ observability.Aggregate
+      ├── SSE done.metrics
+      ├── GET /api/runs
+      ├── GET /api/runs/{id}/metrics
+      └── Web 运行监控
+```
+
+Runtime 只负责把 Eino 事件归一化为稳定的模型调用事实，Chat 负责记录第一段用户可见输出和执行事件，Store 负责原始数据，Observability 只做纯聚合。普通工具与 Agent 交接都使用 ToolCall ID 关联开始与完成；未成对事件保留为未完成计数。当前最近 Run 列表最多聚合 100 条，适合单机调试；生产规模再引入异步投影、分位指标和 OpenTelemetry，不替换原始审计链。

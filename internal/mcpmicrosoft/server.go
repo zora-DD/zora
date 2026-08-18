@@ -274,7 +274,7 @@ func New(config Config) (*mcp.Server, error) {
 	}
 	graph := &connector{tokenSource: tokenSource, baseURL: baseURL, userPath: userPath, httpClient: httpClient, now: now}
 
-	server := mcp.NewServer(&mcp.Implementation{Name: "zora-mcp-microsoft", Version: "0.5.0-dev"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "zora-mcp-microsoft", Version: "0.6.0-dev"}, nil)
 	readOnly, openWorld, destructive := true, true, false
 	annotations := &mcp.ToolAnnotations{ReadOnlyHint: readOnly, IdempotentHint: true, OpenWorldHint: &openWorld, DestructiveHint: &destructive}
 	mcp.AddTool(server, &mcp.Tool{

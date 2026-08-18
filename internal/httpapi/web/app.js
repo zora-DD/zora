@@ -8,6 +8,7 @@ const state = {
   memories: [],
   officeDrafts: [],
   officeOperations: [],
+  runSummaries: [],
   officeExecution: false,
   memoryAutoCapture: false,
   memoryRecall: false,
@@ -68,6 +69,10 @@ const elements = {
   officeDraftDialog: document.querySelector("#officeDraftDialog"),
   officeDraftList: document.querySelector("#officeDraftList"),
   officeDraftCount: document.querySelector("#officeDraftCount"),
+  openRunMetrics: document.querySelector("#openRunMetrics"),
+  closeRunMetrics: document.querySelector("#closeRunMetrics"),
+  runMetricsDialog: document.querySelector("#runMetricsDialog"),
+  runMetricsList: document.querySelector("#runMetricsList"),
   toast: document.querySelector("#toast"),
 };
 
@@ -144,6 +149,8 @@ function bindEvents() {
   elements.cancelMemoryEdit.addEventListener("click", resetMemoryForm);
   elements.openOfficeDrafts.addEventListener("click", openOfficeDrafts);
   elements.closeOfficeDrafts.addEventListener("click", () => elements.officeDraftDialog.close());
+  elements.openRunMetrics.addEventListener("click", openRunMetrics);
+  elements.closeRunMetrics.addEventListener("click", () => elements.runMetricsDialog.close());
   elements.renameConversation.addEventListener("click", renameActiveConversation);
   elements.composer.addEventListener("submit", event => {
     event.preventDefault();
@@ -202,6 +209,92 @@ async function openOfficeDrafts() {
   } catch (error) {
     notify(error.message);
   }
+}
+
+async function openRunMetrics() {
+  try {
+    await refreshRunMetrics();
+    elements.runMetricsDialog.showModal();
+    closeSidebar();
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function refreshRunMetrics() {
+  const result = await api("/api/runs?limit=50");
+  state.runSummaries = result.runs || [];
+  renderRunMetrics();
+}
+
+function renderRunMetrics() {
+  elements.runMetricsList.replaceChildren();
+  if (!state.runSummaries.length) {
+    const empty = document.createElement("div");
+    empty.className = "document-empty";
+    empty.textContent = "还没有 Agent 运行记录。发送一条消息后即可查看指标。";
+    elements.runMetricsList.append(empty);
+    return;
+  }
+  for (const summary of state.runSummaries) {
+    const run = summary.run || {};
+    const metrics = summary.metrics || {};
+    const card = document.createElement("article");
+    card.className = "run-metrics-item";
+    const heading = document.createElement("div");
+    heading.className = "run-metrics-heading";
+    const status = document.createElement("strong");
+    status.className = `status-${run.status || "unknown"}`;
+    status.textContent = runStatusText(run.status);
+    const model = document.createElement("span");
+    model.textContent = run.model || "未知模型";
+    const started = document.createElement("span");
+    started.textContent = formatDateTime(run.started_at);
+    heading.append(status, model, started);
+
+    const grid = document.createElement("div");
+    grid.className = "run-metrics-grid";
+    grid.append(
+      runMetric("总耗时", formatMilliseconds(metrics.duration_ms)),
+      runMetric("首字延迟", metrics.time_to_first_token_ms == null ? "—" : formatMilliseconds(metrics.time_to_first_token_ms)),
+      runMetric("Token", tokenUsageText(metrics)),
+      runMetric("调用", `${metrics.model_calls || 0} 模型 · ${metrics.tool_calls || 0} 工具 · ${metrics.agent_handoffs || 0} 交接`),
+    );
+    const meta = document.createElement("div");
+    meta.className = "run-metrics-meta";
+    const toolDuration = `工具累计 ${formatMilliseconds(metrics.tool_duration_ms)}，最慢 ${formatMilliseconds(metrics.maximum_tool_duration_ms)}`;
+    const handoffDuration = `交接累计 ${formatMilliseconds(metrics.agent_handoff_duration_ms)}，最慢 ${formatMilliseconds(metrics.maximum_agent_handoff_duration_ms)}`;
+    meta.textContent = `${run.id || ""} · ${toolDuration} · ${handoffDuration}${run.error ? ` · 错误：${run.error}` : ""}`;
+    card.append(heading, grid, meta);
+    elements.runMetricsList.append(card);
+  }
+}
+
+function runMetric(label, value) {
+  const item = document.createElement("div");
+  item.className = "run-metric";
+  const name = document.createElement("span");
+  name.textContent = label;
+  const content = document.createElement("strong");
+  content.textContent = value;
+  item.append(name, content);
+  return item;
+}
+
+function tokenUsageText(metrics) {
+  if (metrics.usage_complete) return `${metrics.total_tokens || 0}（输入 ${metrics.prompt_tokens || 0} / 输出 ${metrics.completion_tokens || 0}）`;
+  if (metrics.usage_reported_calls > 0) return `${metrics.total_tokens || 0}（部分调用上报）`;
+  return "Provider 未上报";
+}
+
+function formatMilliseconds(value) {
+  const milliseconds = Number(value || 0);
+  if (milliseconds < 1000) return `${milliseconds} ms`;
+  return `${(milliseconds / 1000).toFixed(milliseconds < 10000 ? 2 : 1)} s`;
+}
+
+function runStatusText(status) {
+  return ({ running: "执行中", completed: "已完成", failed: "失败", cancelled: "已取消", rejected: "已拒绝" })[status] || status || "未知";
 }
 
 async function refreshOfficeDrafts() {
@@ -855,7 +948,7 @@ function handleAgentEvent(type, event) {
     case "done":
       if (event.message) {
         const traces = state.draft.traces;
-        Object.assign(state.draft, event.message, { traces, streaming: false });
+        Object.assign(state.draft, event.message, { traces, metrics: event.metrics, streaming: false });
       }
       if (event.memory && (event.memory.created > 0 || event.memory.updated > 0)) {
         // 回答完成后刷新记忆计数；失败不会影响本轮回答展示。
@@ -954,8 +1047,28 @@ function renderMessages() {
       cursor.className = "cursor";
       bubble.append(cursor);
     }
+    if (message.role !== "user" && message.metrics) {
+      article.querySelector(".message-content").append(renderMessageMetrics(message.metrics));
+    }
     elements.messageList.append(article);
   }
+}
+
+function renderMessageMetrics(metrics) {
+  const container = document.createElement("div");
+  container.className = "message-metrics";
+  const values = [
+    `耗时 ${formatMilliseconds(metrics.duration_ms)}`,
+    metrics.time_to_first_token_ms == null ? "首字 —" : `首字 ${formatMilliseconds(metrics.time_to_first_token_ms)}`,
+    metrics.usage_complete ? `Token ${metrics.total_tokens || 0}` : "Token 未完整上报",
+    `模型 ${metrics.model_calls || 0} · 工具 ${metrics.tool_calls || 0}`,
+  ];
+  for (const value of values) {
+    const item = document.createElement("span");
+    item.textContent = value;
+    container.append(item);
+  }
+  return container;
 }
 
 function renderApproval(container, approval) {

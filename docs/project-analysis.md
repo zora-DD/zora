@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.5 Office Agent 上线准备阶段（OAuth/Secret 与最小权限）
+> 文档基线：V0.6 Agent 可靠性与可观测性阶段
 > 最后更新：2026-08-18
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环，并补齐版本链、PDF 文本层、递归字符切块和文档级 ACL。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 已在只读连接器、结构化草稿、一次性人工确认和可恢复 Operation 之上，实现 Microsoft Graph 写执行器、邮件检查点、日程幂等、client credentials OAuth、Secret 文件和 reader/writer 双身份最小权限边界。协议与故障注入测试已完成，当前只缺真实租户在线验收。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环，并补齐版本链、PDF 文本层、递归字符切块和文档级 ACL。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 已完成 Microsoft Graph 写执行器、OAuth/Secret 和 reader/writer 最小权限边界；真实租户验收因外部资源暂缓。V0.6 在既有 RunEvent 上建立运行指标：记录真实 Provider Usage、首字延迟、工具/交接耗时和总耗时，并通过 REST、SSE 与 Web 监控面板统一查询。
 
 ## 2. 背景与问题
 
@@ -144,7 +144,9 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | Office Operation 执行内核 | 已实现 | 草稿唯一任务、稳定幂等键、租约/attempt、失败重试、启动恢复、SQLite/PostgreSQL 双审计 |
 | Graph 外部写适配 | 已实现、默认关闭 | 邮件两段式执行、日程 transactionId、远端引用检查点和失败恢复已通过本地测试 |
 | OAuth/Secret 上线准备 | 已实现 | `/.default` client credentials、Secret 文件、令牌刷新/失效、读写服务主体隔离和 Exchange RBAC Runbook |
-| 真实租户上线 | V0.5 待验收 | 缺少测试租户/邮箱和管理员授权，在线读写与范围外拒绝尚未执行 |
+| Agent 运行指标 | 已实现 | 总耗时、首字延迟、模型调用、真实 Token Usage 完整度、工具调用/耗时和 Agent 交接统计 |
+| 运行监控面板 | 已实现 | 最近 Run 列表、状态和核心指标；REST 详情与 SSE 完成事件复用同一聚合逻辑 |
+| 真实租户上线 | 外部资源暂缓 | 缺少测试租户/邮箱和管理员授权，在线读写与范围外拒绝尚未执行；不阻塞其他版本开发 |
 
 ## 6. 业务模型
 
@@ -157,6 +159,7 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | AgentRun | 一次用户请求对应的一次根 Agent 执行 | running → completed/failed/cancelled/rejected |
 | AgentTaskRun | 根 Run 下的一次专业 Agent 交接 | running → completed/failed/cancelled；保存任务与输出摘要 |
 | RunEvent | Run 内部发生的可观察事实 | append-only，随 AgentRun 删除 |
+| RunMetrics | 由 AgentRun 与 RunEvent 派生的运行快照 | 查询时聚合，不复制一份易失真的指标表；随底层事件自然更新 |
 | Tool | Agent 可选择的受控能力 | 启动时注册；外部系统工具只读，草稿工具只写 Zora 内部预览 |
 | MCPServer | 独立运行的办公连接器进程 | 启动握手 → 工具发现/调用 → 应用退出时关闭 |
 | MCPToolAdapter | MCP Tool 到 Eino Tool 的命名空间与 Schema 适配 | 启动时创建，只允许白名单且声明只读的工具 |
@@ -699,6 +702,14 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 
 第六阶段实现 Graph Executor，但仍不把写能力交给模型。邮件先创建 Graph 远端草稿，拿到不可变 ID 后必须在当前数据库租约下写入检查点和审计事件，检查点成功后才允许发送；重试先核对 `isDraft`，从而区分继续发送与恢复已完成状态。日程用稳定幂等键派生固定 `transactionId`。这使“远端调用成功但本地进程退出”成为可解释、可恢复的工程路径，而不是仅靠接口名称声称幂等。
 
+### 9.15 指标从真实执行事实派生
+
+V0.6 没有用字符数估算 Token，也没有新增一套与审计轨迹可能不一致的指标写库。Runtime 在每次模型回复完成后写入 `model_call_completed`；只有 Provider 返回 `ResponseMeta.Usage` 时才记录输入、输出、总量、缓存和推理 Token，并单独统计 `usage_reported`。因此 Mock 或不返回 Usage 的 Provider 会明确显示“Usage 不完整”，而不是制造看似精确的成本数据。
+
+Chat 在第一段用户可见 `delta` 到达时记录 `first_token`，用 ToolCall ID 分别关联普通工具和 Agent 交接的开始与完成事件。总耗时由 AgentRun 起止时间计算，其余指标从 append-only RunEvent 聚合。`done.metrics`、运行详情 API 和 Web 监控面板调用同一个聚合器，避免页面、接口和审计轨迹分别计算后产生口径漂移。
+
+该设计同时保留两个诚实边界：模型成本只有真实 Provider Usage 才能计算；当前运行列表采用最多 100 条逐 Run 聚合，适合单机调试和作品演示，生产规模应升级为数据库聚合或异步指标投影。
+
 ## 10. 当前限制与风险
 
 | 限制/风险 | 当前影响 | 后续处理 |
@@ -718,7 +729,7 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 | Multi-Agent 默认会增加模型调用 | 固定集质量增益 0.214286，但调用次数代理为单 Agent 的 2 倍 | 默认关闭；接入真实 Provider Usage 后按业务集重新决定 |
 | Multi-Agent 固定集仅 7 题 | 能验证串/并行、路由、审计和确定性质量增益，不能代表复杂业务 | 扩充对抗提示、失败恢复和真实模型人工集 |
 | 子 Run 暂不支持恢复 | 可独立查询状态和耗时，但进程重启后不能从单个子任务继续 | 引入 Checkpoint、租约任务队列和幂等 Resume |
-| 审批等待器在进程内 | 决定已持久化，但重启会丢失等待中的 SSE 恢复通道 | V0.5 将审批与异步任务状态机结合 |
+| 通用审批等待器在进程内 | 决定已持久化，但重启会丢失等待中的 SSE 恢复通道；Office Operation 不受此限制 | 后续将通用审批也升级为可恢复任务状态机 |
 | MCP Server 属于受信部署组件 | 白名单和只读声明不能证明第三方实现绝对无副作用 | 只部署审核过的连接器；文件 Server 再用 OS 目录权限和进程隔离限制影响面 |
 | Graph 只完成模拟集成验收 | 代码和协议测试已通过，但没有真实 Microsoft 租户凭据的在线验收记录 | 建立最小权限 Entra 测试应用和专用测试账号，执行真实邮件/日历冒烟 |
 | 邮件/日历仅支持 Microsoft | Google Workspace 等来源尚不能接入 | 保持 MCP 工具语义稳定，新增独立 Provider 连接器而不修改 Chat 主链路 |
@@ -730,7 +741,7 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 | 草稿 Payload 尚未加密 | 本地数据库读取者可以看到邮件正文和日程内容 | 生产环境增加磁盘/列加密、数据保留策略和 Tenant ACL |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
 | 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
-| 尚无 token/cost 指标 | 无法比较模型成本 | 从 ResponseMeta 采集 Usage |
+| Token Usage 依赖 Provider 返回 | Mock 或部分兼容服务只能展示调用次数和 Usage 完整度，不能给出伪造成本 | 保持缺失可见；生产 Provider 返回 Usage 后再结合版本化价格表计算成本 |
 | 无恢复运行 | 中断后只能重新发起 | 引入 Eino Checkpoint/Resume |
 | Eino 尚未 1.0 | API 存在演进风险 | 固定版本、适配层隔离、升级回归测试 |
 
@@ -775,6 +786,7 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 2. **V0.2 Knowledge Base（工程项完成）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用、版本/PDF/递归切块/ACL 和固定评测已实现；继续以真实语义样本验证融合收益。
 3. **V0.3 Long-term Memory（主链路完成）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入、会话增量摘要和 A/B 门禁已实现。
 4. **V0.4 Multi-Agent（已完成）**：Supervisor、三个专业 Agent、隔离交接、串/并行执行治理、父子 Run、人工审批和单/多 Agent 对照门禁已实现。
-5. **V0.5 Office Agent（待真实租户验收）**：只读连接器、草稿确认、可恢复 Operation、Graph 写适配、OAuth/Secret 和最小权限 Runbook 已完成；剩余在线读写与负向范围验证。
+5. **V0.5 Office Agent（外部资源暂缓）**：只读连接器、草稿确认、可恢复 Operation、Graph 写适配、OAuth/Secret 和最小权限 Runbook 已完成；在线读写与负向范围验证等待测试租户。
+6. **V0.6 Agent 可靠性与可观测性（已完成）**：真实 Usage、首字延迟、工具/交接耗时、Run 聚合 API、SSE 指标和 Web 监控面板。
 
 详细任务与验收条件见 [Roadmap](roadmap.md)。

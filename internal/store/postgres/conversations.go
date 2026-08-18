@@ -159,6 +159,59 @@ VALUES($1, $2, $3, $4, $5, $6)`,
 	return nil
 }
 
+func (p *Postgres) GetRun(ctx context.Context, id string) (domain.AgentRun, error) {
+	run, err := scanAgentRun(p.pool.QueryRow(ctx, `
+SELECT id, conversation_id, user_message_id, COALESCE(assistant_message_id, ''),
+       status, model, error, started_at, completed_at
+FROM agent_runs WHERE id = $1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.AgentRun{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.AgentRun{}, fmt.Errorf("查询执行记录失败：%w", err)
+	}
+	return run, nil
+}
+
+func (p *Postgres) ListRuns(ctx context.Context, limit int) ([]domain.AgentRun, error) {
+	rows, err := p.pool.Query(ctx, `
+SELECT id, conversation_id, user_message_id, COALESCE(assistant_message_id, ''),
+       status, model, error, started_at, completed_at
+FROM agent_runs ORDER BY started_at DESC, id DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("查询执行记录列表失败：%w", err)
+	}
+	defer rows.Close()
+	runs := make([]domain.AgentRun, 0)
+	for rows.Next() {
+		run, scanErr := scanAgentRun(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("读取执行记录失败：%w", scanErr)
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历执行记录失败：%w", err)
+	}
+	return runs, nil
+}
+
+func scanAgentRun(scanner rowScanner) (domain.AgentRun, error) {
+	var run domain.AgentRun
+	if err := scanner.Scan(
+		&run.ID, &run.ConversationID, &run.UserMessageID, &run.AssistantMessageID,
+		&run.Status, &run.Model, &run.Error, &run.StartedAt, &run.CompletedAt,
+	); err != nil {
+		return domain.AgentRun{}, err
+	}
+	run.StartedAt = normalizeTime(run.StartedAt)
+	if run.CompletedAt != nil {
+		completedAt := normalizeTime(*run.CompletedAt)
+		run.CompletedAt = &completedAt
+	}
+	return run, nil
+}
+
 func (p *Postgres) FinishRun(ctx context.Context, id, status, assistantMessageID, errorMessage string, completedAt time.Time) error {
 	tag, err := p.pool.Exec(ctx, `
 UPDATE agent_runs

@@ -29,6 +29,18 @@ type Event struct {
 	ToolName   string
 	ToolCallID string
 	Arguments  string
+	// Usage 只承载模型供应商真实返回的统计；未返回时保持 nil，不能用字符数伪装 Token。
+	Usage        *ModelUsage
+	FinishReason string
+}
+
+// ModelUsage 是与具体模型 SDK 解耦的单次调用 Token 统计。
+type ModelUsage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CachedTokens     int
+	ReasoningTokens  int
 }
 
 // Runtime 持有配置完成的 Eino ChatModelAgent，并隐藏框架的具体事件结构。
@@ -161,6 +173,22 @@ func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit f
 		}
 		switch role {
 		case schema.Assistant:
+			// 每条 Assistant 输出对应一次模型调用；即使 Provider 没有返回 Usage，
+			// 也记录调用次数并明确 usage 缺失，便于真实模型成本核算。
+			modelEvent := Event{Type: "model_call_completed", AgentName: event.AgentName}
+			if message.ResponseMeta != nil {
+				modelEvent.FinishReason = message.ResponseMeta.FinishReason
+				if usage := message.ResponseMeta.Usage; usage != nil {
+					modelEvent.Usage = &ModelUsage{
+						PromptTokens: usage.PromptTokens, CompletionTokens: usage.CompletionTokens,
+						TotalTokens: usage.TotalTokens, CachedTokens: usage.PromptTokenDetails.CachedTokens,
+						ReasoningTokens: usage.CompletionTokensDetails.ReasoningTokens,
+					}
+				}
+			}
+			if err := emit(modelEvent); err != nil {
+				return "", err
+			}
 			// Assistant 消息可能是最终文本，也可能只包含一个或多个 ToolCall。
 			for _, call := range message.ToolCalls {
 				eventType := "tool_call"

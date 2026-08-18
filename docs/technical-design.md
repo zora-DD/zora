@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.5 Office Agent 上线准备阶段 + V0.2 知识库生产化收口
+> 适用版本：V0.6 Agent 可靠性与可观测性阶段
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -902,8 +902,10 @@ event: delta
 data: {"type":"delta","run_id":"run_xxx","content":"计算结果"}
 
 event: done
-data: {"type":"done","run_id":"run_xxx","message":{"role":"assistant","content":"..."}}
+data: {"type":"done","run_id":"run_xxx","message":{"role":"assistant","content":"..."},"metrics":{"duration_ms":1280,"time_to_first_token_ms":420,"model_calls":2,"usage_reported_calls":2,"usage_complete":true,"prompt_tokens":900,"completion_tokens":120,"total_tokens":1020,"tool_calls":1,"tool_completed":1,"tool_duration_ms":35}}
 ```
+
+`metrics` 是完成时的 Run 指标快照。Token 字段只累计 Provider 在 `ResponseMeta.Usage` 中返回的真实值；`usage_complete=false` 表示至少一次模型调用没有 Usage，调用方不得把已有部分误当成完整成本。
 
 多 Agent 交接会在最终 `delta` 前增加：
 
@@ -945,6 +947,15 @@ Content-Type: application/json
 ```
 
 接口只在多 Agent 且审批模式不为 `off` 时注册。`status` 可选 pending/approved/rejected/expired；`decision` 只允许 approved/rejected。决定成功返回完整审批记录并唤醒同进程中等待的原 SSE；审批不存在返回 404，重复决定返回 400。
+
+### 10.9.3 查询 Run 与运行指标
+
+```http
+GET /api/runs?limit=20
+GET /api/runs/{runID}/metrics
+```
+
+列表按 Run 开始时间倒序返回 `{"runs":[...]}`，默认 20、最大 100；详情返回指定 Run 的状态、起止时间和完整指标。两者都从 AgentRun 与 append-only RunEvent 查询时聚合，不维护第二份指标事实。当前列表会逐 Run 读取事件，适合单机调试和作品演示；高吞吐场景应改为数据库聚合或异步指标投影。
 
 ### 10.10 上传知识文档
 
@@ -1158,17 +1169,27 @@ POST /api/office/operations/{operationID}/execute
 
 ## 14. 可观察性
 
-当前有两条观察通道：
+当前有三条观察通道：
 
 1. `slog`：请求耗时、启动信息、错误和 panic stack；
-2. RunEvent：业务级执行轨迹。
+2. RunEvent：业务级 append-only 执行事实；
+3. RunMetrics：由 AgentRun 与 RunEvent 聚合的 REST、SSE 和 Web 指标视图。
 
-目标设计：
+Runtime 在每次模型输出完成时记录 `model_call_completed`。事件包含 `finish_reason`；仅当 Provider 返回 `ResponseMeta.Usage` 时才包含 prompt/completion/total/cached/reasoning Token。Chat 在第一段用户可见 `delta` 到达时记录 `first_token`，并用 ToolCall ID 配对工具开始/结束事件，用子 Run 或目标 Agent 配对交接事件。聚合器输出：
+
+- Run 总耗时和首字延迟；
+- 模型调用次数、Usage 上报次数和完整度，以及各类真实 Token；
+- 工具调用/完成次数、累计和最长耗时；
+- Agent 交接开始/完成次数和累计耗时。
+
+Mock 不伪造 Token，因此会得到 `usage_complete=false`。这既可测试缺失语义，也避免用字符数估算出虚假的成本精度。`done.metrics`、`GET /api/runs/{id}/metrics` 和 Web“运行监控”复用 `internal/observability.Aggregate`，防止多处统计口径漂移。
+
+后续目标：
 
 - OpenTelemetry trace/span；
 - run_id 作为日志和 trace 关联键；
-- 模型 token usage、首 token 延迟、总耗时；
-- 工具成功率与耗时；
+- Provider 定价表与可审计成本快照；
+- 跨时间窗的成功率、分位延迟和告警；
 - RAG 召回指标；
 - Langfuse 等 Agent Trace 平台作为可选输出，而不是业务数据源。
 
@@ -1177,8 +1198,9 @@ POST /api/office/operations/{operationID}/execute
 | 层级 | 当前覆盖 |
 |---|---|
 | 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分、弱相关硬负例和人工修正保护；会话摘要阈值、窗口、序号间隔、JSON 解析、敏感信息过滤和安全注入 |
-| Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta；Supervisor 单专家和 Document→Writer 串行协作；MCP 文件/邮件意图路由和中文结果整理；专家输出与最终回答隔离 |
-| Store/知识库/记忆测试 | Conversation/Message；Document/Chunk 事务、去重、召回、引用；Memory CRUD；ConversationSummary Upsert、消息范围、级联删除和 PostgreSQL Schema |
+| Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta；逐模型输出的 Usage 透传；Supervisor 单专家和 Document→Writer 串行协作；MCP 文件/邮件意图路由和中文结果整理；专家输出与最终回答隔离 |
+| Store/知识库/记忆测试 | Conversation/Message；AgentRun Get/List；Document/Chunk 事务、去重、召回、引用；Memory CRUD；ConversationSummary Upsert、消息范围、级联删除和 PostgreSQL Schema |
+| 可观察性测试 | Run 总耗时、TTFT、Usage 完整/缺失、工具与 Agent 交接配对和耗时聚合；SSE done.metrics、Run 列表/详情接口 |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
 | Memory A/B 测试 | 严格数据集校验；Control/Treatment 事实覆盖；意外召回与答案污染反例；RunEvent 召回 ID 解析；完整 CLI 基线 |
 | Multi-Agent 评测测试 | 严格数据集校验；路由序列、意外专家和答案完成指标；协作事件闭环；完整 Chat/RunEvent CLI 基线 |
@@ -1327,7 +1349,27 @@ reader 和 writer 使用 `ZORA_MCP_MICROSOFT_` / `ZORA_OFFICE_MICROSOFT_` 两套
 
 邮件不会直接调用 `sendMail`：执行器先 `POST /messages` 创建远端草稿并请求不可变 ID，随后通过 `CheckpointOperation` 原子保存 `microsoft-graph:message:*` 引用；只有检查点成功后才调用 `POST /messages/{id}/send`。检查点使用最长 5 秒的无取消 Context 尽力落库。发送失败或进程重启后，重试复用该 ID，并查询 `isDraft`：仍为草稿则继续发送，已不是草稿则认为上次远端发送已经完成，不再重复发送。日程使用 Operation 幂等键派生固定 UUID 作为 Graph `transactionId`，`POST /events` 成功后保存事件引用。跨 Graph/数据库无法建立单一 ACID 事务：若进程恰好在 Graph 返回草稿 ID 后、检查点调用前被强杀，可能留下未发送的孤立草稿；当前协议保证该窗口不会发送邮件，后续应通过远端幂等标记与对账进一步收敛。
 
-测试使用内存 MCP Transport 与内存 HTTP Transport 覆盖 Graph 方法、路径、Bearer/Prefer Header、请求体、写工具声明、检查点先于发送、第一次发送失败后的重试不重复创建草稿、已发送恢复和稳定 transactionId；OAuth 测试覆盖 `/.default` 表单、Secret 文件、缓存/提前刷新、401 失效重试、文件轮换、错误脱敏、应用身份拒绝 `/me` 和默认不注册写工具。当前未提供真实租户资源，因此只能说明适配器协议、OAuth 生命周期与故障恢复已实现，不能声称在线发送验收通过。
+测试使用内存 MCP Transport 与内存 HTTP Transport 覆盖 Graph 方法、路径、Bearer/Prefer Header、请求体、写工具声明、检查点先于发送、第一次发送失败后的重试不重复创建草稿、已发送恢复和稳定 transactionId；OAuth 测试覆盖 `/.default` 表单、Secret 文件、缓存/提前刷新、401 失效重试、文件轮换、错误脱敏、应用身份拒绝 `/me` 和默认不注册写工具。当前未提供真实租户资源，因此只能说明适配器协议、OAuth 生命周期与故障恢复已实现，不能声称在线发送验收通过。该在线验收标记为外部资源暂缓，不阻塞后续版本。
+
+### 17.5 V0.6 Agent 可靠性与可观测性
+
+这一阶段把现有审计事实转成可查询指标，而不是引入新的 Trace 平台作为业务依赖：
+
+```text
+Eino Runtime
+  ├── 每次模型输出 → model_call_completed(+真实 Usage)
+  ├── 第一段可见文本 → first_token
+  ├── ToolCall ID → tool_call / tool_result
+  └── 子 Run/目标 Agent → handoff started / completed
+             ↓ append-only
+AgentRun + RunEvent
+             ↓ observability.Aggregate
+SSE done.metrics / REST / Web 运行监控
+```
+
+`agentruntime.Event` 使用独立 `ModelUsage`，隔离 Eino 版本细节。Chat 只持久化完成后的模型级 Usage，不把逐 Token delta 写库；即使一次 Run 调用模型多次，也能以 `model_calls` 和 `usage_reported_calls` 表达完整度。普通工具与 Agent 交接都按 ToolCall ID 分别计算耗时；缺失关联 ID 的事件不会虚构耗时。
+
+Store 新增 `GetRun` / `ListRuns`，SQLite 和 PostgreSQL 保持相同契约。`observability.Aggregate` 是纯聚合函数；HTTP 与 Chat 均通过 Service 调用，页面不自行推导指标。Run 列表默认 20、最多 100，当前 N+1 读取事件是明确的 MVP 边界。生产化可增加时间窗聚合表、OpenTelemetry exporter 和价格快照，但不能覆盖原始 RunEvent。
 
 ## 18. 维护约定
 

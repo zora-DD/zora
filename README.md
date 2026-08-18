@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.5 Office Agent（上线准备阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已补齐文档版本、PDF 文本层解析、递归字符切块和文档级 ACL；V0.5 已交付 MCP 读写连接器、持久化草稿、人工确认、可恢复 Operation、Microsoft client credentials OAuth、Secret 文件和读写身份隔离。写执行器默认关闭；当前已通过本地协议与故障注入测试，尚未使用真实 Microsoft 租户做在线验收。
+当前版本：**V0.6 Agent 可靠性与可观测性**。V0.1–V0.4 主链路已完成，V0.5 已交付 MCP 办公连接器、可恢复 Operation、Microsoft OAuth/Secret 和读写身份隔离；真实 Microsoft 租户验收因暂不申请租户而延期，不阻塞主线。V0.6 新增模型调用与真实 Token Usage 审计、首字延迟、工具耗时、Run 聚合 API 和 Web 运行监控。
 
 ## 当前能力
 
@@ -17,6 +17,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 对话管理 | 已完成 | 创建、列表、自动标题、重命名、删除 |
 | 持久化 | 已完成 | SQLite 或 PostgreSQL 保存 Conversation、Message、AgentRun 和 RunEvent |
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
+| Agent 运行指标 | 已完成 | 模型调用次数、Provider 真实 Token Usage、TTFT、工具/交接耗时和整轮耗时；缺失 Usage 时明确标注而不估算 |
+| 运行监控面板 | 已完成 | 最近 50 次 Run 的状态、模型、延迟、Token、工具和多 Agent 交接统计 |
 | Web UI | 已完成 | 内嵌响应式页面，不需要 Node.js 部署 |
 | 知识库 MVP | 已完成 | TXT/Markdown/PDF 文本层、哈希去重、版本链、递归重叠分块、Embedding、向量 + BM25/RRF、引用 |
 | RAG 检索与答案评测 | 已完成 | 对比三路召回，并通过真实 Agent 链路评估事实覆盖、有效引用覆盖和引用忠实度 |
@@ -38,7 +40,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | Office Operation 执行内核 | 已完成 | 每份 approved 草稿唯一任务、稳定幂等键、执行租约、失败重试、启动恢复、双审计、REST/Web 状态展示 |
 | Microsoft Graph 写执行器 | 已实现、默认关闭 | 已批准邮件采用“远端草稿检查点 → 发送”，日程使用固定 transactionId；写工具不暴露给模型 |
 | OAuth 与 Secret | 已完成 | client credentials `/.default`、Secret/Token 文件、缓存与提前刷新、401 单次重试和错误脱敏 |
-| 真实租户上线准备 | V0.5 待验收 | reader/writer 双服务主体和 Exchange Application RBAC Runbook 已完成；仍需真实租户资源执行在线验收 |
+| 真实租户上线准备 | 外部资源延期 | reader/writer 双服务主体和 Exchange Application RBAC Runbook 已完成；取得测试租户后再做在线验收 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
 
@@ -53,6 +55,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **双存储后端**：SQLite 保留零依赖精确扫描；PostgreSQL 将向量和全文候选召回下推数据库，HTTP 与 Agent Tool 契约保持不变。
 - **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
 - **用户历史与内部轨迹分离**：Message 用于对话上下文，RunEvent 用于调试和审计。
+- **指标来自真实执行链路**：每次 Assistant 模型调用记录 `model_call_completed`；Token 只采用 Provider 返回值，首字和工具耗时从持久化事件重建，Mock 未上报时明确显示缺失。
 - **长期记忆不是消息向量库**：Memory 拥有独立类型、稳定 Key、来源、重要性和过期时间；候选只在回答成功后提取，同 Key 冲突执行合并，人工修正不会被自动覆盖。
 - **召回可解释、可关闭**：轻量词项相关性与重要性、时效性联合评分，并用最低主题相关性阻止弱词面重合被重要性抬高；RunEvent 只记录 ID 和分数组件。
 - **记忆收益可回归**：固定数据集让同一问题分别通过关闭/开启召回的完整 Chat 链路，门禁预期召回、错误注入、事实覆盖增益和答案污染，而不是只评估检索函数。
@@ -470,6 +473,8 @@ sequenceDiagram
 | `GET` | `/api/conversations/{id}/messages` | 查询消息历史 |
 | `GET` | `/api/conversations/{id}/summary` | 查询当前增量会话摘要及覆盖范围 |
 | `POST` | `/api/conversations/{id}/messages` | 发送消息并接收 SSE |
+| `GET` | `/api/runs?limit=20` | 查询最近 Run 及聚合后的延迟、Token、工具和 Agent 交接指标，最多 100 条 |
+| `GET` | `/api/runs/{id}/metrics` | 查询单个 Run 与可重建运行指标 |
 | `GET` | `/api/runs/{id}/events` | 查询持久执行事件 |
 | `GET` | `/api/runs/{id}/children` | 查询根 Run 下的专业 Agent 子 Run、状态和输出摘要 |
 | `GET` | `/api/approvals` | 审批开启时查询记录，可通过 `status` 和 `limit` 筛选 |
@@ -497,7 +502,7 @@ sequenceDiagram
 | `GET` | `/api/office/operations/{id}/events` | 查询追加式执行审计记录 |
 | `POST` | `/api/office/operations/{id}/execute` | 通过已配置的幂等写执行器领取并执行任务；未配置时返回 503 且不改变任务 |
 
-SSE 事件：`start`、`approval_required`、`approval_approved/rejected/expired`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`delta`、`done`、`error`。交接事件包含 `child_run_id`；`agent_output` 只显示在协作 Trace，不拼入最终回答。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；`done.memory_recalled` 返回实际注入数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
+SSE 事件：`start`、`approval_required`、`approval_approved/rejected/expired`、`tool_call`、`tool_result`、`agent_handoff_started`、`agent_output`、`agent_handoff_completed`、`delta`、`done`、`error`。交接事件包含 `child_run_id`；`agent_output` 只显示在协作 Trace，不拼入最终回答。`done.metrics` 返回整轮耗时、TTFT、模型/工具/交接次数和 Provider Token Usage 完整性；内部 `model_call_completed`、`first_token` 只写 RunEvent，不制造额外 SSE 噪声。开启自动记忆时，`done.memory` 返回候选、新增、更新和跳过数量；本轮触发摘要时，`done.summary` 返回覆盖序号、消息数和字符数。候选、召回及摘要正文都不会复制进 SSE 或 RunEvent。
 
 完整请求、响应和事件契约见 [项目技术文档](docs/technical-design.md)。
 
@@ -513,6 +518,7 @@ cmd/zora-mcp-microsoft/    Microsoft Graph 邮件/日历只读 MCP Server 入口
 evals/                     可版本化的 RAG/Memory/Multi-Agent 数据、锚点与阈值
 internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
+internal/observability/    RunEvent 指标聚合、Token 完整性和耗时计算
 internal/id/               随机业务 ID
 internal/agentruntime/     Eino Runtime、模型适配和事件转换
 internal/agentseval/       专家路由与单/多 Agent 质量、成本代理、耗时对照门禁
@@ -587,6 +593,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - MCP in-memory 端到端握手、工具发现/调用、白名单缺失失败、环境变量隔离，以及文件遍历/隐藏路径/符号链接逃逸防护；
 - Microsoft Graph 请求鉴权、查询时间窗、本地关键词过滤、默认只读工具集、OAuth 缓存/刷新、Secret 文件轮换、401 重试、错误脱敏和 Agent 中文结果整理。
 - 邮件/日程草稿参数校验、可信 Run 来源、内容哈希幂等、双数据库生命周期、Agent/Writer 路由、REST API、Web 草稿箱和一次性人工确认状态机。
+- Provider Token Usage 透传、Mock 缺失标记、TTFT/工具耗时事件、SQLite/PostgreSQL Run 查询、聚合 API、SSE 指标和 Web 监控入口。
 
 ## 文档导航
 
@@ -625,6 +632,7 @@ V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
 - V0.5：MCP 办公助手——OAuth/Secret 与最小权限 Runbook 已完成；等待真实 Microsoft 测试租户在线验收
+- V0.6：可靠性与可观测性——真实 Token Usage、TTFT、工具/Agent 交接耗时、Run 聚合 API 和 Web 监控已完成
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
 

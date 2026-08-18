@@ -18,6 +18,7 @@ import (
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/id"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/observability"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -26,19 +27,20 @@ const defaultConversationTitle = "新对话"
 
 // StreamEvent 是应用层事件，不直接暴露 Eino 的内部类型。
 type StreamEvent struct {
-	Type           string                `json:"type"`
-	RunID          string                `json:"run_id,omitempty"`
-	AgentName      string                `json:"agent_name,omitempty"`
-	Content        string                `json:"content,omitempty"`
-	ToolName       string                `json:"tool_name,omitempty"`
-	ToolCallID     string                `json:"tool_call_id,omitempty"`
-	ChildRunID     string                `json:"child_run_id,omitempty"`
-	Arguments      string                `json:"arguments,omitempty"`
-	Message        *domain.Message       `json:"message,omitempty"`
-	Memory         *memory.CaptureResult `json:"memory,omitempty"`
-	MemoryRecalled int                   `json:"memory_recalled,omitempty"`
-	Summary        *summary.UpdateResult `json:"summary,omitempty"`
-	Approval       *approval.Approval    `json:"approval,omitempty"`
+	Type           string                    `json:"type"`
+	RunID          string                    `json:"run_id,omitempty"`
+	AgentName      string                    `json:"agent_name,omitempty"`
+	Content        string                    `json:"content,omitempty"`
+	ToolName       string                    `json:"tool_name,omitempty"`
+	ToolCallID     string                    `json:"tool_call_id,omitempty"`
+	ChildRunID     string                    `json:"child_run_id,omitempty"`
+	Arguments      string                    `json:"arguments,omitempty"`
+	Message        *domain.Message           `json:"message,omitempty"`
+	Memory         *memory.CaptureResult     `json:"memory,omitempty"`
+	MemoryRecalled int                       `json:"memory_recalled,omitempty"`
+	Summary        *summary.UpdateResult     `json:"summary,omitempty"`
+	Approval       *approval.Approval        `json:"approval,omitempty"`
+	Metrics        *observability.RunMetrics `json:"metrics,omitempty"`
 }
 
 // Service 是会话用例边界，负责执行顺序、状态落库和同会话并发控制。
@@ -148,6 +150,40 @@ func (s *Service) ListMessages(ctx context.Context, conversationID string) ([]do
 
 func (s *Service) ListRunEvents(ctx context.Context, runID string) ([]domain.RunEvent, error) {
 	return s.store.ListRunEvents(ctx, runID)
+}
+
+func (s *Service) GetRunSummary(ctx context.Context, runID string) (observability.RunSummary, error) {
+	run, err := s.store.GetRun(ctx, runID)
+	if err != nil {
+		return observability.RunSummary{}, err
+	}
+	events, err := s.store.ListRunEvents(ctx, runID)
+	if err != nil {
+		return observability.RunSummary{}, err
+	}
+	return observability.Aggregate(run, events), nil
+}
+
+func (s *Service) ListRunSummaries(ctx context.Context, limit int) ([]observability.RunSummary, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	runs, err := s.store.ListRuns(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	summaries := make([]observability.RunSummary, 0, len(runs))
+	for _, run := range runs {
+		events, eventErr := s.store.ListRunEvents(ctx, run.ID)
+		if eventErr != nil {
+			return nil, eventErr
+		}
+		summaries = append(summaries, observability.Aggregate(run, events))
+	}
+	return summaries, nil
 }
 
 func (s *Service) ListAgentTaskRuns(ctx context.Context, runID string) ([]domain.AgentTaskRun, error) {
@@ -290,11 +326,42 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 
 	childRuns := make(map[string]domain.AgentTaskRun)
 	finishedChildRuns := make(map[string]bool)
+	toolStartedAt := make(map[string]time.Time)
+	firstTokenRecorded := false
 	// 可信 Conversation/Run 身份通过 Context 传给本地草稿工具，模型参数中不暴露这些审计字段。
 	runtimeCtx := agentruntime.WithExecutionIdentity(ctx, conversationID, run.ID)
 	answer, err := s.runtime.Execute(runtimeCtx, history, func(event agentruntime.Event) error {
 		payload := map[string]any{}
 		var childRunID string
+		now := time.Now().UTC()
+		if event.Type == "delta" && !firstTokenRecorded {
+			firstTokenRecorded = true
+			if err := s.appendEvent(ctx, run.ID, "first_token", event.AgentName, "", map[string]any{
+				"latency_ms": now.Sub(run.StartedAt).Milliseconds(),
+			}); err != nil {
+				return err
+			}
+		}
+		if (event.Type == "tool_call" || event.Type == "agent_handoff_started") && event.ToolCallID != "" {
+			toolStartedAt[event.ToolCallID] = now
+		}
+		if event.Type == "tool_result" || event.Type == "agent_handoff_completed" {
+			if startedAt, ok := toolStartedAt[event.ToolCallID]; ok {
+				payload["duration_ms"] = now.Sub(startedAt).Milliseconds()
+				delete(toolStartedAt, event.ToolCallID)
+			}
+		}
+		if event.Type == "model_call_completed" {
+			payload["finish_reason"] = event.FinishReason
+			payload["usage_reported"] = event.Usage != nil
+			if event.Usage != nil {
+				payload["prompt_tokens"] = event.Usage.PromptTokens
+				payload["completion_tokens"] = event.Usage.CompletionTokens
+				payload["total_tokens"] = event.Usage.TotalTokens
+				payload["cached_tokens"] = event.Usage.CachedTokens
+				payload["reasoning_tokens"] = event.Usage.ReasoningTokens
+			}
+		}
 		if event.Type == "agent_handoff_started" {
 			child := domain.AgentTaskRun{
 				ID: id.New("task"), ParentRunID: run.ID, AgentName: event.ToolName,
@@ -334,6 +401,10 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 			if err := s.appendEvent(ctx, run.ID, event.Type, event.AgentName, event.ToolName, payload); err != nil {
 				return err
 			}
+		}
+		// 模型调用指标只进入审计和监控 API，不作为聊天内容推送，避免前端频繁重绘。
+		if event.Type == "model_call_completed" {
+			return nil
 		}
 		return emit(StreamEvent{
 			Type: event.Type, RunID: run.ID, AgentName: event.AgentName,
@@ -402,9 +473,10 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 	if err := s.store.FinishRun(ctx, run.ID, domain.RunCompleted, assistantMessage.ID, "", completedAt); err != nil {
 		return err
 	}
+	runMetrics := s.completedRunMetrics(ctx, run, domain.RunCompleted, assistantMessage.ID, completedAt)
 	return emit(StreamEvent{
 		Type: "done", RunID: run.ID, Message: &assistantMessage,
-		Memory: captureResult, MemoryRecalled: recalledCount, Summary: summaryResult,
+		Memory: captureResult, MemoryRecalled: recalledCount, Summary: summaryResult, Metrics: runMetrics,
 	})
 }
 
@@ -447,13 +519,30 @@ func (s *Service) stopAfterApproval(ctx context.Context, run domain.AgentRun, it
 	}); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
-	if err := s.store.FinishRun(ctx, run.ID, status, assistantMessage.ID, "", time.Now().UTC()); err != nil {
+	completedAt := time.Now().UTC()
+	if err := s.store.FinishRun(ctx, run.ID, status, assistantMessage.ID, "", completedAt); err != nil {
 		return err
 	}
 	if err := emit(StreamEvent{Type: "approval_" + item.Status, RunID: run.ID, Approval: &item}); err != nil {
 		return err
 	}
-	return emit(StreamEvent{Type: "done", RunID: run.ID, Message: &assistantMessage})
+	return emit(StreamEvent{
+		Type: "done", RunID: run.ID, Message: &assistantMessage,
+		Metrics: s.completedRunMetrics(ctx, run, status, assistantMessage.ID, completedAt),
+	})
+}
+
+// completedRunMetrics 复用同一个聚合器构造 SSE 完成快照，避免与查询 API 产生两套指标口径。
+func (s *Service) completedRunMetrics(ctx context.Context, run domain.AgentRun, status, assistantMessageID string, completedAt time.Time) *observability.RunMetrics {
+	events, err := s.store.ListRunEvents(ctx, run.ID)
+	if err != nil {
+		return nil
+	}
+	run.Status = status
+	run.AssistantMessageID = assistantMessageID
+	run.CompletedAt = &completedAt
+	metrics := observability.Aggregate(run, events).Metrics
+	return &metrics
 }
 
 func approvalAuditPayload(item approval.Approval) map[string]any {

@@ -85,7 +85,7 @@ func New(root string) (*mcp.Server, error) {
 	}
 
 	files := &connector{root: canonical}
-	server := mcp.NewServer(&mcp.Implementation{Name: "zora-mcp-files", Version: "0.5.0-dev"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "zora-mcp-files", Version: "0.6.0-dev"}, nil)
 	readOnly := true
 	openWorld := false
 	destructive := false

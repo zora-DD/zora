@@ -63,7 +63,7 @@
 
 当前验证结果：`ZORA_MULTI_AGENT_ENABLED` 默认关闭，显式开启后由 `zora_supervisor` 通过 Eino AgentTool 调用研究、文档和写作专家。研究专家仅持有时间、计算器和项目状态工具，文档专家持有 `knowledge_search`（V0.5 启用时再追加 MCP 文件只读工具），写作专家无底层工具；AgentTool 默认只传递 Supervisor 构造的 `request`，不共享主会话完整历史。Runtime 对每个根 Run 注入独立的交接次数、并行度、专家超时和重试预算，Context 取消继续下传；独立子任务由 Eino ToolNode 并行执行，证据依赖任务保持串行。每次交接同步创建 `agent_task_runs` 子 Run，SSE/Web Trace 暴露 `child_run_id`。`risky/all/off` 审批策略把高影响请求持久化为 `approval_requests`，Web 可批准或拒绝，批准后恢复原 SSE，拒绝/超时进入明确终态。`make eval-agents` 使用隔离 SQLite 和完整 Chat/RunEvent 链路，默认 7 题路由准确率 1、意外专家调用率 0、答案完成率 1；同题单 Agent Control 质量 0.785714，多 Agent Treatment 质量 1，质量增益 0.214286，调用次数代理比 2，延迟比例随环境输出并受宽松上限门禁。该结论只适用于确定性 Mock 小样本，真实 Provider 仍需扩充业务集和 Token Usage。V0.4 主链路已完成。
 
-## V0.5 Office Agent — 上线准备代码已完成，待真实租户验收
+## V0.5 Office Agent — 上线准备代码已完成，真实租户验收延期
 
 - [x] 官方 MCP Go SDK
 - [x] 文件只读连接器
@@ -77,7 +77,7 @@
 - [x] 日程固定 transactionId 幂等创建
 - [x] Microsoft client credentials OAuth、令牌缓存/提前刷新与 401 单次重试
 - [x] Secret/Token 文件、reader/writer 双身份、写工具双门禁和最小权限 Runbook
-- [ ] 真实 Microsoft 租户邮件/日历读写与范围外拒绝验收
+- [ ] 真实 Microsoft 租户邮件/日历读写与范围外拒绝验收（外部资源延期，不阻塞 V0.6）
 
 当前验证结果：已固定官方 `github.com/modelcontextprotocol/go-sdk v1.7.0`，Zora 通过 stdio 启动 MCP 子进程、完成协议握手和分页工具发现，再把 JSON Schema 转为 Eino Tool。只有同时进入本地 `allowed_tools` 且声明 `readOnlyHint` 的工具会被注册，公开名称增加 `mcp_{server}_` 前缀；每次调用受独立超时与 12,000 字符默认输出上限约束，工具调用/结果沿用 RunEvent 审计。内置 `zora-mcp-files` 仅支持文件列表和 UTF-8 文本读取，授权根目录在子进程内强制校验；`zora-mcp-microsoft` 通过 Graph 提供邮件搜索/详情和日历窗口查询/详情四个只读工具，只返回元数据与正文摘要。Graph Token 只透传给独立子进程，外部内容带不可信数据提示。
 
@@ -92,6 +92,21 @@
 第七阶段新增 client credentials `/.default` TokenSource。client secret 从单行 Secret 文件读取，access token 在 Microsoft 子进程内缓存并最多提前 2 分钟刷新；Graph 401 会失效缓存并只重试一次，OAuth/Graph 错误均脱敏。普通 Agent reader 与审批后 writer 改用两套环境前缀、两套 Entra 应用和两份 Secret；reader 默认只注册四个只读工具，writer 必须同时设置 `ZORA_OFFICE_EXECUTOR=microsoft_graph` 与 `ZORA_OFFICE_MICROSOFT_WRITE_ENABLED=true`。部署 Runbook 给出 Exchange Application RBAC 的 mailbox scope、reader/writer 最小角色和正负验收清单。
 
 本阶段仍没有用 Mock 冒充真实租户成功：当前环境没有 Microsoft 测试租户、专用邮箱和 Entra 管理权限，因此在线发送/建会及范围外拒绝尚未执行。拿到这些资源后只剩真实租户验收，不再缺应用代码主链路。
+
+## V0.6 Agent Reliability & Observability — 已完成
+
+- [x] 每次 Assistant 模型调用形成 `model_call_completed` RunEvent
+- [x] 采集 Provider 真实 Prompt/Completion/Total/Cached/Reasoning Token Usage
+- [x] 未上报或部分上报 Usage 的完整性标记，不使用字符数伪造 Token
+- [x] 首字延迟、工具/Agent 交接耗时与整轮耗时
+- [x] SQLite/PostgreSQL 最近 Run 查询与单 Run 查询
+- [x] `GET /api/runs`、`GET /api/runs/{id}/metrics` 聚合接口
+- [x] `done.metrics` 实时结果和 Web 最近 50 次运行监控
+- [x] 聚合单元测试、Runtime Usage 测试、HTTP/SSE 纵向验收
+
+验收条件：指标必须来自真实 Runtime 与持久化 RunEvent；Provider 不返回 Usage 时不得估算成“真实 Token”；同一 Run 的实时 `done.metrics`、聚合 API 和事件明细可以互相核对。
+
+当前验证结果：Runtime 在每条 Assistant 输出合并完成后记录模型调用，兼容工具调用轮次、最终回答和专业 Agent 输出。真实 Provider 返回的 `ResponseMeta.Usage` 被转换为与 SDK 解耦的结构，RunEvent 保存调用级 Token 与 `usage_reported`；聚合器统计 Usage 完整性。Chat 在第一个用户可见 `delta` 时记录 `first_token`，并用 ToolCall ID 分别关联普通工具和 Agent 交接的开始、完成与耗时。最近 Run API 从 SQLite/PostgreSQL 的 `agent_runs` 读取终态，再使用追加式事件重建指标；Web 监控按需读取最近 50 次。Mock 端到端实测为 2 次模型调用、1 次工具调用、Usage 未上报，页面/API 会如实显示“Provider 未上报”。浏览器自动化环境无法连接本机回环地址，因此本轮完成了真实 HTTP/SSE、静态资源、JavaScript 语法和 API 测试，但不把截图级视觉检查描述为已通过。
 
 ## 每个版本的文档完成标准
 

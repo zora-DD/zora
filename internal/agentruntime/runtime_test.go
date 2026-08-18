@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 
@@ -44,6 +45,52 @@ func TestMockRuntimeExecutesToolThroughEino(t *testing.T) {
 	if !strings.Contains(joined, "tool_call") || !strings.Contains(joined, "tool_result") || !strings.Contains(joined, "delta") {
 		t.Fatalf("event chain %q is incomplete", joined)
 	}
+}
+
+func TestRuntimeEmitsProviderTokenUsage(t *testing.T) {
+	t.Parallel()
+	runtime, err := NewWithModel(context.Background(), config.Config{
+		Provider: "openai", Model: "usage-test", Instruction: "请使用中文回答。",
+		RequestTimeout: time.Second, MaxIterations: 3,
+	}, nil, usageTestModel{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var usageEvent *Event
+	_, err = runtime.Execute(context.Background(), []*schema.Message{schema.UserMessage("你好")}, func(event Event) error {
+		if event.Type == "model_call_completed" {
+			copy := event
+			usageEvent = &copy
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usageEvent == nil || usageEvent.Usage == nil || usageEvent.Usage.TotalTokens != 15 ||
+		usageEvent.Usage.CachedTokens != 3 || usageEvent.Usage.ReasoningTokens != 2 || usageEvent.FinishReason != "stop" {
+		t.Fatalf("unexpected usage event: %+v", usageEvent)
+	}
+}
+
+type usageTestModel struct{}
+
+func (usageTestModel) Generate(context.Context, []*schema.Message, ...model.Option) (*schema.Message, error) {
+	message := schema.AssistantMessage("你好，我是 Zora。", nil)
+	message.ResponseMeta = &schema.ResponseMeta{FinishReason: "stop", Usage: &schema.TokenUsage{
+		PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15,
+		PromptTokenDetails:      schema.PromptTokenDetails{CachedTokens: 3},
+		CompletionTokensDetails: schema.CompletionTokensDetails{ReasoningTokens: 2},
+	}}
+	return message, nil
+}
+
+func (m usageTestModel) Stream(ctx context.Context, input []*schema.Message, options ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	message, err := m.Generate(ctx, input, options...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{message}), nil
 }
 
 func TestFormatMCPResultProducesReadableChineseOutput(t *testing.T) {

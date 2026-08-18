@@ -26,6 +26,8 @@ type Store interface {
 	ListMessages(ctx context.Context, conversationID string, limit int) ([]domain.Message, error)
 
 	CreateRun(ctx context.Context, run domain.AgentRun) error
+	GetRun(ctx context.Context, id string) (domain.AgentRun, error)
+	ListRuns(ctx context.Context, limit int) ([]domain.AgentRun, error)
 	FinishRun(ctx context.Context, id, status, assistantMessageID, errorMessage string, completedAt time.Time) error
 	CreateAgentTaskRun(ctx context.Context, run domain.AgentTaskRun) error
 	FinishAgentTaskRun(ctx context.Context, id, status, outputPreview, errorMessage string, completedAt time.Time) error

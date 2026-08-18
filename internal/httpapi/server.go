@@ -77,6 +77,8 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	mux.HandleFunc("PATCH /api/conversations/{conversationID}", server.renameConversation)
 	mux.HandleFunc("DELETE /api/conversations/{conversationID}", server.deleteConversation)
 	mux.HandleFunc("POST /api/conversations/{conversationID}/messages", server.sendMessage)
+	mux.HandleFunc("GET /api/runs", server.listRunSummaries)
+	mux.HandleFunc("GET /api/runs/{runID}/metrics", server.getRunSummary)
 	mux.HandleFunc("GET /api/runs/{runID}/events", server.listRunEvents)
 	mux.HandleFunc("GET /api/runs/{runID}/children", server.listAgentTaskRuns)
 	if server.approval != nil && server.approval.Enabled() {
@@ -124,7 +126,7 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	toolCount := 4 + s.mcpToolCount
 	capabilities := []string{
-		"chat", "streaming", "tools", "persistence", "run-audit",
+		"chat", "streaming", "tools", "persistence", "run-audit", "run-metrics", "token-usage",
 		"knowledge-ingestion", "hybrid-retrieval", "knowledge-citations",
 		"semantic-memory", "episodic-memory", "memory-crud",
 	}
@@ -157,7 +159,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.5.0-dev",
+		"name": "Zora", "version": "0.6.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
 		"human_approval":       s.chat.ApprovalEnabled(),
@@ -297,6 +299,25 @@ func (s *Server) listRunEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": events})
+}
+
+func (s *Server) listRunSummaries(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	summaries, err := s.chat.ListRunSummaries(r.Context(), limit)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"runs": summaries})
+}
+
+func (s *Server) getRunSummary(w http.ResponseWriter, r *http.Request) {
+	summary, err := s.chat.GetRunSummary(r.Context(), r.PathValue("runID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
 }
 
 func (s *Server) listAgentTaskRuns(w http.ResponseWriter, r *http.Request) {

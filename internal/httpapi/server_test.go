@@ -90,6 +90,9 @@ func TestConversationAndAgentSSE(t *testing.T) {
 	if !strings.Contains(events, "event: tool_call") || !strings.Contains(events, "event: tool_result") || !strings.Contains(events, "event: done") || strings.Contains(events, "event: error") || !strings.Contains(events, "42") {
 		t.Fatalf("unexpected SSE stream:\n%s", events)
 	}
+	if !strings.Contains(events, `"metrics":`) || !strings.Contains(events, `"model_calls":2`) {
+		t.Fatalf("done event does not include run metrics:\n%s", events)
+	}
 
 	// Ensure every SSE frame contains valid JSON data.
 	scanner := bufio.NewScanner(strings.NewReader(events))
@@ -98,6 +101,33 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		if strings.HasPrefix(line, "data: ") && !json.Valid([]byte(strings.TrimPrefix(line, "data: "))) {
 			t.Fatalf("invalid SSE JSON: %s", line)
 		}
+	}
+
+	runsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(runsResponse, httptest.NewRequest(http.MethodGet, "/api/runs?limit=5", nil))
+	if runsResponse.Code != http.StatusOK {
+		t.Fatalf("runs status = %d, body = %s", runsResponse.Code, runsResponse.Body.String())
+	}
+	var runList struct {
+		Runs []struct {
+			Run     domain.AgentRun `json:"run"`
+			Metrics struct {
+				ModelCalls    int  `json:"model_calls"`
+				ToolCalls     int  `json:"tool_calls"`
+				UsageComplete bool `json:"usage_complete"`
+			} `json:"metrics"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal(runsResponse.Body.Bytes(), &runList); err != nil {
+		t.Fatal(err)
+	}
+	if len(runList.Runs) != 1 || runList.Runs[0].Metrics.ModelCalls != 2 || runList.Runs[0].Metrics.ToolCalls != 1 || runList.Runs[0].Metrics.UsageComplete {
+		t.Fatalf("unexpected run summaries: %+v", runList.Runs)
+	}
+	metricsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(metricsResponse, httptest.NewRequest(http.MethodGet, "/api/runs/"+runList.Runs[0].Run.ID+"/metrics", nil))
+	if metricsResponse.Code != http.StatusOK || !strings.Contains(metricsResponse.Body.String(), `"model_calls":2`) {
+		t.Fatalf("metrics status = %d, body = %s", metricsResponse.Code, metricsResponse.Body.String())
 	}
 }
 
@@ -472,6 +502,9 @@ func TestEmbeddedSPA(t *testing.T) {
 		if path == "/" && !strings.Contains(response.Body.String(), "长期记忆") {
 			t.Fatalf("GET / did not include the memory management entry")
 		}
+		if path == "/" && !strings.Contains(response.Body.String(), "运行监控") {
+			t.Fatalf("GET / did not include the run metrics entry")
+		}
 	}
 }
 
@@ -487,8 +520,9 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
 		t.Fatalf("info body = %s", response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"version":"0.5.0-dev"`) ||
+	if !strings.Contains(response.Body.String(), `"version":"0.6.0-dev"`) ||
 		!strings.Contains(response.Body.String(), `"tool_count":4`) ||
+		!strings.Contains(response.Body.String(), `"run-metrics"`) ||
 		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||
 		!strings.Contains(response.Body.String(), `"memory_auto_capture":true`) ||
 		!strings.Contains(response.Body.String(), `"memory_recall":true`) ||

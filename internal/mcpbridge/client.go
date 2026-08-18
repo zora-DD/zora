@@ -111,7 +111,7 @@ func (m *Manager) Close() error {
 func connectServer(ctx context.Context, server ServerConfig, options Options, transport mcp.Transport) ([]tool.BaseTool, *mcp.ClientSession, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, options.ConnectTimeout)
 	defer cancel()
-	client := mcp.NewClient(&mcp.Implementation{Name: "zora", Version: "0.5.0-dev"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "zora", Version: "0.6.0-dev"}, nil)
 	session, err := client.Connect(connectCtx, transport, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("连接 MCP Server %q 失败：%w", server.Name, err)

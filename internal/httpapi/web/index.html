@@ -43,6 +43,12 @@
         <small id="officeDraftCount">0 份草稿</small>
       </button>
 
+      <button class="knowledge-button" id="openRunMetrics">
+        <span aria-hidden="true">⌁</span>
+        运行监控
+        <small>Run 指标</small>
+      </button>
+
       <div class="section-label">最近对话</div>
       <nav class="conversation-list" id="conversationList" aria-label="对话列表"></nav>
 
@@ -55,9 +61,9 @@
           </div>
         </div>
         <div class="roadmap-mini">
-          <span>V0.5</span>
+          <span>V0.6</span>
           <div><i></i></div>
-          <small>当前：Office Agent</small>
+          <small>当前：可靠性与可观测性</small>
         </div>
       </div>
     </aside>
@@ -195,6 +201,18 @@
     </div>
     <p class="dialog-description">草稿批准后会先生成带唯一幂等键的持久化执行任务，再由已配置的真实写连接器执行。未配置连接器时只能准备任务；系统不会把预览或模拟结果标记为已发送。</p>
     <div class="office-draft-list" id="officeDraftList"></div>
+  </dialog>
+
+  <dialog class="knowledge-dialog run-metrics-dialog" id="runMetricsDialog">
+    <div class="dialog-heading">
+      <div>
+        <strong>Agent 运行监控</strong>
+        <span>真实 Token Usage · TTFT · 工具耗时</span>
+      </div>
+      <button class="icon-button" id="closeRunMetrics" aria-label="关闭运行监控">×</button>
+    </div>
+    <p class="dialog-description">展示最近 50 次持久化 Run。模型未返回 Token Usage 时会明确标为“未完整上报”，不会用字符数估算。</p>
+    <div class="run-metrics-list" id="runMetricsList"></div>
   </dialog>
 
   <div class="toast" id="toast" role="status"></div>

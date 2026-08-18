@@ -500,6 +500,64 @@ VALUES(?, ?, ?, ?, ?, ?)`,
 	return wrap("创建执行记录", err)
 }
 
+func (s *SQLite) GetRun(ctx context.Context, id string) (domain.AgentRun, error) {
+	run, err := scanAgentRun(s.db.QueryRowContext(ctx, `
+SELECT id, conversation_id, user_message_id, assistant_message_id, status, model, error, started_at, completed_at
+FROM agent_runs WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.AgentRun{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.AgentRun{}, fmt.Errorf("查询执行记录失败：%w", err)
+	}
+	return run, nil
+}
+
+func (s *SQLite) ListRuns(ctx context.Context, limit int) ([]domain.AgentRun, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, conversation_id, user_message_id, assistant_message_id, status, model, error, started_at, completed_at
+FROM agent_runs ORDER BY started_at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("查询执行记录列表失败：%w", err)
+	}
+	defer rows.Close()
+	runs := make([]domain.AgentRun, 0)
+	for rows.Next() {
+		run, scanErr := scanAgentRun(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("读取执行记录失败：%w", scanErr)
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+func scanAgentRun(scanner rowScanner) (domain.AgentRun, error) {
+	var run domain.AgentRun
+	var assistantMessageID, completedAt sql.NullString
+	var startedAt string
+	if err := scanner.Scan(
+		&run.ID, &run.ConversationID, &run.UserMessageID, &assistantMessageID,
+		&run.Status, &run.Model, &run.Error, &startedAt, &completedAt,
+	); err != nil {
+		return domain.AgentRun{}, err
+	}
+	run.AssistantMessageID = assistantMessageID.String
+	parsedStartedAt, err := parseTime(startedAt)
+	if err != nil {
+		return domain.AgentRun{}, err
+	}
+	run.StartedAt = parsedStartedAt
+	if completedAt.Valid {
+		parsed, parseErr := parseTime(completedAt.String)
+		if parseErr != nil {
+			return domain.AgentRun{}, parseErr
+		}
+		run.CompletedAt = &parsed
+	}
+	return run, nil
+}
+
 func (s *SQLite) FinishRun(ctx context.Context, id, status, assistantMessageID, errorMessage string, completedAt time.Time) error {
 	result, err := s.db.ExecContext(ctx, `
 UPDATE agent_runs

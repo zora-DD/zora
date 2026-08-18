@@ -421,6 +421,21 @@ button { color: inherit; }
 .office-draft-actions button.primary:hover { background: rgba(124,102,255,.24); color: white; }
 .office-draft-actions button.danger:hover { background: rgba(255,107,125,.12); color: var(--danger); }
 .office-draft-events { margin: 12px 0 0; padding: 10px 10px 10px 26px; border-radius: 9px; background: rgba(0,0,0,.16); color: var(--muted); font-size: 9px; line-height: 1.7; }
+.message-metrics { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; color: var(--muted-2); font-size: 9px; }
+.message-metrics span { padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: rgba(255,255,255,.018); }
+.run-metrics-list { max-height: 520px; padding: 14px 20px 20px; overflow-y: auto; }
+.run-metrics-item { padding: 13px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.018); }
+.run-metrics-item + .run-metrics-item { margin-top: 9px; }
+.run-metrics-heading { display: flex; align-items: center; gap: 8px; }
+.run-metrics-heading strong { padding: 3px 7px; border-radius: 6px; background: var(--accent-soft); color: #cfc9ff; font-size: 9px; }
+.run-metrics-heading .status-failed, .run-metrics-heading .status-cancelled, .run-metrics-heading .status-rejected { color: var(--danger); }
+.run-metrics-heading span:last-child { margin-left: auto; color: var(--muted-2); font-size: 9px; }
+.run-metrics-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; margin-top: 11px; }
+.run-metric { padding: 8px; border-radius: 8px; background: rgba(0,0,0,.16); }
+.run-metric span, .run-metric strong { display: block; }
+.run-metric span { color: var(--muted-2); font-size: 8px; }
+.run-metric strong { margin-top: 4px; color: #dedee2; font-size: 11px; overflow-wrap: anywhere; }
+.run-metrics-meta { margin-top: 9px; color: var(--muted-2); font-size: 8px; line-height: 1.6; overflow-wrap: anywhere; }
 .mobile-only { display: none; }
 .sidebar-scrim { display: none; }
 
@@ -446,6 +461,7 @@ button { color: inherit; }
   .upload-form { flex-direction: column; }
   .upload-form > button { min-height: 38px; }
   .memory-form-row { grid-template-columns: 1fr; }
+  .run-metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (prefers-reduced-motion: reduce) {
