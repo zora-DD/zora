@@ -1,5 +1,5 @@
 // Package office 实现办公草稿的结构化校验、持久化和 Agent 工具。
-// 当前仓库提供受控执行边界，但不内置真实外部写执行器。
+// 当前仓库提供受控执行边界；真实外部写执行器必须通过显式配置启用。
 package office
 
 import (
@@ -128,11 +128,20 @@ type ExecutionResult struct {
 	ExternalReference string
 }
 
+// ExecutionRequest 把已经批准的不可变草稿和执行任务检查点交给外部执行器。
+// Checkpoint 必须在产生后续外部副作用前调用，用于保存可重试的远端对象 ID。
+type ExecutionRequest struct {
+	Draft             Draft
+	IdempotencyKey    string
+	ExternalReference string
+	Checkpoint        func(ctx context.Context, externalReference string) error
+}
+
 // Executor 是真实外部写入的权限边界。实现必须保证同一幂等键可安全重放。
 type Executor interface {
 	Name() string
 	IdempotencySafe() bool
-	Execute(ctx context.Context, draft Draft, idempotencyKey string) (ExecutionResult, error)
+	Execute(ctx context.Context, request ExecutionRequest) (ExecutionResult, error)
 }
 
 type ExecutionOutcome struct {
@@ -155,6 +164,7 @@ type Store interface {
 	GetOperationByDraft(ctx context.Context, draftID string) (Operation, error)
 	ListOperations(ctx context.Context, filter OperationFilter) ([]Operation, error)
 	ClaimOperation(ctx context.Context, id, executorName, leaseOwner string, now, leaseUntil time.Time, operationEvent OperationEvent, draftEvent DraftEvent) (Operation, Draft, error)
+	CheckpointOperation(ctx context.Context, id, leaseOwner, externalReference string, now time.Time, operationEvent OperationEvent) (Operation, error)
 	FinishOperation(ctx context.Context, id, leaseOwner, nextStatus, externalReference, lastError string, now time.Time, operationEvent OperationEvent, draftEvent DraftEvent) (Operation, Draft, error)
 	ListOperationEvents(ctx context.Context, operationID string) ([]OperationEvent, error)
 	ListExpiredOperations(ctx context.Context, now time.Time, limit int) ([]Operation, error)

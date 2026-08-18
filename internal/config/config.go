@@ -74,6 +74,10 @@ type Config struct {
 	MCPConnectTimeout time.Duration     // 单个 MCP Server 启动、握手和工具发现的超时。
 	MCPCallTimeout    time.Duration     // 单次 MCP 工具调用的独立超时。
 	MCPMaxOutputRunes int               // 单次 MCP 结果注入模型的最大 Unicode 字符数。
+
+	OfficeExecutor        string   // disabled 或 microsoft_graph；默认关闭所有真实外部写操作。
+	OfficeExecutorCommand string   // Microsoft Graph MCP 子进程命令，不经过 Shell。
+	OfficeExecutorArgs    []string // 子进程参数，使用 JSON 数组配置以避免 Shell 注入。
 }
 
 // Load 在启动阶段完成配置校验，让错误尽早暴露，而不是运行到模型调用时才失败。
@@ -196,6 +200,18 @@ func Load() (Config, error) {
 	if err != nil || mcpMaxOutputRunes < 1000 || mcpMaxOutputRunes > 100_000 {
 		return Config{}, fmt.Errorf("ZORA_MCP_MAX_OUTPUT_RUNES 必须在 1000 到 100000 之间")
 	}
+	officeExecutor := strings.ToLower(env("ZORA_OFFICE_EXECUTOR", "disabled"))
+	if officeExecutor != "disabled" && officeExecutor != "microsoft_graph" {
+		return Config{}, fmt.Errorf("ZORA_OFFICE_EXECUTOR 仅支持 disabled 或 microsoft_graph")
+	}
+	officeExecutorCommand := strings.TrimSpace(os.Getenv("ZORA_OFFICE_EXECUTOR_COMMAND"))
+	officeExecutorArgs, err := parseStringArray("ZORA_OFFICE_EXECUTOR_ARGS_JSON", os.Getenv("ZORA_OFFICE_EXECUTOR_ARGS_JSON"))
+	if err != nil {
+		return Config{}, err
+	}
+	if officeExecutor == "microsoft_graph" && officeExecutorCommand == "" {
+		return Config{}, fmt.Errorf("启用 Microsoft Graph 办公执行器时必须配置 ZORA_OFFICE_EXECUTOR_COMMAND")
+	}
 
 	cfg := Config{
 		Addr:                        env("ZORA_ADDR", ":8088"),
@@ -242,6 +258,10 @@ func Load() (Config, error) {
 		MCPConnectTimeout: mcpConnectTimeout,
 		MCPCallTimeout:    mcpCallTimeout,
 		MCPMaxOutputRunes: mcpMaxOutputRunes,
+
+		OfficeExecutor:        officeExecutor,
+		OfficeExecutorCommand: officeExecutorCommand,
+		OfficeExecutorArgs:    officeExecutorArgs,
 	}
 
 	switch cfg.StoreProvider {
@@ -284,6 +304,23 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseStringArray(key, raw string) ([]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil, fmt.Errorf("%s 必须是合法的 JSON 字符串数组：%w", key, err)
+	}
+	for index := range values {
+		values[index] = strings.TrimSpace(values[index])
+		if values[index] == "" {
+			return nil, fmt.Errorf("%s 不能包含空参数", key)
+		}
+	}
+	return values, nil
 }
 
 func parseMCPServers(raw string) ([]MCPServerConfig, error) {

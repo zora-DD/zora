@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.5 Office Agent（第五阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已交付官方 MCP Client、文件与 Microsoft Graph 只读连接器、持久化草稿、人工确认，以及独立、幂等、可恢复的 Office Operation 执行内核。默认仍不配置真实外部写执行器，不会把模拟结果冒充邮件已发送或日程已创建。
+当前版本：**V0.5 Office Agent（第六阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已交付官方 MCP Client、文件与 Microsoft Graph 只读连接器、持久化草稿、人工确认、可恢复 Office Operation，以及显式启用的 Microsoft Graph 写执行器。写执行器默认关闭；当前已通过本地协议与故障注入测试，尚未使用真实 Microsoft 租户做在线验收。
 
 ## 当前能力
 
@@ -36,7 +36,8 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 邮件/日程草稿预览 | 已完成 | 结构化校验、SQLite/PostgreSQL 持久化、Run 来源追踪、重试幂等、REST API 和 Web 草稿箱 |
 | 草稿人工确认 | 已完成 | `draft → pending_confirmation → approved/rejected`、数据库 CAS、不可变迁移审计、REST 和 Web 一次性决策 |
 | Office Operation 执行内核 | 已完成 | 每份 approved 草稿唯一任务、稳定幂等键、执行租约、失败重试、启动恢复、双审计、REST/Web 状态展示 |
-| 真实外部写连接器 | V0.5 后续 | Microsoft Graph 写适配、OAuth 生命周期、Secret 托管、最小权限和真实租户验收尚未实现 |
+| Microsoft Graph 写执行器 | 已实现、默认关闭 | 已批准邮件采用“远端草稿检查点 → 发送”，日程使用固定 transactionId；写工具不暴露给模型 |
+| 真实租户上线准备 | V0.5 进行中 | OAuth 生命周期、Secret 托管、租户/邮箱权限收敛和真实租户验收尚未完成 |
 
 规划中的能力不会以空接口冒充“已完成”。详细进度见 [Roadmap](docs/roadmap.md)。
 
@@ -62,8 +63,9 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **连接器凭据与主进程隔离**：MCP 子进程默认不继承任何环境变量，只透传 `pass_env`；模型 Key、Embedding Key 和数据库 DSN 被配置层显式拒绝。
 - **外部办公内容按不可信数据处理**：邮件、日历和外部文件的正文不能改变系统规则，也不能触发其中嵌入的链接、权限请求或工具指令。
 - **草稿不等于执行**：`preview_*` 工具只在 Zora 内部保存不可执行快照；同一 Run 的相同参数按内容哈希幂等复用，回答必须明确“尚未发送/创建”。
-- **确认不等于执行**：草稿批准后还要显式创建 Operation 并再次确认；默认未配置写执行器，系统不会把 approved 或 pending 表述为已经发送。
-- **外部执行可恢复且不假完成**：Operation 使用稳定幂等键、数据库租约和重试次数；草稿、任务与双审计在同一事务迁移。执行器必须声明支持幂等重放，并返回可核验远端引用，否则任务只能进入 failed。
+- **确认不等于执行**：草稿批准后还要显式创建 Operation 并点击执行；默认未配置写执行器，系统不会把 approved 或 pending 表述为已经发送。
+- **外部执行可恢复且不假完成**：Operation 使用稳定幂等键、数据库租约和重试次数；邮件先创建 Graph 远端草稿并原子保存不可变 ID，检查点成功后才发送；日程使用稳定 transactionId。执行器必须返回可核验远端引用，否则任务只能进入 failed。
+- **写工具不交给模型**：Graph 写工具只存在于专用 MCP 执行会话，普通 MCP Bridge 仍只接受 readOnly 工具；主 Agent 只能创建内部预览，不能自行发送邮件或创建日程。
 - **明确的终态语义**：根 Run 最终进入 completed、failed、cancelled 或 rejected。
 - **工具安全优先**：显式 allowlist；计算器不使用 eval、Shell 或代码执行。
 - **单二进制运行**：SQLite 和前端资源均包含在本地部署方案中。
@@ -195,7 +197,7 @@ make run
 我的会议安排是什么？
 ```
 
-四个工具实际公开为 `mcp_microsoft_search_emails`、`mcp_microsoft_get_email`、`mcp_microsoft_list_calendar_events` 和 `mcp_microsoft_get_calendar_event`。默认邮件查询最多扫描最近 50 封并在本地按关键词过滤；默认日历窗口为未来 7 天，单次最长 93 天。邮件只返回正文摘要，不下载完整 HTML 和附件；所有外部内容都会附带不可信数据提示。当前没有发送邮件、创建或修改日程的工具。
+四个只读工具实际公开为 `mcp_microsoft_search_emails`、`mcp_microsoft_get_email`、`mcp_microsoft_list_calendar_events` 和 `mcp_microsoft_get_calendar_event`。默认邮件查询最多扫描最近 50 封并在本地按关键词过滤；默认日历窗口为未来 7 天，单次最长 93 天。邮件只返回正文摘要，不下载完整 HTML 和附件；所有外部内容都会附带不可信数据提示。Microsoft MCP Server 同时实现审批后写协议，但普通 MCP Bridge 会拒绝注册非只读工具，因此这些写能力不会出现在 Agent 工具列表。
 
 ### 创建和查看办公草稿
 
@@ -210,7 +212,21 @@ make run
 
 侧边栏“办公草稿”展示全部状态。`draft` 可以删除或提交人工确认；`pending_confirmation` 只能被批准或拒绝一次。批准后需要点击“准备执行任务”，系统为该草稿创建唯一 Operation 和稳定幂等键；重复准备返回原任务。默认运行配置未接入真实 Graph 写执行器，因此页面只显示“任务已持久化、执行器未配置”，不会出现执行按钮，也不会产生外部副作用。
 
-执行器接入后，Operation 按 `pending → executing → completed/failed` 迁移。领取任务时写入租约和重试次数；失败可复用原幂等键重试；进程启动会把过期 `executing` 恢复为 `failed`。执行器必须保证同一幂等键可安全重放，并返回非空远端引用，才能标记 completed。这一阶段完成的是可测试的执行内核，Microsoft Graph 真实写适配和 OAuth/Secret 生命周期仍是下一阶段。
+执行器接入后，Operation 按 `pending → executing → completed/failed` 迁移。领取任务时写入租约和重试次数；失败可复用原幂等键重试；进程启动会把过期 `executing` 恢复为 `failed`。执行器必须保证同一幂等键可安全重放，并返回非空远端引用，才能标记 completed。
+
+### 显式启用 Microsoft Graph 写执行器
+
+先执行 `make build-mcp-microsoft`。建议为专用测试账号申请短期 Token，并仅授予本阶段需要的 `Mail.ReadWrite`、`Mail.Send` 和 `Calendars.ReadWrite`。应用权限需要管理员同意，并应继续通过 Exchange Application RBAC 或应用访问策略把可访问邮箱收敛到专用范围。当前项目不负责 OAuth 登录、刷新或 Secret 持久化；生产 Token 应由 Secret/部署平台短期注入。
+
+```bash
+ZORA_OFFICE_EXECUTOR=microsoft_graph \
+ZORA_OFFICE_EXECUTOR_COMMAND=./bin/zora-mcp-microsoft \
+ZORA_MCP_MICROSOFT_ACCESS_TOKEN='短期访问令牌' \
+ZORA_MCP_MICROSOFT_USER_ID=me \
+make run
+```
+
+启用后，Web 执行按钮才会出现。邮件执行先调用 Graph 创建草稿，随后把不可变邮件 ID 写入 `office_operations.external_reference` 和审计事件；只有该事务成功后才调用发送。发送失败或进程重启时复用同一远端草稿，并先核对 `isDraft`，避免重复发送。日程从 Operation 幂等键派生固定 UUID 作为 `transactionId`，重试时不创建第二个事件。默认 `disabled` 模式以及本地 Mock 都不会伪造外部成功。
 
 点击侧边栏的“知识库”可上传 UTF-8 编码的 `.txt` / `.md` / `.markdown` 文件（单文件最大 5 MiB）。上传后可以询问：
 
@@ -334,6 +350,9 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_MCP_MICROSOFT_ACCESS_TOKEN` | 空 | Microsoft Graph 短期访问令牌；只透传给 Microsoft MCP 子进程 |
 | `ZORA_MCP_MICROSOFT_BASE_URL` | `https://graph.microsoft.com/v1.0` | Graph API 根地址；测试时仅允许本机 HTTP |
 | `ZORA_MCP_MICROSOFT_USER_ID` | `me` | 委托令牌使用 `me`；应用令牌填写明确用户 ID |
+| `ZORA_OFFICE_EXECUTOR` | `disabled` | `disabled` 或 `microsoft_graph`；真实写操作必须显式启用 |
+| `ZORA_OFFICE_EXECUTOR_COMMAND` | 空 | 启用 Graph 写执行器时必填，例如 `./bin/zora-mcp-microsoft` |
+| `ZORA_OFFICE_EXECUTOR_ARGS_JSON` | 空数组 | 执行器子进程参数 JSON 数组；命令与参数均不经过 Shell |
 
 配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
 
@@ -586,7 +605,7 @@ V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对
 - V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
-- V0.5：MCP 办公助手——只读连接器、持久化草稿、人工确认和幂等可恢复 Operation 内核已完成；继续实现 Graph 真实写适配、OAuth/Secret 和真实租户验收
+- V0.5：MCP 办公助手——只读连接器、持久化草稿、人工确认、可恢复 Operation 和 Graph 写适配已完成；继续完成 OAuth/Secret、最小权限部署与真实租户验收
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
 

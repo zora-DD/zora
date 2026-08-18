@@ -1,6 +1,6 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.5 Office Agent 第五阶段（幂等可恢复执行内核）
+> 文档基线：V0.5 Office Agent 第六阶段（Microsoft Graph 可恢复写执行器）
 > 最后更新：2026-08-18
 > 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
 
@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第五阶段已在只读连接器、结构化草稿和一次性人工确认之上，实现独立 Office Operation、稳定幂等键、数据库租约、失败重试、启动恢复和双审计；默认仍无真实外部写执行器，Graph 写适配与凭据生命周期尚未实现。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第六阶段已在只读连接器、结构化草稿、一次性人工确认和可恢复 Operation 之上，实现默认关闭的 Microsoft Graph 写执行器、邮件远端草稿检查点、发送状态恢复和日程 transactionId 幂等。协议与故障注入测试已完成，OAuth/Secret 生命周期和真实租户在线验收尚未实现。
 
 ## 2. 背景与问题
 
@@ -142,7 +142,8 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 邮件/日程草稿预览 | 已实现 | 结构化校验、双数据库、可信 Run 来源、内容哈希幂等、REST 与 Web 草稿箱 |
 | 草稿级人工确认 | 已实现 | CAS 状态迁移、一次性批准/拒绝、不可变事件、REST/Web 与无外部副作用提示 |
 | Office Operation 执行内核 | 已实现 | 草稿唯一任务、稳定幂等键、租约/attempt、失败重试、启动恢复、SQLite/PostgreSQL 双审计 |
-| 真实外部写操作 | V0.5 进行中 | Graph 写适配、OAuth 生命周期、Secret 托管、最小权限和真实租户验收仍待实现 |
+| Graph 外部写适配 | 已实现、默认关闭 | 邮件两段式执行、日程 transactionId、远端引用检查点和失败恢复已通过本地测试 |
+| 真实租户上线 | V0.5 进行中 | OAuth 生命周期、Secret 托管、最小权限部署和真实租户验收仍待实现 |
 
 ## 6. 业务模型
 
@@ -163,6 +164,7 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | OfficeDraftEvent | 草稿状态迁移的不可变审计记录 | 每次提交、决定和执行迁移追加一条，随草稿级联删除 |
 | OfficeOperation | approved 草稿对应的唯一持久化外部写任务 | pending/failed → executing → completed/failed；重试复用幂等键 |
 | OfficeOperationEvent | 执行任务状态与 attempt 的追加式审计 | 创建、领取、失败、重试和完成各追加一条 |
+| OfficeExecutor | 审批后专用外部写权限边界 | 默认关闭；只接受固定 MCP 写协议，不向模型公开工具 |
 | Specialist Agent | Research/Document/Writer 专业执行单元 | 启动时组装，通过 AgentTool 接收 request，执行后返回交付物 |
 | Agent Handoff | Supervisor 与专业 Agent 的一次结构化交接 | started → agent output → completed；关联 AgentTaskRun 与顶层 RunEvent |
 | ApprovalRequest | 高影响请求的人工审批记录 | pending → approved/rejected/expired；决定可恢复等待中的 Run |
@@ -686,7 +688,9 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 
 草稿工具固定返回 `external_effect=false`，Web 使用“仅预览”标记。独立 REST/Web 操作把草稿从 draft 提交到 pending_confirmation，再以数据库 CAS 一次性批准或拒绝；迁移和事件原子落库。approved 在页面和 API 中仍明确标注“尚未执行”，因此不会把“生成预览”“人工确认”和“执行外部操作”混为一谈。
 
-第五阶段再把 approved 与执行拆成唯一 `OfficeOperation`。任务持有稳定幂等键、租约、attempt、执行器名称、错误和远端引用；失败重试和重启恢复不生成第二个业务任务。Executor 若未声明幂等安全会在组装时被拒绝，若未返回真实副作用标记和可核验引用则只能落为 failed。该边界让项目可以单测故障恢复，同时诚实保留“Graph 真实写适配尚未交付”的状态。
+第五阶段再把 approved 与执行拆成唯一 `OfficeOperation`。任务持有稳定幂等键、租约、attempt、执行器名称、错误和远端引用；失败重试和重启恢复不生成第二个业务任务。Executor 若未声明幂等安全会在组装时被拒绝，若未返回真实副作用标记和可核验引用则只能落为 failed。
+
+第六阶段实现 Graph Executor，但仍不把写能力交给模型。邮件先创建 Graph 远端草稿，拿到不可变 ID 后必须在当前数据库租约下写入检查点和审计事件，检查点成功后才允许发送；重试先核对 `isDraft`，从而区分继续发送与恢复已完成状态。日程用稳定幂等键派生固定 `transactionId`。这使“远端调用成功但本地进程退出”成为可解释、可恢复的工程路径，而不是仅靠接口名称声称幂等。
 
 ## 10. 当前限制与风险
 
@@ -712,8 +716,10 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 | Graph 只完成模拟集成验收 | 代码和协议测试已通过，但没有真实 Microsoft 租户凭据的在线验收记录 | 建立最小权限 Entra 测试应用和专用测试账号，执行真实邮件/日历冒烟 |
 | 邮件/日历仅支持 Microsoft | Google Workspace 等来源尚不能接入 | 保持 MCP 工具语义稳定，新增独立 Provider 连接器而不修改 Chat 主链路 |
 | MCP 凭据尚无统一托管 | `pass_env` 已隔离 Zora 核心凭据，但专用连接器 Token 仍依赖部署平台 | 引入 Secret 引用/短期令牌，不在 JSON、日志、RunEvent 或模型上下文保存明文 |
-| 默认没有真实写执行器 | Operation 内核已完成，但本地运行只能把 approved 草稿准备为 pending 任务 | 下一阶段实现 Graph 幂等写适配，完成最小权限与真实租户验收 |
+| Graph 写执行器默认关闭 | 默认运行只能把 approved 草稿准备为 pending，避免开发环境误发邮件 | 仅在专用账号、短期 Token 和明确权限范围下显式启用 |
+| Graph 真实租户尚未验收 | 适配器与故障恢复测试通过，但不能证明真实权限、租户策略与投递结果 | 建立专用 Entra 应用/测试账号，完成最小权限与在线冒烟 |
 | 执行器幂等契约依赖实现正确性 | 内核拒绝未声明幂等的执行器，但无法仅靠接口证明远端绝不重复 | Graph 适配使用可重放资源 ID/transactionId，并增加故障注入与真实租户测试 |
+| 邮件远端创建与本地检查点无法跨系统原子提交 | Graph 已返回草稿 ID、但进程在检查点前被强杀时可能留下未发送的孤立草稿；正常错误/取消会尽力无取消落库 | 增加远端幂等标记与对账任务；当前保证检查点成功前绝不发送，因此不会把该窗口放大为重复投递 |
 | 草稿 Payload 尚未加密 | 本地数据库读取者可以看到邮件正文和日程内容 | 生产环境增加磁盘/列加密、数据保留策略和 Tenant ACL |
 | 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
 | 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
@@ -759,6 +765,6 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
 3. **V0.3 Long-term Memory（主链路完成）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入、会话增量摘要和 A/B 门禁已实现。
 4. **V0.4 Multi-Agent（已完成）**：Supervisor、三个专业 Agent、隔离交接、串/并行执行治理、父子 Run、人工审批和单/多 Agent 对照门禁已实现。
-5. **V0.5 Office Agent（进行中）**：只读连接器、持久化草稿、草稿级人工确认，以及幂等可恢复 Operation 内核已完成；继续实现 Graph 真实写适配、OAuth/Secret 生命周期、最小权限和真实租户验收。
+5. **V0.5 Office Agent（进行中）**：只读连接器、持久化草稿、草稿级人工确认、幂等可恢复 Operation 和 Graph 写适配已完成；继续实现 OAuth/Secret 生命周期、最小权限部署和真实租户验收。
 
 详细任务与验收条件见 [Roadmap](roadmap.md)。

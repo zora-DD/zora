@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.5 Office Agent 第五阶段（幂等可恢复执行内核）
+> 适用版本：V0.5 Office Agent 第六阶段（Microsoft Graph 可恢复写执行器）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -200,6 +200,9 @@ flowchart TD
 | `ZORA_MCP_MICROSOFT_ACCESS_TOKEN` | 空 | Microsoft 连接器必填 | Graph 短期访问令牌，只透传给连接器子进程 |
 | `ZORA_MCP_MICROSOFT_BASE_URL` | Graph v1.0 | 否 | Graph API 根地址；非测试场景必须 HTTPS |
 | `ZORA_MCP_MICROSOFT_USER_ID` | `me` | 否 | 委托令牌使用 `me`；应用令牌填写明确用户 ID |
+| `ZORA_OFFICE_EXECUTOR` | `disabled` | 否 | `disabled` 或 `microsoft_graph`；真实写必须显式启用 |
+| `ZORA_OFFICE_EXECUTOR_COMMAND` | 空 | Graph 写开启时必填 | 专用 Microsoft MCP 子进程命令，不经过 Shell |
+| `ZORA_OFFICE_EXECUTOR_ARGS_JSON` | 空数组 | 否 | 专用执行器子进程参数 JSON 数组 |
 
 配置原则：
 
@@ -703,7 +706,11 @@ sequenceDiagram
         Office-->>User: 503，任务保持 pending
     else Executor 已通过幂等门禁
         Office->>Store: 原子领取租约 + Draft/Operation → executing
-        Office->>Executor: Execute(draft, stable idempotency key)
+        Office->>Executor: Execute(draft, stable key, previous checkpoint)
+        opt 产生可重试远端对象
+            Executor->>Office: Checkpoint(external reference)
+            Office->>Store: 原子保存引用 + executing 审计事件
+        end
         alt 真实成功且有远端引用
             Office->>Store: 原子提交 completed + 双审计
         else 调用失败或结果不可核验
@@ -721,7 +728,7 @@ Conversation 或 Agent Run 删除时，草稿通过 `ON DELETE SET NULL` 保留�
 
 执行前由 Store 在单事务锁定/串行读取 Operation 和 Draft：只允许 pending+approved 或 failed+failed 组合进入 executing，同时写 executor_name、attempt+1、lease owner/until 和两类事件。执行结束再次校验状态与 lease owner，原子提交 completed/failed。成功必须同时满足 `ExternalEffect=true` 与非空 `ExternalReference`；否则按失败落库。HTTP Context 即使已取消，Service 仍使用最长 5 秒的无取消 Context 尽力释放租约并保存结果。
 
-Executor 在 Service 组装时必须通过 `IdempotencySafe()` 门禁。进程启动查询 lease_until 已过期的 executing 任务并恢复为 failed；重试继续使用原幂等键。该契约要求具体 Graph 适配器能够安全重放，接口声明本身不能替代真实故障注入和租户验收。
+Executor 在 Service 组装时必须通过 `IdempotencySafe()` 门禁。进程启动查询 lease_until 已过期的 executing 任务并恢复为 failed；重试继续使用原幂等键和远端检查点。执行器可在产生后续副作用前调用 `Checkpoint`；Store 只有在 Operation 仍为 executing 且 lease owner 匹配时才原子保存远端引用与 `executing → executing` 审计事件，失败和租约恢复不会清空该引用。Graph 执行器已通过本地故障注入验证，但接口声明和协议测试仍不能替代真实租户验收。
 
 ## 9. 并发、取消与错误处理
 
@@ -1101,7 +1108,7 @@ POST /api/office/operations/{operationID}/execute
 - API Key 不落库、不返回前端；
 - Tool allowlist；
 - Supervisor 只能调用专业 AgentTool；Research/Document/Writer 分别使用独立工具 allowlist，且只接收结构化 request；
-- 无 Shell、代码执行；默认未配置真实外部写 Executor；
+- 无 Shell、代码执行；真实外部写 Executor 默认关闭，写工具不进入 Agent allowlist；
 - 计算器不使用 eval；
 - JSON 严格解码和大小限制；
 - 模型输出 HTML 转义；
@@ -1242,7 +1249,7 @@ flowchart LR
 
 ### 17.4 V0.5 Office Agent
 
-第五阶段在官方 MCP 只读链路、持久化邮件/日历草稿预览和草稿级人工确认基础上，增加了幂等可恢复执行内核。现有只读连接器链路如下：
+第六阶段在官方 MCP 只读链路、持久化邮件/日历草稿预览、草稿级人工确认和幂等执行内核基础上，增加了 Microsoft Graph 可恢复写执行器。只读连接器链路如下：
 
 ```mermaid
 sequenceDiagram
@@ -1270,7 +1277,7 @@ sequenceDiagram
 
 内置 `zora-mcp-files` 提供 `list_files` 和 `read_text_file`。Server 启动时将授权根目录绝对化并解析符号链接；每次访问再次执行 `Clean → Join → EvalSymlinks → Rel`，拒绝绝对路径、父目录越界、隐藏路径和指向根目录外的链接。列表最多 500 项且不跟随符号链接；读取仅接受普通 UTF-8 文件，单文件最大 2 MiB，返回字符最多 50,000。根目录属于部署权限边界，推荐只挂载专门的办公资料目录。
 
-内置 `zora-mcp-microsoft` 提供四个工具：
+内置 `zora-mcp-microsoft` 向 Agent 公开四个只读工具；同一 Server 的审批后写工具只供专用 OfficeExecutor 会话使用：
 
 接口路径、`$select`/`$top` 和时间窗参数遵循 Microsoft Graph 官方的[邮件列表接口](https://learn.microsoft.com/zh-cn/graph/api/user-list-messages?view=graph-rest-1.0)与[日历视图接口](https://learn.microsoft.com/zh-cn/graph/api/calendar-list-calendarview?view=graph-rest-1.0)。
 
@@ -1281,7 +1288,7 @@ sequenceDiagram
 | `list_calendar_events` | `GET /me/calendar/calendarView` | 指定时间窗内日程；默认未来 7 天，最长 93 天 |
 | `get_calendar_event` | `GET /me/events/{id}` | 单个日程的时间、地点、组织者、参与者和正文摘要 |
 
-Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，响应最多读取 2 MiB。用户输入的 ID 会执行长度/换行校验并按路径转义；查询上限固定，关键词在有限返回集内本地大小写不敏感过滤。Graph 非 2xx 响应会提取错误码和最多 300 字符消息并转为中文错误，任何错误都不会包含访问令牌。
+Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，响应最多读取 2 MiB。用户输入的 ID 会执行长度/换行校验并按路径转义；查询上限固定，关键词在有限返回集内本地大小写不敏感过滤。Graph 非预期响应会提取错误码和最多 300 字符消息并转为中文错误；即使上游错误消息回显令牌，连接器也会在返回主进程前替换为“凭据已隐藏”。
 
 连接器不实现 OAuth 登录与刷新：部署平台负责取得短期令牌，并通过 `pass_env` 只注入 Microsoft 子进程。当前读取正文摘要，建议使用 `Mail.Read` 和 `Calendars.Read`；委托令牌访问 `/me`，应用令牌必须配置明确的 User ID。工具输出含 `content_warning`，系统 Prompt 也把邮件、日历和外部文件声明为不可信数据。
 
@@ -1293,7 +1300,11 @@ Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，�
 
 第五阶段从 approved 草稿幂等创建唯一 OfficeOperation。SQLite/PostgreSQL 使用草稿唯一约束、稳定 SHA-256 幂等键、租约和 attempt 控制并发/重试；领取、完成、失败与 Draft 状态及双事件表原子提交。启动恢复过期 executing，执行器门禁拒绝不支持幂等重放的实现，成功还必须提供可核验远端引用。REST/Web 已支持任务准备、状态、双审计和条件执行，默认未配置 Executor 时明确返回 503 且不改变任务。
 
-下一阶段需要在 Executor 权限边界后实现 Microsoft Graph 写适配，并补齐 OAuth 登录/刷新、Secret 托管、最小 Graph 写权限、故障注入和真实租户集成测试。当前 Operation 内核通过不代表真实办公写操作已经上线。
+第六阶段新增 `mcpbridge.OfficeExecutor`。它启动独立 Microsoft MCP 会话，但不把工具适配成 Eino Tool；启动时只接受固定的 `create_email_draft`、`get_email_delivery_state`、`send_email_draft`、`create_calendar_event`，并核对 readOnly/destructive 声明。子进程仅继承 Graph Token、BaseURL 和 UserID，写执行器默认 `disabled`。
+
+邮件不会直接调用 `sendMail`：执行器先 `POST /messages` 创建远端草稿并请求不可变 ID，随后通过 `CheckpointOperation` 原子保存 `microsoft-graph:message:*` 引用；只有检查点成功后才调用 `POST /messages/{id}/send`。检查点使用最长 5 秒的无取消 Context 尽力落库。发送失败或进程重启后，重试复用该 ID，并查询 `isDraft`：仍为草稿则继续发送，已不是草稿则认为上次远端发送已经完成，不再重复发送。日程使用 Operation 幂等键派生固定 UUID 作为 Graph `transactionId`，`POST /events` 成功后保存事件引用。跨 Graph/数据库无法建立单一 ACID 事务：若进程恰好在 Graph 返回草稿 ID 后、检查点调用前被强杀，可能留下未发送的孤立草稿；当前协议保证该窗口不会发送邮件，后续应通过远端幂等标记与对账进一步收敛。
+
+测试使用内存 MCP Transport 与内存 HTTP Transport 覆盖 Graph 方法、路径、Bearer/Prefer Header、请求体、写工具声明、检查点先于发送、第一次发送失败后的重试不重复创建草稿、已发送恢复和稳定 transactionId。当前未提供真实租户 Token，因此只能说明适配器协议与故障恢复已实现，不能声称在线发送验收通过。下一阶段继续补齐 OAuth 登录/刷新、Secret 托管、最小权限部署和真实租户集成测试。
 
 ## 18. 维护约定
 

@@ -91,7 +91,7 @@ func TestListCalendarEventsUsesBoundedWindowAndConfiguredUser(t *testing.T) {
 	}
 }
 
-func TestMicrosoftServerPublishesFourReadOnlyTools(t *testing.T) {
+func TestMicrosoftServerSeparatesReadAndWriteTools(t *testing.T) {
 	t.Parallel()
 	httpClient := graphHTTPClient(func(_ *http.Request) (int, string) {
 		return http.StatusOK, `{"value":[]}`
@@ -114,13 +114,22 @@ func TestMicrosoftServerPublishesFourReadOnlyTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed.Tools) != 4 {
-		t.Fatalf("tool count = %d, want 4", len(listed.Tools))
+	if len(listed.Tools) != 8 {
+		t.Fatalf("tool count = %d, want 8", len(listed.Tools))
 	}
+	readOnlyCount, writeCount := 0, 0
 	for _, item := range listed.Tools {
-		if item.Annotations == nil || !item.Annotations.ReadOnlyHint || item.Annotations.DestructiveHint == nil || *item.Annotations.DestructiveHint {
-			t.Fatalf("tool %q is not explicitly read-only: %+v", item.Name, item.Annotations)
+		if item.Annotations == nil || item.Annotations.DestructiveHint == nil {
+			t.Fatalf("tool %q lacks safety annotations: %+v", item.Name, item.Annotations)
 		}
+		if item.Annotations.ReadOnlyHint {
+			readOnlyCount++
+		} else {
+			writeCount++
+		}
+	}
+	if readOnlyCount != 5 || writeCount != 3 {
+		t.Fatalf("read-only=%d write=%d", readOnlyCount, writeCount)
 	}
 	result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search_emails", Arguments: map[string]any{"limit": 3}})
 	if err != nil {
@@ -138,11 +147,77 @@ func TestMicrosoftServerPublishesFourReadOnlyTools(t *testing.T) {
 func TestGraphErrorIsReturnedInChineseWithoutLeakingToken(t *testing.T) {
 	t.Parallel()
 	httpClient := graphHTTPClient(func(_ *http.Request) (int, string) {
-		return http.StatusUnauthorized, `{"error":{"code":"InvalidAuthenticationToken","message":"Access token has expired."}}`
+		return http.StatusUnauthorized, `{"error":{"code":"InvalidAuthenticationToken","message":"令牌 never-leak-token 已过期"}}`
 	})
 	client := &connector{accessToken: "never-leak-token", baseURL: "http://127.0.0.1", userPath: "/me", httpClient: httpClient, now: time.Now}
 	_, _, err := client.searchEmails(context.Background(), nil, searchEmailsInput{})
 	if err == nil || !strings.Contains(err.Error(), "Microsoft Graph 返回 HTTP 401") || strings.Contains(err.Error(), "never-leak-token") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGraphWriteProtocolCreatesCheckpointableObjects(t *testing.T) {
+	t.Parallel()
+	requests := 0
+	httpClient := graphHTTPClient(func(request *http.Request) (int, string) {
+		requests++
+		if request.Header.Get("Authorization") != "Bearer test-token" {
+			t.Fatalf("authorization = %q", request.Header.Get("Authorization"))
+		}
+		switch requests {
+		case 1:
+			if request.Method != http.MethodPost || request.URL.Path != "/v1.0/me/messages" || request.Header.Get("Prefer") != `IdType="ImmutableId"` {
+				t.Fatalf("unexpected create message request: %s %s prefer=%q", request.Method, request.URL.Path, request.Header.Get("Prefer"))
+			}
+			var body map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body["subject"] != "发布通知" {
+				t.Fatalf("unexpected message body: %+v, err=%v", body, err)
+			}
+			return http.StatusCreated, `{"id":"immutable-mail-1"}`
+		case 2:
+			if request.Method != http.MethodGet || request.URL.Path != "/v1.0/me/messages/immutable-mail-1" || request.Header.Get("Prefer") != `IdType="ImmutableId"` {
+				t.Fatalf("unexpected message state request: %s %s", request.Method, request.URL.Path)
+			}
+			return http.StatusOK, `{"id":"immutable-mail-1","isDraft":true}`
+		case 3:
+			if request.Method != http.MethodPost || request.URL.Path != "/v1.0/me/messages/immutable-mail-1/send" {
+				t.Fatalf("unexpected send request: %s %s", request.Method, request.URL.Path)
+			}
+			return http.StatusAccepted, ""
+		case 4:
+			if request.Method != http.MethodPost || request.URL.Path != "/v1.0/me/events" {
+				t.Fatalf("unexpected create event request: %s %s", request.Method, request.URL.Path)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(request.Body).Decode(&body); err != nil || body["transactionId"] != "fixed-transaction-id" || body["subject"] != "发布评审" {
+				t.Fatalf("unexpected event body: %+v, err=%v", body, err)
+			}
+			return http.StatusCreated, `{"id":"event-1"}`
+		default:
+			t.Fatalf("unexpected extra request: %s %s", request.Method, request.URL.Path)
+			return http.StatusInternalServerError, ""
+		}
+	})
+	client := &connector{accessToken: "test-token", baseURL: "http://127.0.0.1/v1.0", userPath: "/me", httpClient: httpClient, now: time.Now}
+	_, created, err := client.createEmailDraft(context.Background(), nil, createEmailDraftInput{
+		To: []string{"dev@example.com"}, Subject: "发布通知", Body: "今晚发布。",
+	})
+	if err != nil || created.ID != "immutable-mail-1" {
+		t.Fatalf("created message = %+v, err=%v", created, err)
+	}
+	_, state, err := client.getEmailDeliveryState(context.Background(), nil, getEmailDeliveryStateInput{ID: created.ID})
+	if err != nil || !state.IsDraft {
+		t.Fatalf("message state = %+v, err=%v", state, err)
+	}
+	_, sent, err := client.sendEmailDraft(context.Background(), nil, sendEmailDraftInput{ID: created.ID})
+	if err != nil || !sent.Sent {
+		t.Fatalf("sent message = %+v, err=%v", sent, err)
+	}
+	_, event, err := client.createCalendarEvent(context.Background(), nil, createCalendarEventInput{
+		Subject: "发布评审", Start: "2026-08-20T10:00:00+08:00", End: "2026-08-20T11:00:00+08:00",
+		TransactionID: "fixed-transaction-id",
+	})
+	if err != nil || event.ID != "event-1" || requests != 4 {
+		t.Fatalf("created event = %+v, requests=%d, err=%v", event, requests, err)
 	}
 }

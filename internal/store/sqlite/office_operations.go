@@ -178,6 +178,39 @@ WHERE id = ? AND status = ?`, office.OperationExecuting, executorName, leaseOwne
 	return updated, updatedDraft, nil
 }
 
+// CheckpointOperation 在同一事务中保存远端对象 ID 和审计事件，但保持任务处于 executing。
+func (s *SQLite) CheckpointOperation(ctx context.Context, id, leaseOwner, externalReference string, now time.Time, operationEvent office.OperationEvent) (office.Operation, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return office.Operation{}, fmt.Errorf("开始保存办公执行检查点事务失败：%w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+UPDATE office_operations SET external_reference = ?, updated_at = ?
+WHERE id = ? AND status = ? AND lease_owner = ?`, externalReference, formatTime(now), id, office.OperationExecuting, leaseOwner)
+	if err != nil {
+		return office.Operation{}, fmt.Errorf("保存办公执行检查点失败：%w", err)
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		return office.Operation{}, fmt.Errorf("%w：办公执行任务租约已失效，不能保存检查点", office.ErrStateConflict)
+	}
+	updated, err := scanOfficeOperation(tx.QueryRowContext(ctx, officeOperationSelect+` WHERE id = ?`, id))
+	if err != nil {
+		return office.Operation{}, fmt.Errorf("读取办公执行检查点失败：%w", err)
+	}
+	operationEvent.OperationID = id
+	operationEvent.FromStatus, operationEvent.ToStatus = office.OperationExecuting, office.OperationExecuting
+	operationEvent.Attempt = updated.Attempt
+	if err := insertSQLiteOperationEvent(ctx, tx, operationEvent); err != nil {
+		return office.Operation{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return office.Operation{}, fmt.Errorf("提交办公执行检查点事务失败：%w", err)
+	}
+	return updated, nil
+}
+
 func (s *SQLite) FinishOperation(ctx context.Context, id, leaseOwner, nextStatus, externalReference, lastError string, now time.Time, operationEvent office.OperationEvent, draftEvent office.DraftEvent) (office.Operation, office.Draft, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

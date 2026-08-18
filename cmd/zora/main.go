@@ -65,7 +65,36 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	officeService, err := office.NewService(database)
+	var officeExecutor *mcpbridge.OfficeExecutor
+	if cfg.OfficeExecutor == "microsoft_graph" {
+		officeExecutor, err = mcpbridge.ConnectOfficeExecutor(startupCtx, mcpbridge.OfficeExecutorConfig{
+			Command: cfg.OfficeExecutorCommand,
+			Args:    cfg.OfficeExecutorArgs,
+			// 只把 Microsoft Graph 专用变量交给子进程，模型密钥和数据库连接串不会被继承。
+			PassEnv: []string{
+				"ZORA_MCP_MICROSOFT_ACCESS_TOKEN",
+				"ZORA_MCP_MICROSOFT_BASE_URL",
+				"ZORA_MCP_MICROSOFT_USER_ID",
+			},
+		}, mcpbridge.Options{
+			ConnectTimeout: cfg.MCPConnectTimeout,
+			CallTimeout:    cfg.MCPCallTimeout,
+			MaxOutputRunes: cfg.MCPMaxOutputRunes,
+		})
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if closeErr := officeExecutor.Close(); closeErr != nil {
+				logger.Debug("Microsoft 办公执行器关闭时返回错误", "error", closeErr)
+			}
+		}()
+	}
+	officeOptions := make([]office.ServiceOption, 0, 1)
+	if officeExecutor != nil {
+		officeOptions = append(officeOptions, office.WithExecutor(officeExecutor))
+	}
+	officeService, err := office.NewService(database, officeOptions...)
 	if err != nil {
 		return err
 	}
@@ -227,7 +256,8 @@ func run(logger *slog.Logger) error {
 			"向量提供方", cfg.EmbeddingProvider, "向量模型", embedder.Name(),
 			"自动记忆", cfg.MemoryAutoCapture, "记忆召回", cfg.MemoryRecallEnabled,
 			"会话摘要", cfg.SummaryEnabled, "多Agent", cfg.MultiAgentEnabled,
-			"MCP已启用", cfg.MCPEnabled, "MCP工具数", mcpToolCount)
+			"MCP已启用", cfg.MCPEnabled, "MCP工具数", mcpToolCount,
+			"办公执行器", cfg.OfficeExecutor)
 		serveErrors <- server.ListenAndServe()
 	}()
 

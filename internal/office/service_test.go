@@ -66,6 +66,11 @@ func TestDraftValidationRejectsMissingIdentityInvalidAddressAndCalendarWindow(t 
 	}); err == nil || !strings.Contains(err.Error(), "晚于开始时间") {
 		t.Fatalf("expected calendar window error, got %v", err)
 	}
+	if _, _, err := service.CreateCalendarDraft(ctx, CalendarDraft{
+		Subject: "全天发布窗口", Start: "2026-08-17T00:00:00+08:00", End: "2026-08-18T00:00:00+08:00", IsAllDay: true,
+	}); err == nil || !strings.Contains(err.Error(), "全天日程必须提供") {
+		t.Fatalf("expected all-day timezone error, got %v", err)
+	}
 }
 
 func TestDraftToolReturnsExplicitNoExternalEffect(t *testing.T) {
@@ -263,8 +268,8 @@ type sequenceExecutor struct {
 
 func (e *sequenceExecutor) Name() string          { return "test-executor" }
 func (e *sequenceExecutor) IdempotencySafe() bool { return !e.unsafe }
-func (e *sequenceExecutor) Execute(_ context.Context, _ Draft, key string) (ExecutionResult, error) {
-	e.keys = append(e.keys, key)
+func (e *sequenceExecutor) Execute(_ context.Context, request ExecutionRequest) (ExecutionResult, error) {
+	e.keys = append(e.keys, request.IdempotencyKey)
 	index := len(e.keys) - 1
 	if index < len(e.errors) && e.errors[index] != nil {
 		return ExecutionResult{}, e.errors[index]
@@ -412,6 +417,21 @@ func (s *memoryDraftStore) ClaimOperation(_ context.Context, id, executorName, l
 	s.operationEvents[id] = append(s.operationEvents[id], operationEvent)
 	s.events[draft.ID] = append(s.events[draft.ID], draftEvent)
 	return item, draft, nil
+}
+
+func (s *memoryDraftStore) CheckpointOperation(_ context.Context, id, leaseOwner, externalReference string, now time.Time, event OperationEvent) (Operation, error) {
+	item, ok := s.operations[id]
+	if !ok {
+		return Operation{}, store.ErrNotFound
+	}
+	if item.Status != OperationExecuting || item.LeaseOwner != leaseOwner {
+		return Operation{}, fmt.Errorf("%w：租约已失效", ErrStateConflict)
+	}
+	item.ExternalReference, item.UpdatedAt = externalReference, now
+	s.operations[id] = item
+	event.FromStatus, event.ToStatus, event.Attempt = OperationExecuting, OperationExecuting, item.Attempt
+	s.operationEvents[id] = append(s.operationEvents[id], event)
+	return item, nil
 }
 
 func (s *memoryDraftStore) FinishOperation(_ context.Context, id, leaseOwner, nextStatus, externalReference, lastError string, now time.Time, operationEvent OperationEvent, draftEvent DraftEvent) (Operation, Draft, error) {

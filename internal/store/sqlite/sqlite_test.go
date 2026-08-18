@@ -358,7 +358,7 @@ func TestOfficeOperationPersistsAtomicCompletionAndAudit(t *testing.T) {
 		t.Fatalf("reloaded operation = %+v, err=%v", reloaded, err)
 	}
 	events, err := database.ListOperationEvents(ctx, first.item.ID)
-	if err != nil || len(events) != 3 || events[2].ToStatus != office.OperationCompleted {
+	if err != nil || len(events) != 4 || events[2].FromStatus != office.OperationExecuting || events[2].ToStatus != office.OperationExecuting || events[3].ToStatus != office.OperationCompleted {
 		t.Fatalf("operation events = %+v, err=%v", events, err)
 	}
 	draftEvents, err := database.ListDraftEvents(ctx, draft.ID)
@@ -371,8 +371,11 @@ type sqliteOfficeExecutor struct{ calls atomic.Int32 }
 
 func (*sqliteOfficeExecutor) Name() string          { return "sqlite-test-executor" }
 func (*sqliteOfficeExecutor) IdempotencySafe() bool { return true }
-func (e *sqliteOfficeExecutor) Execute(_ context.Context, _ office.Draft, _ string) (office.ExecutionResult, error) {
+func (e *sqliteOfficeExecutor) Execute(ctx context.Context, request office.ExecutionRequest) (office.ExecutionResult, error) {
 	e.calls.Add(1)
+	if err := request.Checkpoint(ctx, "sqlite-remote-reference"); err != nil {
+		return office.ExecutionResult{}, err
+	}
 	return office.ExecutionResult{ExternalEffect: true, ExternalReference: "sqlite-remote-reference"}, nil
 }
 

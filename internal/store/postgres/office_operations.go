@@ -168,6 +168,37 @@ RETURNING id, kind, status, conversation_id, source_run_id, title, payload::text
 	return updated, updatedDraft, nil
 }
 
+// CheckpointOperation 原子保存远端对象 ID；只有当前租约持有者可以写入。
+func (p *Postgres) CheckpointOperation(ctx context.Context, id, leaseOwner, externalReference string, now time.Time, operationEvent office.OperationEvent) (office.Operation, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return office.Operation{}, fmt.Errorf("开始保存办公执行检查点事务失败：%w", err)
+	}
+	defer tx.Rollback(ctx)
+	updated, err := scanOfficeOperation(tx.QueryRow(ctx, `
+UPDATE office_operations SET external_reference = $1, updated_at = $2
+WHERE id = $3 AND status = $4 AND lease_owner = $5
+RETURNING id, draft_id, kind, status, idempotency_key, executor_name, attempt,
+          lease_owner, lease_until, external_reference, last_error, created_at, updated_at, completed_at`,
+		externalReference, normalizeTime(now), id, office.OperationExecuting, leaseOwner))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return office.Operation{}, fmt.Errorf("%w：办公执行任务租约已失效，不能保存检查点", office.ErrStateConflict)
+	}
+	if err != nil {
+		return office.Operation{}, fmt.Errorf("保存办公执行检查点失败：%w", err)
+	}
+	operationEvent.OperationID = id
+	operationEvent.FromStatus, operationEvent.ToStatus = office.OperationExecuting, office.OperationExecuting
+	operationEvent.Attempt = updated.Attempt
+	if err := insertPostgresOperationEvent(ctx, tx, operationEvent); err != nil {
+		return office.Operation{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return office.Operation{}, fmt.Errorf("提交办公执行检查点事务失败：%w", err)
+	}
+	return updated, nil
+}
+
 func (p *Postgres) FinishOperation(ctx context.Context, id, leaseOwner, nextStatus, externalReference, lastError string, now time.Time, operationEvent office.OperationEvent, draftEvent office.DraftEvent) (office.Operation, office.Draft, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {

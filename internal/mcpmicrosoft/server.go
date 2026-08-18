@@ -1,7 +1,9 @@
-// Package mcpmicrosoft 提供基于 Microsoft Graph 的邮件和日历只读 MCP Server。
+// Package mcpmicrosoft 提供基于 Microsoft Graph 的邮件、日历 MCP Server。
+// 写工具不会进入 Agent 工具集，只允许审批后的办公执行器按固定协议调用。
 package mcpmicrosoft
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -182,6 +184,51 @@ type getCalendarEventOutput struct {
 	ContentWarning string        `json:"content_warning"`
 }
 
+type createEmailDraftInput struct {
+	To      []string `json:"to" jsonschema:"收件人邮箱地址列表"`
+	CC      []string `json:"cc,omitempty" jsonschema:"抄送人邮箱地址列表"`
+	Subject string   `json:"subject" jsonschema:"邮件主题"`
+	Body    string   `json:"body" jsonschema:"纯文本邮件正文"`
+}
+
+type createEmailDraftOutput struct {
+	ID string `json:"id"`
+}
+
+type getEmailDeliveryStateInput struct {
+	ID string `json:"id" jsonschema:"由 create_email_draft 返回的不可变邮件 ID"`
+}
+
+type getEmailDeliveryStateOutput struct {
+	ID      string `json:"id"`
+	IsDraft bool   `json:"is_draft"`
+}
+
+type sendEmailDraftInput struct {
+	ID string `json:"id" jsonschema:"由 create_email_draft 返回且已持久化检查点的邮件 ID"`
+}
+
+type sendEmailDraftOutput struct {
+	ID   string `json:"id"`
+	Sent bool   `json:"sent"`
+}
+
+type createCalendarEventInput struct {
+	Attendees     []string `json:"attendees,omitempty"`
+	Subject       string   `json:"subject"`
+	Start         string   `json:"start"`
+	End           string   `json:"end"`
+	TimeZone      string   `json:"timezone,omitempty"`
+	Location      string   `json:"location,omitempty"`
+	Body          string   `json:"body,omitempty"`
+	IsAllDay      bool     `json:"is_all_day"`
+	TransactionID string   `json:"transaction_id" jsonschema:"由本地执行任务幂等键派生的固定事务 ID"`
+}
+
+type createCalendarEventOutput struct {
+	ID string `json:"id"`
+}
+
 type graphList[T any] struct {
 	Value []T `json:"value"`
 }
@@ -241,7 +288,123 @@ func New(config Config) (*mcp.Server, error) {
 		Description: "按 list_calendar_events 返回的 ID 读取日程详情，只用于信息核对。",
 		Annotations: annotations,
 	}, graph.getCalendarEvent)
+
+	// 以下工具是审批后执行协议的一部分。普通 MCP Bridge 会拒绝注册非只读工具，
+	// 因而模型无法绕过草稿确认、执行任务租约和幂等检查点直接调用它们。
+	writeOpenWorld, writeDestructive := true, false
+	writeAnnotations := &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: false, OpenWorldHint: &writeOpenWorld, DestructiveHint: &writeDestructive}
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "create_email_draft", Title: "创建 Microsoft 邮件草稿",
+		Description: "为已经人工批准的 Zora 邮件草稿创建远端草稿，并返回不可变邮件 ID；不会发送邮件。",
+		Annotations: writeAnnotations,
+	}, graph.createEmailDraft)
+	stateAnnotations := &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &openWorld, DestructiveHint: &destructive}
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "get_email_delivery_state", Title: "核对 Microsoft 邮件发送状态",
+		Description: "按不可变邮件 ID 核对邮件是否仍为草稿，用于失败重试恢复。",
+		Annotations: stateAnnotations,
+	}, graph.getEmailDeliveryState)
+	sendDestructive := true
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "send_email_draft", Title: "发送 Microsoft 邮件草稿",
+		Description: "发送已经创建且完成本地检查点持久化的远端邮件草稿。",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: true, OpenWorldHint: &writeOpenWorld, DestructiveHint: &sendDestructive},
+	}, graph.sendEmailDraft)
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "create_calendar_event", Title: "创建 Microsoft 日历事件",
+		Description: "使用固定 transactionId 创建已经人工批准的日历事件。",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, IdempotentHint: true, OpenWorldHint: &writeOpenWorld, DestructiveHint: &writeDestructive},
+	}, graph.createCalendarEvent)
 	return server, nil
+}
+
+func (c *connector) createEmailDraft(ctx context.Context, _ *mcp.CallToolRequest, input createEmailDraftInput) (*mcp.CallToolResult, createEmailDraftOutput, error) {
+	message := map[string]any{
+		"subject":      input.Subject,
+		"body":         map[string]string{"contentType": "Text", "content": input.Body},
+		"toRecipients": graphRecipients(input.To),
+		"ccRecipients": graphRecipients(input.CC),
+	}
+	var response struct {
+		ID string `json:"id"`
+	}
+	if err := c.postJSON(ctx, c.userPath+"/messages", message, &response, http.StatusCreated, true); err != nil {
+		return nil, createEmailDraftOutput{}, err
+	}
+	if strings.TrimSpace(response.ID) == "" {
+		return nil, createEmailDraftOutput{}, fmt.Errorf("Microsoft Graph 创建邮件草稿后未返回邮件 ID")
+	}
+	return nil, createEmailDraftOutput{ID: response.ID}, nil
+}
+
+func (c *connector) getEmailDeliveryState(ctx context.Context, _ *mcp.CallToolRequest, input getEmailDeliveryStateInput) (*mcp.CallToolResult, getEmailDeliveryStateOutput, error) {
+	id, err := validateGraphID(input.ID, "邮件")
+	if err != nil {
+		return nil, getEmailDeliveryStateOutput{}, err
+	}
+	var response struct {
+		ID      string `json:"id"`
+		IsDraft bool   `json:"isDraft"`
+	}
+	if err := c.getJSONWithImmutableID(ctx, c.userPath+"/messages/"+url.PathEscape(id)+"?$select=id,isDraft", &response); err != nil {
+		return nil, getEmailDeliveryStateOutput{}, err
+	}
+	return nil, getEmailDeliveryStateOutput{ID: response.ID, IsDraft: response.IsDraft}, nil
+}
+
+func (c *connector) sendEmailDraft(ctx context.Context, _ *mcp.CallToolRequest, input sendEmailDraftInput) (*mcp.CallToolResult, sendEmailDraftOutput, error) {
+	id, err := validateGraphID(input.ID, "邮件")
+	if err != nil {
+		return nil, sendEmailDraftOutput{}, err
+	}
+	if err := c.postJSON(ctx, c.userPath+"/messages/"+url.PathEscape(id)+"/send", nil, nil, http.StatusAccepted, true); err != nil {
+		return nil, sendEmailDraftOutput{}, err
+	}
+	return nil, sendEmailDraftOutput{ID: id, Sent: true}, nil
+}
+
+func (c *connector) createCalendarEvent(ctx context.Context, _ *mcp.CallToolRequest, input createCalendarEventInput) (*mcp.CallToolResult, createCalendarEventOutput, error) {
+	start, err := time.Parse(time.RFC3339, strings.TrimSpace(input.Start))
+	if err != nil {
+		return nil, createCalendarEventOutput{}, fmt.Errorf("日程开始时间必须是 RFC3339 时间：%w", err)
+	}
+	end, err := time.Parse(time.RFC3339, strings.TrimSpace(input.End))
+	if err != nil || !end.After(start) {
+		return nil, createCalendarEventOutput{}, fmt.Errorf("日程结束时间必须是晚于开始时间的 RFC3339 时间")
+	}
+	transactionID := strings.TrimSpace(input.TransactionID)
+	if transactionID == "" || len(transactionID) > 255 {
+		return nil, createCalendarEventOutput{}, fmt.Errorf("日程 transaction_id 不能为空且不能超过 255 个字符")
+	}
+	timeZone := "UTC"
+	startValue, endValue := start.UTC().Format("2006-01-02T15:04:05"), end.UTC().Format("2006-01-02T15:04:05")
+	if input.IsAllDay {
+		timeZone = strings.TrimSpace(input.TimeZone)
+		if timeZone == "" {
+			return nil, createCalendarEventOutput{}, fmt.Errorf("全天日程必须提供时区")
+		}
+		startValue, endValue = start.Format("2006-01-02T15:04:05"), end.Format("2006-01-02T15:04:05")
+	}
+	event := map[string]any{
+		"subject":       input.Subject,
+		"body":          map[string]string{"contentType": "Text", "content": input.Body},
+		"start":         graphDateTime{DateTime: startValue, TimeZone: timeZone},
+		"end":           graphDateTime{DateTime: endValue, TimeZone: timeZone},
+		"location":      graphLocation{DisplayName: input.Location},
+		"attendees":     graphEventAttendees(input.Attendees),
+		"isAllDay":      input.IsAllDay,
+		"transactionId": transactionID,
+	}
+	var response struct {
+		ID string `json:"id"`
+	}
+	if err := c.postJSON(ctx, c.userPath+"/events", event, &response, http.StatusCreated, false); err != nil {
+		return nil, createCalendarEventOutput{}, err
+	}
+	if strings.TrimSpace(response.ID) == "" {
+		return nil, createCalendarEventOutput{}, fmt.Errorf("Microsoft Graph 创建日程后未返回事件 ID")
+	}
+	return nil, createCalendarEventOutput{ID: response.ID}, nil
 }
 
 func (c *connector) searchEmails(ctx context.Context, _ *mcp.CallToolRequest, input searchEmailsInput) (*mcp.CallToolResult, searchEmailsOutput, error) {
@@ -371,6 +534,14 @@ func (c *connector) calendarWindow(startValue, endValue string) (time.Time, time
 }
 
 func (c *connector) getJSON(ctx context.Context, resource string, target any) error {
+	return c.getJSONWithPrefer(ctx, resource, target, `outlook.body-content-type="text"`)
+}
+
+func (c *connector) getJSONWithImmutableID(ctx context.Context, resource string, target any) error {
+	return c.getJSONWithPrefer(ctx, resource, target, `IdType="ImmutableId"`)
+}
+
+func (c *connector) getJSONWithPrefer(ctx context.Context, resource string, target any, prefer string) error {
 	endpoint := c.baseURL + resource
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -378,7 +549,35 @@ func (c *connector) getJSON(ctx context.Context, resource string, target any) er
 	}
 	request.Header.Set("Authorization", "Bearer "+c.accessToken)
 	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Prefer", `outlook.body-content-type="text"`)
+	request.Header.Set("Prefer", prefer)
+	return c.doJSON(request, target, http.StatusOK)
+}
+
+func (c *connector) postJSON(ctx context.Context, resource string, payload, target any, expectedStatus int, immutableID bool) error {
+	var body io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("序列化 Microsoft Graph 请求失败：%w", err)
+		}
+		body = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+resource, body)
+	if err != nil {
+		return fmt.Errorf("创建 Microsoft Graph 请求失败：%w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.accessToken)
+	request.Header.Set("Accept", "application/json")
+	if payload != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if immutableID {
+		request.Header.Set("Prefer", `IdType="ImmutableId"`)
+	}
+	return c.doJSON(request, target, expectedStatus)
+}
+
+func (c *connector) doJSON(request *http.Request, target any, expectedStatus int) error {
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return fmt.Errorf("请求 Microsoft Graph 失败：%w", err)
@@ -391,13 +590,40 @@ func (c *connector) getJSON(ctx context.Context, resource string, target any) er
 	if len(body) > maxGraphResponse {
 		return fmt.Errorf("Microsoft Graph 响应超过 %d MiB 上限", maxGraphResponse>>20)
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return graphStatusError(response.StatusCode, body)
+	if response.StatusCode != expectedStatus {
+		statusErr := graphStatusError(response.StatusCode, body)
+		// 上游错误文本不可信；即使服务端回显请求信息，也不能把访问令牌带回主进程日志或 UI。
+		if c.accessToken != "" {
+			return fmt.Errorf("%s", strings.ReplaceAll(statusErr.Error(), c.accessToken, "[凭据已隐藏]"))
+		}
+		return statusErr
+	}
+	if target == nil {
+		return nil
 	}
 	if err := json.Unmarshal(body, target); err != nil {
 		return fmt.Errorf("解析 Microsoft Graph 响应失败：%w", err)
 	}
 	return nil
+}
+
+func graphRecipients(addresses []string) []graphRecipient {
+	result := make([]graphRecipient, 0, len(addresses))
+	for _, address := range addresses {
+		result = append(result, graphRecipient{EmailAddress: emailAddress{Address: strings.TrimSpace(address)}})
+	}
+	return result
+}
+
+func graphEventAttendees(addresses []string) []map[string]any {
+	result := make([]map[string]any, 0, len(addresses))
+	for _, address := range addresses {
+		result = append(result, map[string]any{
+			"emailAddress": emailAddress{Address: strings.TrimSpace(address)},
+			"type":         "required",
+		})
+	}
+	return result
 }
 
 func graphStatusError(statusCode int, body []byte) error {

@@ -133,6 +133,14 @@ func (s *Service) CreateCalendarDraft(ctx context.Context, input CalendarDraft) 
 			return Draft{}, false, fmt.Errorf("日程时区必须是有效的 IANA 时区：%q", input.TimeZone)
 		}
 	}
+	if input.IsAllDay {
+		if input.TimeZone == "" {
+			return Draft{}, false, fmt.Errorf("全天日程必须提供 IANA 时区")
+		}
+		if start.Hour() != 0 || start.Minute() != 0 || start.Second() != 0 || end.Hour() != 0 || end.Minute() != 0 || end.Second() != 0 {
+			return Draft{}, false, fmt.Errorf("全天日程的开始和结束时间必须是当地时间 00:00:00")
+		}
+	}
 	input.Start = start.Format(time.RFC3339)
 	input.End = end.Format(time.RFC3339)
 	return s.save(ctx, identity, KindCalendar, input.Subject, input)

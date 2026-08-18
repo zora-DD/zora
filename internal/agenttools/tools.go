@@ -100,7 +100,7 @@ func Build() ([]tool.BaseTool, error) {
 					"邮件/日程结构化草稿预览、持久化与 Run 来源追踪",
 					"Office 草稿持久化人工确认、一次性决策与状态迁移审计",
 				},
-				NextMilestone: "V0.5 办公写操作幂等执行、失败恢复与凭据审计",
+				NextMilestone: "V0.5 OAuth/Secret 生命周期、最小权限部署与真实租户验收",
 			}, nil
 		},
 	)

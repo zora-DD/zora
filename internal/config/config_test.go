@@ -44,6 +44,26 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if cfg.MCPEnabled || len(cfg.MCPServers) != 0 || cfg.MCPConnectTimeout != 10*time.Second || cfg.MCPCallTimeout != 20*time.Second || cfg.MCPMaxOutputRunes != 12000 {
 		t.Fatalf("unexpected MCP defaults: %+v", cfg)
 	}
+	if cfg.OfficeExecutor != "disabled" || cfg.OfficeExecutorCommand != "" || len(cfg.OfficeExecutorArgs) != 0 {
+		t.Fatalf("office executor must be disabled by default: %+v", cfg)
+	}
+}
+
+func TestLoadMicrosoftOfficeExecutorRequiresExplicitCommand(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ZORA_OFFICE_EXECUTOR", "microsoft_graph")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected missing office executor command error")
+	}
+	t.Setenv("ZORA_OFFICE_EXECUTOR_COMMAND", "./bin/zora-mcp-microsoft")
+	t.Setenv("ZORA_OFFICE_EXECUTOR_ARGS_JSON", `["--stdio"]`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OfficeExecutor != "microsoft_graph" || cfg.OfficeExecutorCommand != "./bin/zora-mcp-microsoft" || len(cfg.OfficeExecutorArgs) != 1 {
+		t.Fatalf("unexpected office executor config: %+v", cfg)
+	}
 }
 
 func TestLoadPostgresStoreRequiresDSN(t *testing.T) {
@@ -152,6 +172,7 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_MEMORY_RECALL_ENABLED", "ZORA_MEMORY_RECALL_LIMIT", "ZORA_MEMORY_RECALL_MIN_SCORE",
 		"ZORA_SUMMARY_ENABLED", "ZORA_SUMMARY_TRIGGER_MESSAGES", "ZORA_SUMMARY_KEEP_RECENT", "ZORA_SUMMARY_MAX_RUNES",
 		"ZORA_MCP_ENABLED", "ZORA_MCP_SERVERS_JSON", "ZORA_MCP_CONNECT_TIMEOUT", "ZORA_MCP_CALL_TIMEOUT", "ZORA_MCP_MAX_OUTPUT_RUNES",
+		"ZORA_OFFICE_EXECUTOR", "ZORA_OFFICE_EXECUTOR_COMMAND", "ZORA_OFFICE_EXECUTOR_ARGS_JSON",
 	} {
 		t.Setenv(key, "")
 	}

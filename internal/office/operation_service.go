@@ -131,14 +131,41 @@ func (s *Service) ExecuteOperation(ctx context.Context, operationID string) (Exe
 		return ExecutionOutcome{}, err
 	}
 
-	result, executeErr := s.executor.Execute(ctx, draft, claimed.IdempotencyKey)
+	latestReference := claimed.ExternalReference
+	result, executeErr := s.executor.Execute(ctx, ExecutionRequest{
+		Draft: draft, IdempotencyKey: claimed.IdempotencyKey, ExternalReference: latestReference,
+		Checkpoint: func(checkpointCtx context.Context, externalReference string) error {
+			externalReference = strings.TrimSpace(externalReference)
+			if externalReference == "" {
+				return fmt.Errorf("执行器检查点的外部引用不能为空")
+			}
+			now := s.now().UTC()
+			event := OperationEvent{
+				ID: id.New("operation_event"), OperationID: claimed.ID,
+				FromStatus: OperationExecuting, ToStatus: OperationExecuting,
+				Attempt: claimed.Attempt, Actor: "system",
+				Reason: "已保存远端对象检查点，后续重试将复用该对象", CreatedAt: now,
+			}
+			// 远端对象已经存在时，即使 HTTP 请求刚好取消，也必须尽力保存检查点，避免下次重试重复创建。
+			persistCtx, cancelPersist := context.WithTimeout(context.WithoutCancel(checkpointCtx), 5*time.Second)
+			defer cancelPersist()
+			checkpoint, checkpointErr := s.store.CheckpointOperation(
+				persistCtx, claimed.ID, claimed.LeaseOwner, externalReference, now, event,
+			)
+			if checkpointErr != nil {
+				return checkpointErr
+			}
+			latestReference = checkpoint.ExternalReference
+			return nil
+		},
+	})
 	if executeErr == nil && (!result.ExternalEffect || strings.TrimSpace(result.ExternalReference) == "") {
 		executeErr = errors.New("执行器未返回可核验的外部操作引用，不能标记为已完成")
 	}
 	if executeErr != nil {
 		message := truncateRunes(executeErr.Error(), maxOperationError)
 		finished, updatedDraft, finishErr := s.finishOperation(
-			ctx, claimed, OperationFailed, "", message, "外部操作执行失败："+message,
+			ctx, claimed, OperationFailed, latestReference, message, "外部操作执行失败："+message,
 		)
 		if finishErr != nil {
 			return ExecutionOutcome{}, fmt.Errorf("记录办公执行失败状态时出错：%w", finishErr)
@@ -195,7 +222,7 @@ func (s *Service) RecoverExpiredOperations(ctx context.Context) (int, error) {
 		batchRecovered := 0
 		for _, item := range items {
 			_, _, finishErr := s.finishOperation(
-				ctx, item, OperationFailed, "", "上一次执行因进程退出或租约超时而中断",
+				ctx, item, OperationFailed, item.ExternalReference, "上一次执行因进程退出或租约超时而中断",
 				"执行租约已过期，任务已恢复为可重试状态",
 			)
 			if errors.Is(finishErr, ErrStateConflict) {

@@ -63,7 +63,7 @@
 
 当前验证结果：`ZORA_MULTI_AGENT_ENABLED` 默认关闭，显式开启后由 `zora_supervisor` 通过 Eino AgentTool 调用研究、文档和写作专家。研究专家仅持有时间、计算器和项目状态工具，文档专家持有 `knowledge_search`（V0.5 启用时再追加 MCP 文件只读工具），写作专家无底层工具；AgentTool 默认只传递 Supervisor 构造的 `request`，不共享主会话完整历史。Runtime 对每个根 Run 注入独立的交接次数、并行度、专家超时和重试预算，Context 取消继续下传；独立子任务由 Eino ToolNode 并行执行，证据依赖任务保持串行。每次交接同步创建 `agent_task_runs` 子 Run，SSE/Web Trace 暴露 `child_run_id`。`risky/all/off` 审批策略把高影响请求持久化为 `approval_requests`，Web 可批准或拒绝，批准后恢复原 SSE，拒绝/超时进入明确终态。`make eval-agents` 使用隔离 SQLite 和完整 Chat/RunEvent 链路，默认 7 题路由准确率 1、意外专家调用率 0、答案完成率 1；同题单 Agent Control 质量 0.785714，多 Agent Treatment 质量 1，质量增益 0.214286，调用次数代理比 2，延迟比例随环境输出并受宽松上限门禁。该结论只适用于确定性 Mock 小样本，真实 Provider 仍需扩充业务集和 Token Usage。V0.4 主链路已完成。
 
-## V0.5 Office Agent — 第五阶段已完成
+## V0.5 Office Agent — 第六阶段已完成
 
 - [x] 官方 MCP Go SDK
 - [x] 文件只读连接器
@@ -72,6 +72,9 @@
 - [x] 草稿预览
 - [x] 写操作人工确认
 - [x] 幂等执行任务、租约与失败恢复
+- [x] Microsoft Graph 邮件/日程写执行器（默认关闭）
+- [x] 邮件远端草稿检查点、失败重试与已发送恢复
+- [x] 日程固定 transactionId 幂等创建
 - [ ] OAuth/Secret 托管、最小写权限和真实租户验收
 
 当前验证结果：已固定官方 `github.com/modelcontextprotocol/go-sdk v1.7.0`，Zora 通过 stdio 启动 MCP 子进程、完成协议握手和分页工具发现，再把 JSON Schema 转为 Eino Tool。只有同时进入本地 `allowed_tools` 且声明 `readOnlyHint` 的工具会被注册，公开名称增加 `mcp_{server}_` 前缀；每次调用受独立超时与 12,000 字符默认输出上限约束，工具调用/结果沿用 RunEvent 审计。内置 `zora-mcp-files` 仅支持文件列表和 UTF-8 文本读取，授权根目录在子进程内强制校验；`zora-mcp-microsoft` 通过 Graph 提供邮件搜索/详情和日历窗口查询/详情四个只读工具，只返回元数据与正文摘要。Graph Token 只透传给独立子进程，外部内容带不可信数据提示。
@@ -82,7 +85,9 @@
 
 第五阶段新增独立 `office_operations` 和 `office_operation_events`。每份 approved 草稿最多一个 Operation，`draft_id` 与 SHA-256 幂等键均唯一；执行按 `pending/failed → executing → completed/failed` 迁移，领取时写入租约、执行器名称和 attempt。Operation、草稿状态及两类审计事件在同一 SQLite/PostgreSQL 事务提交；失败重试保持原幂等键，进程启动会回收过期 executing 租约。Executor 接口强制声明 `IdempotencySafe`，且只有返回 `external_effect=true` 和非空远端引用才能完成，默认无执行器时 API 返回 503、任务保持 pending。REST/Web 已支持准备任务、状态/审计查看和条件执行；单元测试覆盖安全门禁、失败重试、稳定幂等键和租约恢复，SQLite 测试覆盖并发准备、原子完成与重启持久化。
 
-本阶段没有用 Mock 冒充真实发送。Microsoft Graph 写适配、OAuth 登录/刷新、Secret 托管、最小写权限和真实租户集成验收仍待完成，因此 V0.5 继续进行。
+第六阶段在 Executor 权限边界后接入专用 Microsoft Graph MCP 写会话。写工具不适配为 Eino Tool，模型仍只能生成 Zora 内部草稿。邮件先通过 `POST /messages` 创建远端草稿并取得不可变 ID，Operation 在发送前原子保存检查点与审计事件；失败重试复用该 ID，并用 `isDraft` 区分“仍待发送”和“远端已发送、本地未落完成状态”。日程把稳定幂等键派生为固定 UUID `transactionId` 后调用 `POST /events`。Graph 错误映射为中文且会隐藏访问令牌，Token 仍只进入最小环境的子进程。自动化测试覆盖请求方法/路径/载荷、Bearer 头、写工具安全声明、检查点先于发送、发送失败重试不重复创建草稿，以及稳定日程事务 ID。
+
+本阶段没有用 Mock 冒充真实租户成功：实现和故障注入测试已经完成，但当前环境没有 Microsoft 测试租户与真实 Token，因此在线发送/建会验收没有执行。OAuth 登录/刷新、Secret 托管、应用权限邮箱范围收敛和真实租户冒烟仍待完成，V0.5 继续进行。
 
 ## 每个版本的文档完成标准
 

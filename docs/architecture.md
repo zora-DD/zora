@@ -205,18 +205,23 @@ Web 将交接事件显示为带 `child_run_id` 的专业 Agent Trace，并显示
 
 ## 9. V0.5 MCP 办公连接器架构
 
-第五阶段在文件与 Microsoft Graph 两类只读连接器、内部草稿和人工确认之上增加持久化执行任务内核：
+第六阶段在只读连接器、内部草稿、人工确认和持久化执行任务内核之上增加显式启用的 Graph 写执行器：
 
 ```text
 Zora 主进程
-└── mcpbridge.Manager
-    └── CommandTransport（独立最小环境）
+├── mcpbridge.Manager（只读 Agent 工具会话）
+│   └── CommandTransport（独立最小环境）
         ├── zora-mcp-files 子进程
         │   ├── list_files
         │   └── read_text_file
         └── zora-mcp-microsoft 子进程
             ├── search_emails / get_email
             └── list_calendar_events / get_calendar_event
+└── mcpbridge.OfficeExecutor（审批后专用写会话，默认关闭）
+    └── zora-mcp-microsoft 子进程
+        ├── create_email_draft → checkpoint → send_email_draft
+        ├── get_email_delivery_state（故障恢复）
+        └── create_calendar_event(transactionId)
 
 Writer Agent / 单 Agent
 └── office.Service
@@ -224,7 +229,7 @@ Writer Agent / 单 Agent
     ├── preview_calendar_draft
     ├── draft → pending_confirmation → approved / rejected
     ├── approved → Operation(pending) → executing → completed / failed
-    ├── Executor（默认未配置；实现必须支持幂等重放）
+    ├── Executor（默认未配置；Graph 执行器必须显式启用）
     └── office_drafts / office_operations + 双事件表（SQLite / PostgreSQL）
 ```
 
@@ -238,4 +243,8 @@ Microsoft 连接器使用 Graph REST 统一查询邮件和日历。OAuth 登录�
 
 approved 草稿可幂等创建唯一 Operation。领取任务时 Operation 与 Draft 原子进入 executing，并保存执行器、attempt、lease owner/until；成功或失败时两者与 `office_draft_events`、`office_operation_events` 同事务提交。失败和启动时回收的过期租约继续复用原 SHA-256 幂等键。Executor 必须声明幂等安全，且返回真实副作用标记和非空远端引用后才能完成。
 
-当前默认没有 Graph 写 Executor，`approved` 和 `pending` 均明确表示“未执行”；执行 API 返回 503 且不领取任务。下一阶段在这一权限边界后实现 Graph 写适配、OAuth/Secret 生命周期和最小权限，不允许用本地 Mock 冒充真实发送。
+Graph 写工具虽然由同一 Microsoft MCP Server 声明，但普通 `mcpbridge.Manager` 仍强制要求 `readOnlyHint=true`，因此写工具不会进入 Eino/Agent。只有 `ZORA_OFFICE_EXECUTOR=microsoft_graph` 时，`OfficeExecutor` 才启动第二条专用 MCP 会话，并只接受固定名称与安全声明匹配的四个协议工具。该子进程仅继承 Graph Token、BaseURL 和 UserID，模型 Key、Embedding Key 与数据库 DSN 不进入其环境。
+
+邮件执行使用两段式恢复协议：Graph 先创建远端邮件草稿并返回不可变 ID，Store 在 Operation 仍持有 executing 租约时原子写入 `external_reference` 和 `executing → executing` 检查点事件，之后才允许发送。发送失败时 failed 状态保留远端引用；重试先查询 `isDraft`，仍为草稿则继续发送，已不是草稿则把上次执行恢复为 completed，不再重复发送。日程以稳定幂等键派生 UUID `transactionId`，Graph 成功返回事件 ID 后同样保存检查点。
+
+默认仍没有 Graph 写 Executor，`approved` 和 `pending` 均明确表示“未执行”；执行 API 返回 503 且不领取任务。当前已完成本地协议和故障注入测试，尚未完成 OAuth/Secret 生命周期、权限范围收敛和真实 Microsoft 租户在线验收，不允许把测试结果描述成真实发送成功。
