@@ -127,12 +127,19 @@
       </div>
       <button class="icon-button" id="closeKnowledge" aria-label="关闭知识库">×</button>
     </div>
-    <p class="dialog-description">上传 UTF-8 编码的 TXT 或 Markdown（不超过 5 MiB）。Zora 会自动分块并通过向量 + BM25 检索。</p>
+    <p class="dialog-description">上传 UTF-8 编码的 TXT、Markdown 或含文本层的 PDF（不超过 5 MiB，不含 OCR）。Zora 会自动分块并通过向量 + BM25 检索。</p>
     <form class="upload-form" id="knowledgeUpload">
       <label class="file-picker">
-        <input type="file" id="knowledgeFile" accept=".txt,.md,.markdown,text/plain,text/markdown" required>
+        <input type="file" id="knowledgeFile" accept=".txt,.md,.markdown,.pdf,text/plain,text/markdown,application/pdf" required>
         <span>选择文档</span>
         <small id="selectedFile">尚未选择</small>
+      </label>
+      <label class="visibility-picker">
+        <span>可见范围</span>
+        <select id="knowledgeVisibility">
+          <option value="private">仅自己</option>
+          <option value="public">所有用户</option>
+        </select>
       </label>
       <button type="submit" id="uploadKnowledge">上传并索引</button>
     </form>

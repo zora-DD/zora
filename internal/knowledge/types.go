@@ -9,6 +9,7 @@ import (
 
 var (
 	ErrNotFound          = errors.New("知识库文档不存在")
+	ErrAccessDenied      = errors.New("无权访问该知识库文档")
 	ErrEmbeddingMismatch = errors.New("已存在分块使用了不同的 Embedding 模型或维度")
 )
 
@@ -20,15 +21,23 @@ const (
 	RetrievalHybrid  RetrievalMode = "hybrid"
 	RetrievalVector  RetrievalMode = "vector"
 	RetrievalKeyword RetrievalMode = "keyword"
+
+	VisibilityPrivate = "private"
+	VisibilityPublic  = "public"
 )
 
 // Document 是一份完成摄取的知识库文档。
 type Document struct {
 	ID                  string    `json:"id"`
+	VersionGroupID      string    `json:"version_group_id"`
+	Version             int       `json:"version"`
+	IsLatest            bool      `json:"is_latest"`
 	Name                string    `json:"name"`
 	SourceType          string    `json:"source_type"`
 	MIMEType            string    `json:"mime_type"`
 	ContentHash         string    `json:"content_hash"`
+	OwnerID             string    `json:"owner_id"`
+	Visibility          string    `json:"visibility"`
 	EmbeddingModel      string    `json:"embedding_model"`
 	EmbeddingDimensions int       `json:"embedding_dimensions"`
 	ChunkCount          int       `json:"chunk_count"`
@@ -71,6 +80,7 @@ type IngestInput struct {
 	Name       string
 	SourceType string
 	MIMEType   string
+	Visibility string
 	Content    []byte
 }
 
@@ -83,11 +93,12 @@ type IngestResult struct {
 // Store 是知识库持久化边界。当前 SQLite 实现采用精确扫描，
 // 后续 pgvector 实现可以在不改变 Service 的情况下下推向量检索。
 type Store interface {
-	CreateDocument(ctx context.Context, document Document, chunks []Chunk) error
+	CreateDocument(ctx context.Context, document Document, chunks []Chunk) (Document, error)
 	GetDocumentByHash(ctx context.Context, contentHash string) (Document, error)
-	ListDocuments(ctx context.Context, limit int) ([]Document, error)
-	DeleteDocument(ctx context.Context, id string) error
-	ListChunks(ctx context.Context, limit int) ([]Chunk, error)
+	ListDocuments(ctx context.Context, principalID string, includeHistory bool, limit int) ([]Document, error)
+	ListDocumentVersions(ctx context.Context, documentID, principalID string) ([]Document, error)
+	DeleteDocument(ctx context.Context, id, principalID string) error
+	ListChunks(ctx context.Context, principalID string, limit int) ([]Chunk, error)
 }
 
 // CandidateRequest 是向量库下推候选召回时使用的稳定契约。
@@ -99,6 +110,7 @@ type CandidateRequest struct {
 	EmbeddingModel      string
 	EmbeddingDimensions int
 	Limit               int
+	PrincipalID         string
 }
 
 // Candidate 同时携带单路原始分数和名次，Service 继续负责 RRF 融合。

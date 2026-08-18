@@ -394,6 +394,9 @@ func TestKnowledgeUploadSearchAndDelete(t *testing.T) {
 	if _, err := file.Write([]byte("# 蓝鲸项目\n\n蓝鲸项目的发布日是 2026 年 9 月 18 日，上线前必须完成灰度验证。")); err != nil {
 		t.Fatal(err)
 	}
+	if err := writer.WriteField("visibility", knowledge.VisibilityPublic); err != nil {
+		t.Fatal(err)
+	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -408,8 +411,14 @@ func TestKnowledgeUploadSearchAndDelete(t *testing.T) {
 	if err := json.Unmarshal(uploaded.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Document.ChunkCount != 1 {
-		t.Fatalf("chunk count = %d, want 1", result.Document.ChunkCount)
+	if result.Document.ChunkCount != 1 || result.Document.Version != 1 || result.Document.Visibility != knowledge.VisibilityPublic {
+		t.Fatalf("unexpected document metadata: %+v", result.Document)
+	}
+	versionsRequest := httptest.NewRequest(http.MethodGet, "/api/knowledge/documents/"+result.Document.ID+"/versions", nil)
+	versionsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(versionsResponse, versionsRequest)
+	if versionsResponse.Code != http.StatusOK || !strings.Contains(versionsResponse.Body.String(), `"version":1`) {
+		t.Fatalf("versions status = %d, body = %s", versionsResponse.Code, versionsResponse.Body.String())
 	}
 
 	search := httptest.NewRequest(http.MethodPost, "/api/knowledge/search", strings.NewReader(`{"query":"蓝鲸什么时候发布","top_k":3}`))

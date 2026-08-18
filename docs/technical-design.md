@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.5 Office Agent 第六阶段（Microsoft Graph 可恢复写执行器）
+> 适用版本：V0.5 Office Agent 第六阶段 + V0.2 知识库生产化收口
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -182,6 +182,7 @@ flowchart TD
 | `ZORA_EMBEDDING_DIMENSIONS` | hash 384 / openai 1024 | 否 | 向量维度 |
 | `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 否 | Unicode 字符分块上限，最少 100 |
 | `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 否 | 重叠字符数，必须小于分块上限的一半 |
+| `ZORA_KNOWLEDGE_PRINCIPAL_ID` | `local-user` | 否 | 单用户部署中由服务端信任的知识库主体，客户端不能覆盖 |
 | `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 否 | 成功回答后是否执行候选提取和 Consolidation |
 | `ZORA_MEMORY_MAX_CANDIDATES` | `3` | 否 | 单轮候选上限，范围 1–10 |
 | `ZORA_MEMORY_RECALL_ENABLED` | `true` | 否 | 是否在 Agent 执行前召回并注入长期记忆 |
@@ -459,7 +460,7 @@ PostgreSQL 已处理：
 
 - 多实例会话互斥；
 - 带版本升级/回滚的正式 migration 工具；
-- tenant_id 和 ACL；
+- 登录态到 tenant/user 的鉴权映射（文档 owner/private/public 过滤已实现）；
 - 备份、恢复和连接池生产参数基准。
 
 ### 8.5 知识库摄取流程（当前实现）
@@ -472,26 +473,28 @@ sequenceDiagram
     participant Embed as Embedder
     participant DB as SQLite
 
-    UI->>API: multipart TXT/Markdown
+    UI->>API: multipart TXT/Markdown/PDF + visibility
     API->>API: 扩展名、5 MiB 和 multipart 限制
     API->>KB: Ingest(name, mime, bytes)
-    KB->>KB: UTF-8 校验 + SHA-256 去重
-    KB->>KB: 归一化换行 + Unicode 重叠分块
+    KB->>KB: 文本/PDF 文本层解析 + owner 命名空间 SHA-256 去重
+    KB->>KB: 归一化换行 + 递归 Unicode 重叠分块
     KB->>Embed: 批量 Embed(chunks)
     Embed-->>KB: 等长度稠密向量
     KB->>KB: 生成中文单/双字特征和西文词频
-    KB->>DB: 事务写入 Document + Chunks
+    KB->>DB: 事务分配 version、切换 latest、写入 Document + Chunks
     DB-->>UI: document + deduplicated
 ```
 
 关键设计：
 
-- 先按 SHA-256 查询已有文档，命中后直接返回 `deduplicated=true`；
+- 内容哈希加入可信 owner 命名空间；同一主体命中后返回 `deduplicated=true`，不同主体不会通过去重结果泄露文件存在性；
 - 如果同内容文档使用了不同的 Embedding 模型或维度，返回 409，要求删除后重新索引，不会静默复用错误向量；
-- 分块按 rune 而非 byte 计数，优先在段落、换行、句末和空格处截断；
+- PDF 使用纯 Go 基础解析读取文本层；扫描件会返回“不包含 OCR”的明确错误；
+- 分块按 rune 而非 byte 计数，递归尝试 Markdown 标题、段落、换行、句末和空格，找不到才硬切；
 - `start_rune` / `end_rune` 指向换行归一化后的文本，可以精确恢复引用内容；
 - Embedder 返回数量和每个向量维度都必须与请求匹配，否则整个摄取失败；
-- Document 与所有 Chunk 在一个 SQLite 事务内写入，不暴露半成品索引。
+- 相同 owner + 小写文档名计算稳定 `version_group_id`；事务内分配递增版本并把旧版 `is_latest` 置为 false；
+- Document 与所有 Chunk 在一个事务内写入，不暴露半成品索引。默认列表和 SQLite/pgvector/FTS 检索均过滤 `is_latest` 与 `(owner_id = principal OR visibility = public)`；删除要求 owner，删除最新版时回退到最大历史版本。
 
 ### 8.6 Embedding Provider
 
@@ -942,18 +945,24 @@ Content-Type: multipart/form-data
 
 file=@release.md
 name=可选显示名
+visibility=private
 ```
 
-`file` 必须是 `.txt`、`.md` 或 `.markdown`，内容必须为 UTF-8。新文档返回 201，内容哈希已存在时返回 200：
+`file` 支持 `.txt`、`.md`、`.markdown` 或含文本层的 `.pdf`；`visibility` 可选 `private`/`public`，默认 private。新内容返回 201，同 owner 内容哈希已存在时返回 200：
 
 ```json
 {
   "document": {
     "id": "doc_xxx",
+    "version_group_id": "doc_group_xxx",
+    "version": 2,
+    "is_latest": true,
     "name": "release.md",
     "source_type": "upload",
     "mime_type": "text/markdown",
     "content_hash": "sha256-hex",
+    "owner_id": "local-user",
+    "visibility": "private",
     "embedding_model": "zora-hash-384-v1",
     "embedding_dimensions": 384,
     "chunk_count": 3,
@@ -968,10 +977,11 @@ name=可选显示名
 
 ```http
 GET /api/knowledge/documents
+GET /api/knowledge/documents/{documentID}/versions
 DELETE /api/knowledge/documents/{documentID}
 ```
 
-GET 返回 `{"documents": [...]}`；DELETE 成功返回 204，不存在返回 404，关联 Chunk 级联删除。
+第一个 GET 只返回当前主体可见的最新版；versions 返回同版本组内当前主体可见的历史版本，按版本倒序。DELETE 仅 owner 可执行，成功返回 204，越权返回 403，不存在返回 404；关联 Chunk 级联删除，删除最新版后自动恢复上一版。
 
 ### 10.12 调试混合检索
 
@@ -1214,7 +1224,7 @@ Dockerfile 使用 Go 构建阶段产出 Zora、文件 MCP 和 Microsoft MCP 三�
 
 ## 17. 后续目标设计
 
-### 17.1 V0.2 RAG 剩余工作
+### 17.1 V0.2 RAG 后续增强
 
 ```mermaid
 flowchart LR
@@ -1230,7 +1240,7 @@ flowchart LR
     Cite --> Agent["Agent 回答"]
 ```
 
-当前已实现内容哈希、chunk 来源范围、Embedding 抽象、混合召回、引用、固定检索/答案评测，以及 PostgreSQL + pgvector HNSW/FTS 候选下推。剩余工作是增加文档版本、tenant/ACL、PDF、异步摄取、可选 Rerank，以及更有区分度的真实语义评测样本。
+当前已实现 owner 命名空间内容哈希、文档版本链、private/public ACL、PDF 文本层、递归字符切块、chunk 来源范围、Embedding 抽象、混合召回、引用、固定检索/答案评测，以及 PostgreSQL + pgvector HNSW/FTS 候选下推。后续增强是登录态与 tenant 映射、OCR、异步摄取、可选 Rerank，以及更有区分度的真实语义评测样本。
 
 ### 17.2 V0.3 Memory
 

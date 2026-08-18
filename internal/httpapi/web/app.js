@@ -44,6 +44,7 @@ const elements = {
   knowledgeDialog: document.querySelector("#knowledgeDialog"),
   knowledgeUpload: document.querySelector("#knowledgeUpload"),
   knowledgeFile: document.querySelector("#knowledgeFile"),
+  knowledgeVisibility: document.querySelector("#knowledgeVisibility"),
   selectedFile: document.querySelector("#selectedFile"),
   uploadKnowledge: document.querySelector("#uploadKnowledge"),
   knowledgeDocuments: document.querySelector("#knowledgeDocuments"),
@@ -585,6 +586,7 @@ async function uploadKnowledgeDocument(event) {
   if (!file) return;
   const formData = new FormData();
   formData.append("file", file);
+  formData.append("visibility", elements.knowledgeVisibility.value);
   elements.uploadKnowledge.disabled = true;
   elements.uploadKnowledge.textContent = "索引中…";
   try {
@@ -611,8 +613,8 @@ async function deleteKnowledgeDocument(document) {
 	if (!confirm(`删除「${document.name}」及其全部分块？`)) return;
 	try {
 		await api(`/api/knowledge/documents/${document.id}`, { method: "DELETE" });
-		state.documents = state.documents.filter(item => item.id !== document.id);
-		renderKnowledgeDocuments();
+		// 删除当前版本后，服务端可能自动恢复上一版本，因此必须重新读取列表。
+		await refreshKnowledgeDocuments();
 		notify("文档已删除");
 	} catch (error) {
 		notify(error.message);
@@ -642,14 +644,29 @@ function documentNode(document) {
 	const name = window.document.createElement("strong");
 	name.textContent = document.name;
 	const detail = window.document.createElement("span");
-	detail.textContent = `${document.chunk_count} 个分块 · ${document.embedding_model}`;
+	const visibility = document.visibility === "public" ? "所有用户" : "仅自己";
+	detail.textContent = `v${document.version} · ${visibility} · ${document.chunk_count} 个分块 · ${document.embedding_model}`;
 	info.append(name, detail);
+	const versions = window.document.createElement("button");
+	versions.type = "button";
+	versions.textContent = "版本";
+	versions.addEventListener("click", () => showKnowledgeVersions(document));
 	const remove = window.document.createElement("button");
 	remove.type = "button";
 	remove.textContent = "删除";
 	remove.addEventListener("click", () => deleteKnowledgeDocument(document));
-	item.append(info, remove);
+	item.append(info, versions, remove);
 	return item;
+}
+
+async function showKnowledgeVersions(document) {
+	try {
+		const result = await api(`/api/knowledge/documents/${document.id}/versions`);
+		const labels = (result.documents || []).map(item => `v${item.version}${item.is_latest ? "（当前）" : ""}`);
+		notify(labels.length ? `「${document.name}」版本：${labels.join("、")}` : "没有可见版本");
+	} catch (error) {
+		notify(error.message);
+	}
 }
 
 async function createConversation() {

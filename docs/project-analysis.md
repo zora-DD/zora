@@ -15,7 +15,7 @@ Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产
 - 多 Agent 如何分工、控制预算并证明其收益；
 - 办公写操作如何经过授权、审批和审计。
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第六阶段已在只读连接器、结构化草稿、一次性人工确认和可恢复 Operation 之上，实现默认关闭的 Microsoft Graph 写执行器、邮件远端草稿检查点、发送状态恢复和日程 transactionId 幂等。协议与故障注入测试已完成，OAuth/Secret 生命周期和真实租户在线验收尚未实现。
+当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环，并补齐版本链、PDF 文本层、递归字符切块和文档级 ACL。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 第六阶段已在只读连接器、结构化草稿、一次性人工确认和可恢复 Operation 之上，实现默认关闭的 Microsoft Graph 写执行器、邮件远端草稿检查点、发送状态恢复和日程 transactionId 幂等。协议与故障注入测试已完成，OAuth/Secret 生命周期和真实租户在线验收尚未实现。
 
 ## 2. 背景与问题
 
@@ -124,10 +124,10 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 工具系统 | 已实现 | 三个内置只读工具、知识库工具；MCP 工具使用 Server 名称空间、显式 allowlist 和 Schema 转换 |
 | 执行审计 | 已实现 | AgentRun 与 append-only RunEvent |
 | 本地持久化 | 已实现 | SQLite、WAL、事务与级联删除 |
-| 知识库本地 MVP | 已实现 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
+| 知识库本地 MVP | 已实现 | TXT/Markdown/PDF 文本层、版本化去重、递归重叠分块、Embedding、向量 + BM25/RRF、引用 |
 | RAG 检索与答案评测 | 已实现 | 三种召回指标，以及 Agent 答案的事实覆盖、有效引用覆盖、引用忠实度和联合门禁 |
 | PostgreSQL 知识库 | 已实现 | pgxpool、完整 Store、pgvector HNSW、FTS/GIN、RRF 候选融合 |
-| 生产知识库剩余项 | V0.2 进行中 | 权限、文档版本/PDF、更强语义评测和生产验收 |
+| 知识库权限与版本 | 已实现 | owner/private/public、最新版检索、版本历史和删除最新版回退；完整登录与 tenant 隔离仍属平台层能力 |
 | 长期记忆底座 | 已实现 | Semantic/Episodic Schema、来源/重要性/过期字段、双存储和用户 CRUD |
 | 自动记忆写入 | 已实现 | 结构化/规则提取、Memory Key 去重与冲突更新、来源追踪、人工修正保护和审计 |
 | 记忆召回与注入 | 已实现 | 相关性/重要性/时效性联合评分、Top-K 安全注入、调试 API 和 Run 审计 |
@@ -169,7 +169,7 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | Agent Handoff | Supervisor 与专业 Agent 的一次结构化交接 | started → agent output → completed；关联 AgentTaskRun 与顶层 RunEvent |
 | ApprovalRequest | 高影响请求的人工审批记录 | pending → approved/rejected/expired；决定可恢复等待中的 Run |
 | Model Provider | 生成回答和工具决策的模型来源 | 由环境配置选择 |
-| KnowledgeDocument | 一份已完成索引的用户文档 | 上传后持续存在，可删除 |
+| KnowledgeDocument | 一份完成索引的不可变文档版本 | 同 owner + name 形成版本链；仅最新版参与默认列表/检索，删除最新版恢复上一版 |
 | KnowledgeChunk | 可检索、可引用的原文片段 | 与文档在同一事务创建，随文档级联删除 |
 | Memory | 经筛选的长期事实、偏好或事件 | 可由对话提取或手动创建、编辑、过期和删除；同 Key 候选执行合并 |
 | ConversationSummary | 一段对话较早历史的增量压缩结果 | 达到阈值后 Upsert，随 Conversation 级联删除；不删除原始 Message |
@@ -243,7 +243,12 @@ erDiagram
     KNOWLEDGE_DOCUMENT ||--|{ KNOWLEDGE_CHUNK : contains
     KNOWLEDGE_DOCUMENT {
         string id PK
+        string version_group_id
+        int version
+        bool is_latest
         string content_hash UK
+        string owner_id
+        string visibility
         string embedding_model
         int embedding_dimensions
         int chunk_count
@@ -758,11 +763,14 @@ Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要�
 - 默认 `zora-rag-smoke-v1` 的实际基线为 Recall@3=1、MRR=1，三种模式打平，尚不能证明融合收益。
 - PostgreSQL 与 SQLite 实现相同 Store 契约，数据库侧只下推 Top 50 单路候选，RRF 仍由应用层统一计算；
 - PostgreSQL 启动校验 `vector(N)` 维度，多实例 DDL 使用 advisory transaction lock。
+- private 文档只对 owner 可见，public 可跨主体读取；删除始终要求 owner，HTTP 把越权映射为 403；当前单用户主体来自服务端 `ZORA_KNOWLEDGE_PRINCIPAL_ID`。
+- 同 owner + 文档名形成版本组，写入时原子切换 latest；列表和两类检索候选只读取最新版，删除最新版自动回退。
+- PDF 仅解析已有文本层，不做 OCR；递归切块优先 Markdown 标题、段落、换行、句末和空格，最后才硬切。
 
 ## 12. 演进路线
 
 1. **V0.1 Agent Core**：建立当前可运行基线。
-2. **V0.2 Knowledge Base（进行中）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用和固定检索评测已实现；继续完成权限、文档能力和答案质量评估。
+2. **V0.2 Knowledge Base（工程项完成）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用、版本/PDF/递归切块/ACL 和固定评测已实现；继续以真实语义样本验证融合收益。
 3. **V0.3 Long-term Memory（主链路完成）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入、会话增量摘要和 A/B 门禁已实现。
 4. **V0.4 Multi-Agent（已完成）**：Supervisor、三个专业 Agent、隔离交接、串/并行执行治理、父子 Run、人工审批和单/多 Agent 对照门禁已实现。
 5. **V0.5 Office Agent（进行中）**：只读连接器、持久化草稿、草稿级人工确认、幂等可恢复 Operation 和 Graph 写适配已完成；继续实现 OAuth/Secret 生命周期、最小权限部署和真实租户验收。

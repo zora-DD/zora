@@ -12,27 +12,27 @@
 - [x] 自动化测试与 Docker 构建文件
 - [x] 项目分析、技术设计、README 和文档维护约定
 
-## V0.2 Knowledge Base — 进行中
+## V0.2 Knowledge Base — 工程项已完成，真实语义验收待加强
 
 - [x] PostgreSQL + pgvector Store（完整会话/Run/知识库持久化）
 - [x] 文档上传和 SHA-256 内容去重
-- [ ] 文档版本控制
+- [x] 文档版本控制
 - [x] TXT、Markdown 基础解析
-- [ ] PDF 基础解析
+- [x] PDF 基础解析（文本层，不含 OCR）
 - [x] Unicode 边界感知的重叠分块
-- [ ] 递归/语义切块策略
+- [x] 递归字符切块策略（Markdown 标题 → 段落 → 换行 → 句末 → 空格 → 硬切）
 - [x] Embedding Provider 抽象（本地 Hash + OpenAI-compatible）
 - [x] SQLite 精确向量扫描 + BM25（最多 10,000 chunks）
 - [x] pgvector HNSW 向量检索 + PostgreSQL FTS/GIN 候选召回
 - [x] RRF 混合召回
 - [x] 结构化引用坐标与 Agent Tool 证据查看
-- [ ] 文档级权限过滤
+- [x] 文档级权限过滤（服务端可信主体 + private/public）
 - [x] 固定检索评测集：Recall@K、MRR、命中率和单路/混合对比
 - [x] 确定性答案事实覆盖、有效引用覆盖与引用忠实度评估
 
 验收条件：每个知识库答案能够定位到原文；能用固定数据证明混合召回优于单一路径。
 
-当前验证结果：上传 → 分块 → Embedding → 向量/关键词 → RRF → `knowledge_search` → 对话 SSE 的纵向链路已打通。SQLite 采用进程内精确扫描；PostgreSQL 实现完整 Store、pgvector HNSW、`tsvector`/GIN、维度校验、迁移锁和数据库候选下推。自动化测试已覆盖 Store 契约、候选融合和评测指标；真实 PostgreSQL 生命周期测试可通过 `make test-postgres` 执行，但本次开发环境没有 Docker，容器验收尚未实际运行。`zora-rag-smoke-v1` 在默认 Hash Embedding 下得到 Recall@3=1、MRR=1，事实覆盖率/有效引用覆盖率/引用忠实度均为 1；但三种检索模式仍然打平，确定性锚点评测也不能替代真实模型语义评审，因此仍需真实语义样本和 ACL，V0.2 暂不标记完成。
+当前验证结果：上传 → 文本/PDF 解析 → 递归字符分块 → Embedding → 向量/关键词 → RRF → `knowledge_search` → 对话 SSE 的纵向链路已打通。相同主体和文档名形成单调版本链，默认列表与检索只使用最新版，删除最新版会恢复上一版；服务端可信主体控制 owner，private 仅 owner 可见、public 可跨主体读取，非 owner 不得删除。SQLite 旧表可迁移，PostgreSQL 在版本组上使用事务级 advisory lock。自动化测试覆盖版本回退、旧版检索隔离、ACL、PDF 文本层解析、递归边界和 HTTP 元数据。`zora-rag-smoke-v1` 在默认 Hash Embedding 下仍为 Recall@3=1、MRR=1，事实覆盖率/有效引用覆盖率/引用忠实度均为 1；但三种检索模式打平，确定性小样本不能证明融合优于单路，也不能替代真实模型语义评审。因此代码清单完成，验收结论仍保留该限制。
 
 ## V0.3 Long-term Memory — 主链路已完成
 

@@ -180,18 +180,33 @@ CREATE INDEX IF NOT EXISTS idx_memories_expiry
 
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
+    version_group_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    is_latest BOOLEAN NOT NULL,
     name TEXT NOT NULL,
     source_type TEXT NOT NULL,
     mime_type TEXT NOT NULL,
     content_hash TEXT NOT NULL UNIQUE,
+    owner_id TEXT NOT NULL,
+    visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public')),
     embedding_model TEXT NOT NULL,
     embedding_dimensions INTEGER NOT NULL,
     chunk_count INTEGER NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS version_group_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0);
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS is_latest BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'local-user';
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'public'));
+UPDATE knowledge_documents SET version_group_id = id WHERE version_group_id = '';
 CREATE INDEX IF NOT EXISTS idx_knowledge_documents_created
     ON knowledge_documents(created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_documents_group_version
+    ON knowledge_documents(version_group_id, version);
+CREATE INDEX IF NOT EXISTS idx_knowledge_documents_acl_latest
+    ON knowledge_documents(owner_id, visibility, is_latest);
 
 CREATE TABLE IF NOT EXISTS knowledge_chunks (
     sequence BIGSERIAL PRIMARY KEY,
@@ -225,4 +240,5 @@ INSERT INTO zora_schema_versions(version) VALUES (5) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (6) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (7) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (8) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (9) ON CONFLICT DO NOTHING;
 `

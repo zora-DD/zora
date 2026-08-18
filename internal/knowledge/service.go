@@ -1,40 +1,60 @@
 package knowledge
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	pdf "github.com/ledongthuc/pdf"
+
 	"github.com/zhiruo/zora/internal/id"
 )
 
 const (
-	maxDocumentBytes = 5 << 20
-	maxSearchChunks  = 10_000
-	rrfConstant      = 60.0
+	maxDocumentBytes  = 5 << 20
+	maxExtractedBytes = 20 << 20
+	maxSearchChunks   = 10_000
+	rrfConstant       = 60.0
 )
 
 type Service struct {
 	store        Store
 	embedder     Embedder
 	chunkOptions ChunkOptions
+	principalID  string
 }
 
-func NewService(store Store, embedder Embedder, chunkOptions ChunkOptions) (*Service, error) {
+type ServiceOption func(*Service)
+
+// WithPrincipal 设置没有登录系统时的服务端固定主体；客户端不能通过上传参数伪造 owner。
+func WithPrincipal(principalID string) ServiceOption {
+	return func(service *Service) { service.principalID = strings.TrimSpace(principalID) }
+}
+
+func NewService(store Store, embedder Embedder, chunkOptions ChunkOptions, options ...ServiceOption) (*Service, error) {
 	if store == nil || embedder == nil {
 		return nil, fmt.Errorf("知识库存储和 Embedding 器不能为空")
 	}
 	if _, err := ChunkText(strings.Repeat("x", 100), chunkOptions); err != nil {
 		return nil, fmt.Errorf("分块配置无效：%w", err)
 	}
-	return &Service{store: store, embedder: embedder, chunkOptions: chunkOptions}, nil
+	service := &Service{store: store, embedder: embedder, chunkOptions: chunkOptions, principalID: "local-user"}
+	for _, option := range options {
+		option(service)
+	}
+	if service.principalID == "" {
+		return nil, fmt.Errorf("知识库主体 ID 不能为空")
+	}
+	return service, nil
 }
 
 func (s *Service) EmbeddingModel() string { return s.embedder.Name() }
@@ -54,19 +74,28 @@ func (s *Service) Ingest(ctx context.Context, input IngestInput) (IngestResult, 
 	if len(input.Content) == 0 || len(input.Content) > maxDocumentBytes {
 		return IngestResult{}, fmt.Errorf("文档大小必须在 1 字节至 5 MiB 之间")
 	}
-	if !utf8.Valid(input.Content) {
-		return IngestResult{}, fmt.Errorf("文档必须是 UTF-8 编码的文本")
-	}
+	principalID := s.principal(ctx)
 	if input.SourceType == "" {
 		input.SourceType = "upload"
 	}
 	if input.MIMEType == "" {
 		input.MIMEType = "text/plain"
 	}
+	input.Visibility = strings.ToLower(strings.TrimSpace(input.Visibility))
+	if input.Visibility == "" {
+		input.Visibility = VisibilityPrivate
+	}
+	if input.Visibility != VisibilityPrivate && input.Visibility != VisibilityPublic {
+		return IngestResult{}, fmt.Errorf("文档可见性仅支持 private 或 public")
+	}
 
-	hashBytes := sha256.Sum256(input.Content)
+	// 哈希加入 owner 命名空间，使不同主体上传相同私有文件时不会互相泄露去重结果。
+	hashBytes := sha256.Sum256(append([]byte(principalID+"\x00"), input.Content...))
 	contentHash := hex.EncodeToString(hashBytes[:])
 	if existing, err := s.store.GetDocumentByHash(ctx, contentHash); err == nil {
+		if existing.OwnerID != principalID {
+			return IngestResult{}, ErrAccessDenied
+		}
 		if existing.EmbeddingModel != s.embedder.Name() || existing.EmbeddingDimensions != s.embedder.Dimensions() {
 			return IngestResult{}, fmt.Errorf("%w：请删除后重新上传《%s》以重建索引", ErrEmbeddingMismatch, existing.Name)
 		}
@@ -75,7 +104,11 @@ func (s *Service) Ingest(ctx context.Context, input IngestInput) (IngestResult, 
 		return IngestResult{}, err
 	}
 
-	textChunks, err := ChunkText(string(input.Content), s.chunkOptions)
+	text, err := extractText(input.MIMEType, input.Content)
+	if err != nil {
+		return IngestResult{}, err
+	}
+	textChunks, err := ChunkText(text, s.chunkOptions)
 	if err != nil {
 		return IngestResult{}, err
 	}
@@ -92,9 +125,12 @@ func (s *Service) Ingest(ctx context.Context, input IngestInput) (IngestResult, 
 	}
 
 	now := time.Now().UTC()
+	groupDigest := sha256.Sum256([]byte(principalID + "\x00" + strings.ToLower(input.Name)))
 	document := Document{
-		ID: id.New("doc"), Name: input.Name, SourceType: input.SourceType,
+		ID: id.New("doc"), VersionGroupID: "doc_group_" + hex.EncodeToString(groupDigest[:12]),
+		Name: input.Name, SourceType: input.SourceType,
 		MIMEType: input.MIMEType, ContentHash: contentHash,
+		OwnerID: principalID, Visibility: input.Visibility,
 		EmbeddingModel: s.embedder.Name(), EmbeddingDimensions: s.embedder.Dimensions(),
 		ChunkCount: len(textChunks),
 		CreatedAt:  now, UpdatedAt: now,
@@ -113,18 +149,26 @@ func (s *Service) Ingest(ctx context.Context, input IngestInput) (IngestResult, 
 			TermCounts: terms, TokenCount: tokenCount, CreatedAt: now,
 		}
 	}
-	if err := s.store.CreateDocument(ctx, document, chunks); err != nil {
+	saved, err := s.store.CreateDocument(ctx, document, chunks)
+	if err != nil {
 		return IngestResult{}, err
 	}
-	return IngestResult{Document: document}, nil
+	return IngestResult{Document: saved}, nil
 }
 
 func (s *Service) ListDocuments(ctx context.Context) ([]Document, error) {
-	return s.store.ListDocuments(ctx, 200)
+	return s.store.ListDocuments(ctx, s.principal(ctx), false, 200)
 }
 
 func (s *Service) DeleteDocument(ctx context.Context, id string) error {
-	return s.store.DeleteDocument(ctx, id)
+	return s.store.DeleteDocument(ctx, id, s.principal(ctx))
+}
+
+func (s *Service) ListDocumentVersions(ctx context.Context, documentID string) ([]Document, error) {
+	if strings.TrimSpace(documentID) == "" {
+		return nil, fmt.Errorf("文档 ID 不能为空")
+	}
+	return s.store.ListDocumentVersions(ctx, documentID, s.principal(ctx))
 }
 
 func (s *Service) Search(ctx context.Context, query string, topK int) ([]SearchResult, error) {
@@ -165,7 +209,7 @@ func (s *Service) SearchWithMode(ctx context.Context, query string, topK int, mo
 		candidates, err := candidateStore.SearchCandidates(ctx, CandidateRequest{
 			Mode: mode, QueryVector: queryVector, QueryTerms: queryTerms,
 			EmbeddingModel: s.embedder.Name(), EmbeddingDimensions: s.embedder.Dimensions(),
-			Limit: 50,
+			Limit: 50, PrincipalID: s.principal(ctx),
 		})
 		if err != nil {
 			return nil, err
@@ -173,7 +217,7 @@ func (s *Service) SearchWithMode(ctx context.Context, query string, topK int, mo
 		return rankCandidates(candidates, topK, mode), nil
 	}
 
-	chunks, err := s.store.ListChunks(ctx, maxSearchChunks)
+	chunks, err := s.store.ListChunks(ctx, s.principal(ctx), maxSearchChunks)
 	if err != nil {
 		return nil, err
 	}
@@ -200,6 +244,62 @@ func (s *Service) SearchWithMode(ctx context.Context, query string, topK int, mo
 		return nil, ErrEmbeddingMismatch
 	}
 	return rankSearch(query, queryVector, compatible, topK, mode), nil
+}
+
+func (s *Service) principal(ctx context.Context) string {
+	if value, ok := PrincipalFromContext(ctx); ok {
+		return value
+	}
+	return s.principalID
+}
+
+type principalContextKey struct{}
+
+// WithPrincipalContext 供未来鉴权中间件和测试注入已经验证的主体，不接受客户端原始 owner 字段。
+func WithPrincipalContext(ctx context.Context, principalID string) context.Context {
+	principalID = strings.TrimSpace(principalID)
+	if principalID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, principalContextKey{}, principalID)
+}
+
+func PrincipalFromContext(ctx context.Context) (string, bool) {
+	value, ok := ctx.Value(principalContextKey{}).(string)
+	return strings.TrimSpace(value), ok && strings.TrimSpace(value) != ""
+}
+
+func extractText(mimeType string, content []byte) (string, error) {
+	mimeType = strings.ToLower(strings.TrimSpace(strings.Split(mimeType, ";")[0]))
+	if mimeType != "application/pdf" {
+		if !utf8.Valid(content) {
+			return "", fmt.Errorf("文档必须是 UTF-8 编码的文本")
+		}
+		return string(content), nil
+	}
+	reader, err := pdf.NewReader(bytes.NewReader(content), int64(len(content)))
+	if err != nil {
+		return "", fmt.Errorf("解析 PDF 失败：%w", err)
+	}
+	plain, err := reader.GetPlainText()
+	if err != nil {
+		return "", fmt.Errorf("提取 PDF 文本失败：%w", err)
+	}
+	extracted, err := io.ReadAll(io.LimitReader(plain, maxExtractedBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("读取 PDF 文本失败：%w", err)
+	}
+	if len(extracted) > maxExtractedBytes {
+		return "", fmt.Errorf("PDF 提取文本超过 20 MiB 上限")
+	}
+	text := strings.TrimSpace(string(extracted))
+	if text == "" {
+		return "", fmt.Errorf("PDF 未提取到可索引文本；当前基础解析不包含 OCR")
+	}
+	if !utf8.ValidString(text) {
+		return "", fmt.Errorf("PDF 提取结果不是有效的 UTF-8 文本")
+	}
+	return text, nil
 }
 
 func (s *Service) embedQuery(ctx context.Context, query string) ([]float64, error) {

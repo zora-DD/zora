@@ -181,10 +181,15 @@ CREATE INDEX IF NOT EXISTS idx_memories_expiry
     ON memories(expires_at);
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
+    version_group_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version > 0),
+    is_latest INTEGER NOT NULL CHECK (is_latest IN (0, 1)),
     name TEXT NOT NULL,
     source_type TEXT NOT NULL,
     mime_type TEXT NOT NULL,
     content_hash TEXT NOT NULL UNIQUE,
+    owner_id TEXT NOT NULL,
+    visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public')),
     embedding_model TEXT NOT NULL,
     embedding_dimensions INTEGER NOT NULL,
     chunk_count INTEGER NOT NULL,
@@ -250,7 +255,61 @@ func Open(path string) (*SQLite, error) {
 		db.Close()
 		return nil, err
 	}
+	if err = ensureKnowledgeColumns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &SQLite{db: db}, nil
+}
+
+// ensureKnowledgeColumns 把早期单版本知识库平滑迁移为带版本和 ACL 的结构。
+func ensureKnowledgeColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(knowledge_documents)`)
+	if err != nil {
+		return fmt.Errorf("读取 SQLite 知识库表结构失败：%w", err)
+	}
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("解析 SQLite 知识库表结构失败：%w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("遍历 SQLite 知识库表结构失败：%w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭 SQLite 知识库表结构结果失败：%w", err)
+	}
+	migrations := []struct{ column, statement string }{
+		{"version_group_id", `ALTER TABLE knowledge_documents ADD COLUMN version_group_id TEXT NOT NULL DEFAULT ''`},
+		{"version", `ALTER TABLE knowledge_documents ADD COLUMN version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0)`},
+		{"is_latest", `ALTER TABLE knowledge_documents ADD COLUMN is_latest INTEGER NOT NULL DEFAULT 1 CHECK (is_latest IN (0, 1))`},
+		{"owner_id", `ALTER TABLE knowledge_documents ADD COLUMN owner_id TEXT NOT NULL DEFAULT 'local-user'`},
+		{"visibility", `ALTER TABLE knowledge_documents ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'public'))`},
+	}
+	for _, migration := range migrations {
+		if !columns[migration.column] {
+			if _, err := db.Exec(migration.statement); err != nil {
+				return fmt.Errorf("迁移 SQLite 知识库字段 %s 失败：%w", migration.column, err)
+			}
+		}
+	}
+	if _, err := db.Exec(`UPDATE knowledge_documents SET version_group_id = id WHERE version_group_id = ''`); err != nil {
+		return fmt.Errorf("迁移 SQLite 知识库版本组失败：%w", err)
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_documents_group_version ON knowledge_documents(version_group_id, version)`); err != nil {
+		return fmt.Errorf("创建 SQLite 知识库版本索引失败：%w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_knowledge_documents_acl_latest ON knowledge_documents(owner_id, visibility, is_latest)`); err != nil {
+		return fmt.Errorf("创建 SQLite 知识库权限索引失败：%w", err)
+	}
+	return nil
 }
 
 // ensureMemoryColumns 兼容已经由 V0.3 第一阶段创建的数据库。
@@ -545,58 +604,65 @@ FROM run_events WHERE run_id = ? ORDER BY sequence ASC`, runID)
 	return events, rows.Err()
 }
 
-// CreateDocument 在同一事务中写入文档与全部分块，避免出现“只有文档没有向量”的半成品。
-func (s *SQLite) CreateDocument(ctx context.Context, document knowledge.Document, chunks []knowledge.Chunk) error {
+// CreateDocument 在同一事务中分配版本号、切换 latest 并写入全部分块。
+func (s *SQLite) CreateDocument(ctx context.Context, document knowledge.Document, chunks []knowledge.Chunk) (knowledge.Document, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("开始保存知识库文档事务失败：%w", err)
+		return knowledge.Document{}, fmt.Errorf("开始保存知识库文档事务失败：%w", err)
 	}
 	defer tx.Rollback()
-
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) + 1 FROM knowledge_documents WHERE version_group_id = ?`, document.VersionGroupID).Scan(&document.Version); err != nil {
+		return knowledge.Document{}, fmt.Errorf("计算知识库文档版本失败：%w", err)
+	}
+	document.IsLatest = true
+	if _, err := tx.ExecContext(ctx, `UPDATE knowledge_documents SET is_latest = 0, updated_at = ? WHERE version_group_id = ? AND is_latest = 1`, formatTime(document.UpdatedAt), document.VersionGroupID); err != nil {
+		return knowledge.Document{}, fmt.Errorf("更新知识库旧版本状态失败：%w", err)
+	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO knowledge_documents(
-    id, name, source_type, mime_type, content_hash, embedding_model, embedding_dimensions,
-    chunk_count, created_at, updated_at
-) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		document.ID, document.Name, document.SourceType, document.MIMEType,
-		document.ContentHash, document.EmbeddingModel, document.EmbeddingDimensions, document.ChunkCount,
+    id, version_group_id, version, is_latest, name, source_type, mime_type, content_hash,
+    owner_id, visibility, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
+) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		document.ID, document.VersionGroupID, document.Version, 1, document.Name, document.SourceType,
+		document.MIMEType, document.ContentHash, document.OwnerID, document.Visibility,
+		document.EmbeddingModel, document.EmbeddingDimensions, document.ChunkCount,
 		formatTime(document.CreatedAt), formatTime(document.UpdatedAt))
 	if err != nil {
-		return fmt.Errorf("保存知识库文档失败：%w", err)
+		return knowledge.Document{}, fmt.Errorf("保存知识库文档失败：%w", err)
 	}
-
 	for _, chunk := range chunks {
 		embedding, err := json.Marshal(chunk.Embedding)
 		if err != nil {
-			return fmt.Errorf("编码分块向量失败：%w", err)
+			return knowledge.Document{}, fmt.Errorf("编码分块向量失败：%w", err)
 		}
 		terms, err := json.Marshal(chunk.TermCounts)
 		if err != nil {
-			return fmt.Errorf("编码分块词频失败：%w", err)
+			return knowledge.Document{}, fmt.Errorf("编码分块词频失败：%w", err)
 		}
 		_, err = tx.ExecContext(ctx, `
 INSERT INTO knowledge_chunks(
     id, document_id, ordinal, content, start_rune, end_rune, embedding_model,
     embedding, term_counts, token_count, created_at
 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			chunk.ID, chunk.DocumentID, chunk.Ordinal, chunk.Content,
-			chunk.StartRune, chunk.EndRune, chunk.EmbeddingModel,
-			string(embedding), string(terms), chunk.TokenCount, formatTime(chunk.CreatedAt))
+			chunk.ID, chunk.DocumentID, chunk.Ordinal, chunk.Content, chunk.StartRune, chunk.EndRune,
+			chunk.EmbeddingModel, string(embedding), string(terms), chunk.TokenCount, formatTime(chunk.CreatedAt))
 		if err != nil {
-			return fmt.Errorf("保存第 %d 个知识库分块失败：%w", chunk.Ordinal+1, err)
+			return knowledge.Document{}, fmt.Errorf("保存第 %d 个知识库分块失败：%w", chunk.Ordinal+1, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("提交知识库文档事务失败：%w", err)
+		return knowledge.Document{}, fmt.Errorf("提交知识库文档事务失败：%w", err)
 	}
-	return nil
+	return document, nil
 }
 
+const sqliteKnowledgeDocumentSelect = `
+SELECT id, version_group_id, version, is_latest, name, source_type, mime_type, content_hash,
+       owner_id, visibility, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
+FROM knowledge_documents`
+
 func (s *SQLite) GetDocumentByHash(ctx context.Context, contentHash string) (knowledge.Document, error) {
-	row := s.db.QueryRowContext(ctx, `
-SELECT id, name, source_type, mime_type, content_hash, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
-FROM knowledge_documents WHERE content_hash = ?`, contentHash)
-	document, err := scanKnowledgeDocument(row)
+	document, err := scanKnowledgeDocument(s.db.QueryRowContext(ctx, sqliteKnowledgeDocumentSelect+` WHERE content_hash = ?`, contentHash))
 	if errors.Is(err, sql.ErrNoRows) {
 		return knowledge.Document{}, knowledge.ErrNotFound
 	}
@@ -606,62 +672,86 @@ FROM knowledge_documents WHERE content_hash = ?`, contentHash)
 	return document, nil
 }
 
-func (s *SQLite) ListDocuments(ctx context.Context, limit int) ([]knowledge.Document, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, name, source_type, mime_type, content_hash, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
-FROM knowledge_documents ORDER BY created_at DESC LIMIT ?`, limit)
+func (s *SQLite) ListDocuments(ctx context.Context, principalID string, includeHistory bool, limit int) ([]knowledge.Document, error) {
+	historyFilter := ` AND is_latest = 1`
+	if includeHistory {
+		historyFilter = ""
+	}
+	rows, err := s.db.QueryContext(ctx, sqliteKnowledgeDocumentSelect+` WHERE (owner_id = ? OR visibility = 'public')`+historyFilter+` ORDER BY updated_at DESC, version DESC LIMIT ?`, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询知识库文档列表失败：%w", err)
 	}
 	defer rows.Close()
-
-	documents := make([]knowledge.Document, 0)
-	for rows.Next() {
-		document, err := scanKnowledgeDocument(rows)
-		if err != nil {
-			return nil, fmt.Errorf("读取知识库文档失败：%w", err)
-		}
-		documents = append(documents, document)
-	}
-	return documents, rows.Err()
+	return scanKnowledgeDocuments(rows)
 }
 
-func (s *SQLite) DeleteDocument(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM knowledge_documents WHERE id = ?`, id)
+func (s *SQLite) ListDocumentVersions(ctx context.Context, documentID, principalID string) ([]knowledge.Document, error) {
+	var groupID string
+	err := s.db.QueryRowContext(ctx, `SELECT version_group_id FROM knowledge_documents WHERE id = ? AND (owner_id = ? OR visibility = 'public')`, documentID, principalID).Scan(&groupID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, knowledge.ErrNotFound
+	}
 	if err != nil {
+		return nil, fmt.Errorf("查询知识库文档版本组失败：%w", err)
+	}
+	rows, err := s.db.QueryContext(ctx, sqliteKnowledgeDocumentSelect+` WHERE version_group_id = ? AND (owner_id = ? OR visibility = 'public') ORDER BY version DESC`, groupID, principalID)
+	if err != nil {
+		return nil, fmt.Errorf("查询知识库文档版本列表失败：%w", err)
+	}
+	defer rows.Close()
+	return scanKnowledgeDocuments(rows)
+}
+
+func (s *SQLite) DeleteDocument(ctx context.Context, id, principalID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始删除知识库文档事务失败：%w", err)
+	}
+	defer tx.Rollback()
+	var ownerID, groupID string
+	var latest int
+	err = tx.QueryRowContext(ctx, `SELECT owner_id, version_group_id, is_latest FROM knowledge_documents WHERE id = ?`, id).Scan(&ownerID, &groupID, &latest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return knowledge.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("查询待删除知识库文档失败：%w", err)
+	}
+	if ownerID != principalID {
+		return knowledge.ErrAccessDenied
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM knowledge_documents WHERE id = ?`, id); err != nil {
 		return fmt.Errorf("删除知识库文档失败：%w", err)
 	}
-	count, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("确认知识库文档删除结果失败：%w", err)
+	if latest == 1 {
+		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_documents SET is_latest = 1, updated_at = ? WHERE id = (SELECT id FROM knowledge_documents WHERE version_group_id = ? ORDER BY version DESC LIMIT 1)`, formatTime(time.Now().UTC()), groupID); err != nil {
+			return fmt.Errorf("恢复知识库上一版本失败：%w", err)
+		}
 	}
-	if count == 0 {
-		return knowledge.ErrNotFound
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交删除知识库文档事务失败：%w", err)
 	}
 	return nil
 }
 
-func (s *SQLite) ListChunks(ctx context.Context, limit int) ([]knowledge.Chunk, error) {
+func (s *SQLite) ListChunks(ctx context.Context, principalID string, limit int) ([]knowledge.Chunk, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT c.id, c.document_id, d.name, c.ordinal, c.content, c.start_rune, c.end_rune,
        c.embedding_model, c.embedding, c.term_counts, c.token_count, c.created_at
 FROM knowledge_chunks c
 JOIN knowledge_documents d ON d.id = c.document_id
-ORDER BY c.sequence ASC LIMIT ?`, limit)
+WHERE d.is_latest = 1 AND (d.owner_id = ? OR d.visibility = 'public')
+ORDER BY c.sequence ASC LIMIT ?`, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询知识库分块失败：%w", err)
 	}
 	defer rows.Close()
-
 	chunks := make([]knowledge.Chunk, 0)
 	for rows.Next() {
 		var chunk knowledge.Chunk
 		var embedding, terms, createdAt string
-		if err := rows.Scan(
-			&chunk.ID, &chunk.DocumentID, &chunk.DocumentName, &chunk.Ordinal, &chunk.Content,
-			&chunk.StartRune, &chunk.EndRune, &chunk.EmbeddingModel, &embedding, &terms,
-			&chunk.TokenCount, &createdAt,
-		); err != nil {
+		if err := rows.Scan(&chunk.ID, &chunk.DocumentID, &chunk.DocumentName, &chunk.Ordinal, &chunk.Content,
+			&chunk.StartRune, &chunk.EndRune, &chunk.EmbeddingModel, &embedding, &terms, &chunk.TokenCount, &createdAt); err != nil {
 			return nil, fmt.Errorf("读取知识库分块失败：%w", err)
 		}
 		if err := json.Unmarshal([]byte(embedding), &chunk.Embedding); err != nil {
@@ -678,20 +768,19 @@ ORDER BY c.sequence ASC LIMIT ?`, limit)
 	return chunks, rows.Err()
 }
 
-type rowScanner interface {
-	Scan(dest ...any) error
-}
+type rowScanner interface{ Scan(dest ...any) error }
 
 func scanKnowledgeDocument(row rowScanner) (knowledge.Document, error) {
 	var document knowledge.Document
+	var isLatest int
 	var createdAt, updatedAt string
-	if err := row.Scan(
-		&document.ID, &document.Name, &document.SourceType, &document.MIMEType,
-		&document.ContentHash, &document.EmbeddingModel, &document.EmbeddingDimensions, &document.ChunkCount,
-		&createdAt, &updatedAt,
-	); err != nil {
+	if err := row.Scan(&document.ID, &document.VersionGroupID, &document.Version, &isLatest,
+		&document.Name, &document.SourceType, &document.MIMEType, &document.ContentHash,
+		&document.OwnerID, &document.Visibility, &document.EmbeddingModel, &document.EmbeddingDimensions,
+		&document.ChunkCount, &createdAt, &updatedAt); err != nil {
 		return knowledge.Document{}, err
 	}
+	document.IsLatest = isLatest == 1
 	var err error
 	if document.CreatedAt, err = parseTime(createdAt); err != nil {
 		return knowledge.Document{}, err
@@ -700,6 +789,18 @@ func scanKnowledgeDocument(row rowScanner) (knowledge.Document, error) {
 		return knowledge.Document{}, err
 	}
 	return document, nil
+}
+
+func scanKnowledgeDocuments(rows *sql.Rows) ([]knowledge.Document, error) {
+	documents := make([]knowledge.Document, 0)
+	for rows.Next() {
+		document, err := scanKnowledgeDocument(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取知识库文档失败：%w", err)
+		}
+		documents = append(documents, document)
+	}
+	return documents, rows.Err()
 }
 
 func affected(operation string, result sql.Result, err error) error {

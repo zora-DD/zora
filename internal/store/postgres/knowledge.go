@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
@@ -15,36 +16,47 @@ import (
 )
 
 // CreateDocument 在同一事务中保存文档、pgvector 向量和 FTS 词项。
-func (p *Postgres) CreateDocument(ctx context.Context, document knowledge.Document, chunks []knowledge.Chunk) error {
+func (p *Postgres) CreateDocument(ctx context.Context, document knowledge.Document, chunks []knowledge.Chunk) (knowledge.Document, error) {
 	if document.EmbeddingDimensions != p.embeddingDimensions {
-		return fmt.Errorf("文档向量维度为 %d，但 PostgreSQL 列维度为 %d", document.EmbeddingDimensions, p.embeddingDimensions)
+		return knowledge.Document{}, fmt.Errorf("文档向量维度为 %d，但 PostgreSQL 列维度为 %d", document.EmbeddingDimensions, p.embeddingDimensions)
 	}
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
-		return fmt.Errorf("开始保存知识库文档事务失败：%w", err)
+		return knowledge.Document{}, fmt.Errorf("开始保存知识库文档事务失败：%w", err)
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, document.VersionGroupID); err != nil {
+		return knowledge.Document{}, fmt.Errorf("锁定知识库文档版本组失败：%w", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) + 1 FROM knowledge_documents WHERE version_group_id = $1`, document.VersionGroupID).Scan(&document.Version); err != nil {
+		return knowledge.Document{}, fmt.Errorf("计算知识库文档版本失败：%w", err)
+	}
+	document.IsLatest = true
+	if _, err := tx.Exec(ctx, `UPDATE knowledge_documents SET is_latest = FALSE, updated_at = $1 WHERE version_group_id = $2 AND is_latest = TRUE`, normalizeTime(document.UpdatedAt), document.VersionGroupID); err != nil {
+		return knowledge.Document{}, fmt.Errorf("更新知识库旧版本状态失败：%w", err)
+	}
 
 	_, err = tx.Exec(ctx, `
 INSERT INTO knowledge_documents(
-    id, name, source_type, mime_type, content_hash, embedding_model, embedding_dimensions,
-    chunk_count, created_at, updated_at
-) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-		document.ID, document.Name, document.SourceType, document.MIMEType,
-		document.ContentHash, document.EmbeddingModel, document.EmbeddingDimensions,
-		document.ChunkCount, normalizeTime(document.CreatedAt), normalizeTime(document.UpdatedAt),
+    id, version_group_id, version, is_latest, name, source_type, mime_type, content_hash,
+    owner_id, visibility, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
+) VALUES($1, $2, $3, TRUE, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		document.ID, document.VersionGroupID, document.Version, document.Name, document.SourceType,
+		document.MIMEType, document.ContentHash, document.OwnerID, document.Visibility,
+		document.EmbeddingModel, document.EmbeddingDimensions, document.ChunkCount,
+		normalizeTime(document.CreatedAt), normalizeTime(document.UpdatedAt),
 	)
 	if err != nil {
-		return fmt.Errorf("保存知识库文档失败：%w", err)
+		return knowledge.Document{}, fmt.Errorf("保存知识库文档失败：%w", err)
 	}
 
 	for _, chunk := range chunks {
 		if len(chunk.Embedding) != p.embeddingDimensions {
-			return fmt.Errorf("第 %d 个分块的向量维度为 %d，但 PostgreSQL 列维度为 %d", chunk.Ordinal+1, len(chunk.Embedding), p.embeddingDimensions)
+			return knowledge.Document{}, fmt.Errorf("第 %d 个分块的向量维度为 %d，但 PostgreSQL 列维度为 %d", chunk.Ordinal+1, len(chunk.Embedding), p.embeddingDimensions)
 		}
 		terms, err := json.Marshal(chunk.TermCounts)
 		if err != nil {
-			return fmt.Errorf("编码第 %d 个分块词频失败：%w", chunk.Ordinal+1, err)
+			return knowledge.Document{}, fmt.Errorf("编码第 %d 个分块词频失败：%w", chunk.Ordinal+1, err)
 		}
 		_, err = tx.Exec(ctx, `
 INSERT INTO knowledge_chunks(
@@ -57,20 +69,17 @@ INSERT INTO knowledge_chunks(
 			chunk.TokenCount, normalizeTime(chunk.CreatedAt),
 		)
 		if err != nil {
-			return fmt.Errorf("保存第 %d 个知识库分块失败：%w", chunk.Ordinal+1, err)
+			return knowledge.Document{}, fmt.Errorf("保存第 %d 个知识库分块失败：%w", chunk.Ordinal+1, err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("提交知识库文档事务失败：%w", err)
+		return knowledge.Document{}, fmt.Errorf("提交知识库文档事务失败：%w", err)
 	}
-	return nil
+	return document, nil
 }
 
 func (p *Postgres) GetDocumentByHash(ctx context.Context, contentHash string) (knowledge.Document, error) {
-	document, err := scanKnowledgeDocument(p.pool.QueryRow(ctx, `
-SELECT id, name, source_type, mime_type, content_hash, embedding_model,
-       embedding_dimensions, chunk_count, created_at, updated_at
-FROM knowledge_documents WHERE content_hash = $1`, contentHash))
+	document, err := scanKnowledgeDocument(p.pool.QueryRow(ctx, postgresKnowledgeDocumentSelect+` WHERE content_hash = $1`, contentHash))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return knowledge.Document{}, knowledge.ErrNotFound
 	}
@@ -80,11 +89,12 @@ FROM knowledge_documents WHERE content_hash = $1`, contentHash))
 	return document, nil
 }
 
-func (p *Postgres) ListDocuments(ctx context.Context, limit int) ([]knowledge.Document, error) {
-	rows, err := p.pool.Query(ctx, `
-SELECT id, name, source_type, mime_type, content_hash, embedding_model,
-       embedding_dimensions, chunk_count, created_at, updated_at
-FROM knowledge_documents ORDER BY created_at DESC LIMIT $1`, limit)
+func (p *Postgres) ListDocuments(ctx context.Context, principalID string, includeHistory bool, limit int) ([]knowledge.Document, error) {
+	historyFilter := ` AND is_latest = TRUE`
+	if includeHistory {
+		historyFilter = ""
+	}
+	rows, err := p.pool.Query(ctx, postgresKnowledgeDocumentSelect+` WHERE (owner_id = $1 OR visibility = 'public')`+historyFilter+` ORDER BY updated_at DESC, version DESC LIMIT $2`, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询知识库文档列表失败：%w", err)
 	}
@@ -104,25 +114,64 @@ FROM knowledge_documents ORDER BY created_at DESC LIMIT $1`, limit)
 	return documents, nil
 }
 
-func (p *Postgres) DeleteDocument(ctx context.Context, id string) error {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM knowledge_documents WHERE id = $1`, id)
+func (p *Postgres) ListDocumentVersions(ctx context.Context, documentID, principalID string) ([]knowledge.Document, error) {
+	var groupID string
+	err := p.pool.QueryRow(ctx, `SELECT version_group_id FROM knowledge_documents WHERE id = $1 AND (owner_id = $2 OR visibility = 'public')`, documentID, principalID).Scan(&groupID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, knowledge.ErrNotFound
+	}
 	if err != nil {
+		return nil, fmt.Errorf("查询知识库文档版本组失败：%w", err)
+	}
+	rows, err := p.pool.Query(ctx, postgresKnowledgeDocumentSelect+` WHERE version_group_id = $1 AND (owner_id = $2 OR visibility = 'public') ORDER BY version DESC`, groupID, principalID)
+	if err != nil {
+		return nil, fmt.Errorf("查询知识库文档版本列表失败：%w", err)
+	}
+	defer rows.Close()
+	return scanKnowledgeDocuments(rows)
+}
+
+func (p *Postgres) DeleteDocument(ctx context.Context, id, principalID string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("开始删除知识库文档事务失败：%w", err)
+	}
+	defer tx.Rollback(ctx)
+	var ownerID, groupID string
+	var latest bool
+	err = tx.QueryRow(ctx, `SELECT owner_id, version_group_id, is_latest FROM knowledge_documents WHERE id = $1 FOR UPDATE`, id).Scan(&ownerID, &groupID, &latest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return knowledge.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("查询待删除知识库文档失败：%w", err)
+	}
+	if ownerID != principalID {
+		return knowledge.ErrAccessDenied
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM knowledge_documents WHERE id = $1`, id); err != nil {
 		return fmt.Errorf("删除知识库文档失败：%w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return knowledge.ErrNotFound
+	if latest {
+		if _, err := tx.Exec(ctx, `UPDATE knowledge_documents SET is_latest = TRUE, updated_at = $1 WHERE id = (SELECT id FROM knowledge_documents WHERE version_group_id = $2 ORDER BY version DESC LIMIT 1)`, normalizeTime(time.Now().UTC()), groupID); err != nil {
+			return fmt.Errorf("恢复知识库上一版本失败：%w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("提交删除知识库文档事务失败：%w", err)
 	}
 	return nil
 }
 
 // ListChunks 保留完整 Store 契约，在线检索会优先使用 SearchCandidates 下推到数据库。
-func (p *Postgres) ListChunks(ctx context.Context, limit int) ([]knowledge.Chunk, error) {
+func (p *Postgres) ListChunks(ctx context.Context, principalID string, limit int) ([]knowledge.Chunk, error) {
 	rows, err := p.pool.Query(ctx, `
 SELECT c.id, c.document_id, d.name, c.ordinal, c.content, c.start_rune, c.end_rune,
        c.embedding_model, c.embedding, c.term_counts, c.token_count, c.created_at
 FROM knowledge_chunks c
 JOIN knowledge_documents d ON d.id = c.document_id
-ORDER BY c.sequence ASC LIMIT $1`, limit)
+WHERE d.is_latest = TRUE AND (d.owner_id = $1 OR d.visibility = 'public')
+ORDER BY c.sequence ASC LIMIT $2`, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询知识库分块失败：%w", err)
 	}
@@ -175,7 +224,7 @@ func (p *Postgres) SearchCandidates(ctx context.Context, request knowledge.Candi
 		}
 	}
 	if request.Mode == knowledge.RetrievalKeyword || request.Mode == knowledge.RetrievalHybrid {
-		candidates, err := p.searchKeywordCandidates(ctx, request.QueryTerms, request.Limit)
+		candidates, err := p.searchKeywordCandidates(ctx, request.QueryTerms, request.PrincipalID, request.Limit)
 		if err != nil {
 			return nil, err
 		}
@@ -205,8 +254,10 @@ SELECT c.id, c.document_id, d.name, c.ordinal, c.content, c.start_rune, c.end_ru
 FROM knowledge_chunks c
 JOIN knowledge_documents d ON d.id = c.document_id
 WHERE c.embedding_model = $2
+  AND d.is_latest = TRUE
+  AND (d.owner_id = $3 OR d.visibility = 'public')
 ORDER BY c.embedding <=> $1
-LIMIT $3`, pgvector.NewVector(toFloat32(request.QueryVector)), request.EmbeddingModel, request.Limit)
+LIMIT $4`, pgvector.NewVector(toFloat32(request.QueryVector)), request.EmbeddingModel, request.PrincipalID, request.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("执行 pgvector 候选召回失败：%w", err)
 	}
@@ -214,7 +265,7 @@ LIMIT $3`, pgvector.NewVector(toFloat32(request.QueryVector)), request.Embedding
 	return scanCandidates(rows, true)
 }
 
-func (p *Postgres) searchKeywordCandidates(ctx context.Context, terms []string, limit int) ([]knowledge.Candidate, error) {
+func (p *Postgres) searchKeywordCandidates(ctx context.Context, terms []string, principalID string, limit int) ([]knowledge.Candidate, error) {
 	if len(terms) == 0 {
 		return []knowledge.Candidate{}, nil
 	}
@@ -229,8 +280,10 @@ FROM knowledge_chunks c
 JOIN knowledge_documents d ON d.id = c.document_id
 CROSS JOIN query
 WHERE c.search_vector @@ query.value
+  AND d.is_latest = TRUE
+  AND (d.owner_id = $2 OR d.visibility = 'public')
 ORDER BY keyword_score DESC
-LIMIT $2`, tsQuery, limit)
+LIMIT $3`, tsQuery, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("执行 PostgreSQL 全文候选召回失败：%w", err)
 	}
@@ -274,18 +327,42 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+const postgresKnowledgeDocumentSelect = `
+SELECT id, version_group_id, version, is_latest, name, source_type, mime_type, content_hash,
+       owner_id, visibility, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
+FROM knowledge_documents`
+
 func scanKnowledgeDocument(row rowScanner) (knowledge.Document, error) {
 	var document knowledge.Document
 	if err := row.Scan(
-		&document.ID, &document.Name, &document.SourceType, &document.MIMEType,
-		&document.ContentHash, &document.EmbeddingModel, &document.EmbeddingDimensions,
-		&document.ChunkCount, &document.CreatedAt, &document.UpdatedAt,
+		&document.ID, &document.VersionGroupID, &document.Version, &document.IsLatest,
+		&document.Name, &document.SourceType, &document.MIMEType, &document.ContentHash,
+		&document.OwnerID, &document.Visibility, &document.EmbeddingModel,
+		&document.EmbeddingDimensions, &document.ChunkCount, &document.CreatedAt, &document.UpdatedAt,
 	); err != nil {
 		return knowledge.Document{}, err
 	}
 	document.CreatedAt = normalizeTime(document.CreatedAt)
 	document.UpdatedAt = normalizeTime(document.UpdatedAt)
 	return document, nil
+}
+
+type knowledgeDocumentRows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}
+
+func scanKnowledgeDocuments(rows knowledgeDocumentRows) ([]knowledge.Document, error) {
+	documents := make([]knowledge.Document, 0)
+	for rows.Next() {
+		document, err := scanKnowledgeDocument(rows)
+		if err != nil {
+			return nil, fmt.Errorf("读取知识库文档失败：%w", err)
+		}
+		documents = append(documents, document)
+	}
+	return documents, rows.Err()
 }
 
 func buildSearchTerms(counts map[string]int) string {

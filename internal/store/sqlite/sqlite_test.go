@@ -12,11 +12,51 @@ import (
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/domain"
+	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
+
+func TestOpenMigratesKnowledgeVersionAndACLColumns(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "legacy-knowledge.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = legacy.Exec(`
+CREATE TABLE knowledge_documents (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, source_type TEXT NOT NULL, mime_type TEXT NOT NULL,
+  content_hash TEXT NOT NULL UNIQUE, embedding_model TEXT NOT NULL, embedding_dimensions INTEGER NOT NULL,
+  chunk_count INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+INSERT INTO knowledge_documents(id, name, source_type, mime_type, content_hash, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at)
+VALUES('doc_legacy', '旧知识.md', 'upload', 'text/markdown', 'legacy-hash', 'zora-hash-128-v1', 128, 0, ?, ?);`, now, now)
+	if err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	documents, err := database.ListDocuments(context.Background(), "local-user", false, 10)
+	if err != nil || len(documents) != 1 {
+		t.Fatalf("migrated documents = %+v, %v", documents, err)
+	}
+	got := documents[0]
+	if got.VersionGroupID != got.ID || got.Version != 1 || !got.IsLatest || got.OwnerID != "local-user" || got.Visibility != knowledge.VisibilityPrivate {
+		t.Fatalf("migrated document metadata = %+v", got)
+	}
+}
 
 func TestOpenMigratesV03MemoryColumns(t *testing.T) {
 	t.Parallel()

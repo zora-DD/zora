@@ -98,6 +98,7 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	}
 	mux.HandleFunc("GET /api/knowledge/documents", server.listKnowledgeDocuments)
 	mux.HandleFunc("POST /api/knowledge/documents", server.uploadKnowledgeDocument)
+	mux.HandleFunc("GET /api/knowledge/documents/{documentID}/versions", server.listKnowledgeDocumentVersions)
 	mux.HandleFunc("DELETE /api/knowledge/documents/{documentID}", server.deleteKnowledgeDocument)
 	mux.HandleFunc("POST /api/knowledge/search", server.searchKnowledge)
 	mux.HandleFunc("GET /api/memories", server.listMemories)
@@ -344,7 +345,7 @@ func (s *Server) listKnowledgeDocuments(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) uploadKnowledgeDocument(w http.ResponseWriter, r *http.Request) {
-	// V0.2 先限制为 5 MiB 纯文本；多出的 1 MiB 留给 multipart 边界和表单字段。
+	// 原始文件限制为 5 MiB；多出的 1 MiB 留给 multipart 边界和表单字段。
 	r.Body = http.MaxBytesReader(w, r.Body, 6<<20)
 	if err := r.ParseMultipartForm(6 << 20); err != nil {
 		s.problem(w, fmt.Errorf("multipart 上传请求无效：%w", err))
@@ -361,8 +362,8 @@ func (s *Server) uploadKnowledgeDocument(w http.ResponseWriter, r *http.Request)
 	defer file.Close()
 
 	extension := strings.ToLower(filepath.Ext(header.Filename))
-	if extension != ".txt" && extension != ".md" && extension != ".markdown" {
-		s.problem(w, fmt.Errorf("仅支持 .txt、.md 和 .markdown 文件"))
+	if extension != ".txt" && extension != ".md" && extension != ".markdown" && extension != ".pdf" {
+		s.problem(w, fmt.Errorf("仅支持 .txt、.md、.markdown 和 .pdf 文件"))
 		return
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, (5<<20)+1))
@@ -376,14 +377,17 @@ func (s *Server) uploadKnowledgeDocument(w http.ResponseWriter, r *http.Request)
 	}
 	mimeType := header.Header.Get("Content-Type")
 	if mimeType == "" || mimeType == "application/octet-stream" {
-		if extension == ".md" || extension == ".markdown" {
+		if extension == ".pdf" {
+			mimeType = "application/pdf"
+		} else if extension == ".md" || extension == ".markdown" {
 			mimeType = "text/markdown"
 		} else {
 			mimeType = "text/plain"
 		}
 	}
 	result, err := s.knowledge.Ingest(r.Context(), knowledge.IngestInput{
-		Name: name, SourceType: "upload", MIMEType: mimeType, Content: contents,
+		Name: name, SourceType: "upload", MIMEType: mimeType,
+		Visibility: r.FormValue("visibility"), Content: contents,
 	})
 	if err != nil {
 		s.problem(w, err)
@@ -394,6 +398,15 @@ func (s *Server) uploadKnowledgeDocument(w http.ResponseWriter, r *http.Request)
 		status = http.StatusOK
 	}
 	writeJSON(w, status, result)
+}
+
+func (s *Server) listKnowledgeDocumentVersions(w http.ResponseWriter, r *http.Request) {
+	documents, err := s.knowledge.ListDocumentVersions(r.Context(), r.PathValue("documentID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"documents": documents})
 }
 
 func (s *Server) deleteKnowledgeDocument(w http.ResponseWriter, r *http.Request) {
@@ -699,6 +712,8 @@ func (s *Server) problem(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) || errors.Is(err, summary.ErrNotFound) {
 		status = http.StatusNotFound
+	} else if errors.Is(err, knowledge.ErrAccessDenied) {
+		status = http.StatusForbidden
 	} else if errors.Is(err, knowledge.ErrEmbeddingMismatch) || errors.Is(err, office.ErrStateConflict) {
 		status = http.StatusConflict
 	} else if errors.Is(err, office.ErrExecutorUnavailable) {

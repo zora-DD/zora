@@ -39,3 +39,18 @@ func TestChunkTextRejectsBlankDocument(t *testing.T) {
 		t.Fatal("expected blank document error")
 	}
 }
+
+func TestChunkTextPrefersMarkdownHeadingBoundary(t *testing.T) {
+	t.Parallel()
+	input := strings.Repeat("前", 88) + "\n\n## 新章节\n" + strings.Repeat("后", 80)
+	chunks, err := ChunkText(input, ChunkOptions{MaxRunes: 100, OverlapRunes: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("chunk count = %d, want at least 2", len(chunks))
+	}
+	if strings.Contains(chunks[0].Content, "新章节") || !strings.Contains(chunks[1].Content, "## 新章节") {
+		t.Fatalf("heading boundary was not preserved: %+v", chunks[:2])
+	}
+}

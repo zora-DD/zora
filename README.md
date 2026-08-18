@@ -4,7 +4,7 @@
 
 Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产品的核心工程能力：工具调用、执行审计、向量知识库、长期记忆、多 Agent、人工审批和办公连接器。
 
-当前版本：**V0.5 Office Agent（第六阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已形成 SQLite/PostgreSQL 双后端 RAG 主链路；V0.5 已交付官方 MCP Client、文件与 Microsoft Graph 只读连接器、持久化草稿、人工确认、可恢复 Office Operation，以及显式启用的 Microsoft Graph 写执行器。写执行器默认关闭；当前已通过本地协议与故障注入测试，尚未使用真实 Microsoft 租户做在线验收。
+当前版本：**V0.5 Office Agent（第六阶段）**。V0.1 Agent Core、V0.3 长期记忆和 V0.4 Multi-Agent 已完成；V0.2 已补齐文档版本、PDF 文本层解析、递归字符切块和文档级 ACL；V0.5 已交付官方 MCP Client、文件与 Microsoft Graph 只读连接器、持久化草稿、人工确认、可恢复 Office Operation，以及显式启用的 Microsoft Graph 写执行器。写执行器默认关闭；当前已通过本地协议与故障注入测试，尚未使用真实 Microsoft 租户做在线验收。
 
 ## 当前能力
 
@@ -18,10 +18,10 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 持久化 | 已完成 | SQLite 或 PostgreSQL 保存 Conversation、Message、AgentRun 和 RunEvent |
 | 执行审计 | 已完成 | ToolCall、ToolResult、完成、失败和取消事件 |
 | Web UI | 已完成 | 内嵌响应式页面，不需要 Node.js 部署 |
-| 知识库 MVP | 已完成 | TXT/Markdown、哈希去重、重叠分块、Embedding 抽象、向量 + BM25/RRF、引用 |
+| 知识库 MVP | 已完成 | TXT/Markdown/PDF 文本层、哈希去重、版本链、递归重叠分块、Embedding、向量 + BM25/RRF、引用 |
 | RAG 检索与答案评测 | 已完成 | 对比三路召回，并通过真实 Agent 链路评估事实覆盖、有效引用覆盖和引用忠实度 |
 | PostgreSQL 向量库 | 已实现 | pgx 连接池、幂等迁移、pgvector HNSW、PostgreSQL FTS、RRF 候选融合 |
-| 生产知识库剩余项 | V0.2 进行中 | 文档权限、版本、PDF、更强语义评测和真实数据验收 |
+| 知识库权限与版本 | 已完成 | 服务端可信主体、private/public 过滤、最新版检索、删除最新版自动回退；尚无完整登录/租户系统 |
 | 长期记忆底座 | 已完成 | Semantic/Episodic Schema、重要性、来源、过期时间、SQLite/PostgreSQL 和用户 CRUD |
 | 自动记忆写入 | 已完成 | 真实模型结构化提取、本地规则提取、Memory Key 去重/冲突合并、人工修正保护和 Run 审计 |
 | 记忆召回与注入 | 已完成 | 词项相关性 + 重要性 + 时效性联合评分、Top-K 安全上下文和 Run 审计 |
@@ -47,6 +47,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 - **框架复用、业务自研**：Eino 负责 ReAct、Tool 和模型事件；会话、Run、审计及后续 RAG/Memory 机制由项目控制。
 - **Mock 不绕过 Agent**：无密钥模式仍经过 Eino ChatModelAgent 和 ToolNode，可稳定测试完整链路。
 - **RAG 召回可解释**：同时保留向量相似度、BM25 得分和 RRF 融合结果，每条证据可追溯到文档和字符区间。
+- **知识版本与 ACL 进入检索层**：相同 owner + 文档名形成版本组，默认只召回最新版；private/public 在列表、版本读取和候选 SQL 中统一过滤，客户端不能伪造 owner。
 - **检索效果可回归**：固定评测集在隔离数据库中重建语料，分别测量 vector、keyword 和 hybrid，避免算法升级只凭主观体验。
 - **双存储后端**：SQLite 保留零依赖精确扫描；PostgreSQL 将向量和全文候选召回下推数据库，HTTP 与 Agent Tool 契约保持不变。
 - **Embedding 可替换**：默认 Hash Embedding 零密钥运行；生产可切换 OpenAI-compatible Embedding。
@@ -228,7 +229,7 @@ make run
 
 启用后，Web 执行按钮才会出现。邮件执行先调用 Graph 创建草稿，随后把不可变邮件 ID 写入 `office_operations.external_reference` 和审计事件；只有该事务成功后才调用发送。发送失败或进程重启时复用同一远端草稿，并先核对 `isDraft`，避免重复发送。日程从 Operation 幂等键派生固定 UUID 作为 `transactionId`，重试时不创建第二个事件。默认 `disabled` 模式以及本地 Mock 都不会伪造外部成功。
 
-点击侧边栏的“知识库”可上传 UTF-8 编码的 `.txt` / `.md` / `.markdown` 文件（单文件最大 5 MiB）。上传后可以询问：
+点击侧边栏的“知识库”可上传 UTF-8 编码的 `.txt` / `.md` / `.markdown`，或带文本层的 `.pdf` 文件（单文件最大 5 MiB，当前不含 OCR），并选择“仅自己”或“所有用户”。同一主体使用相同显示名再次上传会生成新版本；列表和问答只使用最新版，删除最新版后恢复上一版本。上传后可以询问：
 
 ```text
 根据我上传的文档，项目的发布日期和上线要求是什么？
@@ -332,6 +333,7 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_EMBEDDING_DIMENSIONS` | hash: `384`；openai: `1024` | 向量维度，变更后需重建旧索引 |
 | `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 每个分块的 Unicode 字符上限 |
 | `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 相邻分块重叠字符数 |
+| `ZORA_KNOWLEDGE_PRINCIPAL_ID` | `local-user` | 单用户部署的服务端可信知识库主体；不能由上传表单覆盖 |
 | `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 成功回答后是否自动提取并合并长期记忆 |
 | `ZORA_MEMORY_MAX_CANDIDATES` | `3` | 单轮最多候选数，范围 1–10 |
 | `ZORA_MEMORY_RECALL_ENABLED` | `true` | 是否在回答前召回并注入相关记忆，可独立关闭做 A/B |
@@ -458,8 +460,9 @@ sequenceDiagram
 | `GET` | `/api/approvals` | 审批开启时查询记录，可通过 `status` 和 `limit` 筛选 |
 | `POST` | `/api/approvals/{id}/decision` | 审批开启时提交 `approved` 或 `rejected` 决定并恢复等待中的 Run |
 | `GET` | `/api/knowledge/documents` | 查询已索引文档 |
-| `POST` | `/api/knowledge/documents` | multipart 上传 TXT/Markdown 并同步索引 |
-| `DELETE` | `/api/knowledge/documents/{id}` | 删除文档及其分块 |
+| `POST` | `/api/knowledge/documents` | multipart 上传 TXT/Markdown/PDF，设置 private/public 并同步索引 |
+| `GET` | `/api/knowledge/documents/{id}/versions` | 查询当前主体可见的文档版本链 |
+| `DELETE` | `/api/knowledge/documents/{id}` | owner 删除指定版本；若为最新版则恢复上一版 |
 | `POST` | `/api/knowledge/search` | 执行向量 + BM25/RRF 混合检索 |
 | `GET` | `/api/memories` | 查询长期记忆，可按类型筛选并选择是否包含已过期项 |
 | `POST` | `/api/memories` | 手动创建 Semantic/Episodic 记忆 |
@@ -602,7 +605,7 @@ V0.4 已实现 Supervisor、专业 Agent、执行治理和 Control/Treatment 对
 ## Roadmap
 
 - V0.1：Agent Core——已完成
-- V0.2：向量知识库与 RAG——主链路已实现，生产增强项继续迭代
+- V0.2：向量知识库与 RAG——工程清单已完成；真实语义样本仍需证明混合召回收益
 - V0.3：长期记忆——Schema、双存储、用户 CRUD、自动写入、Consolidation、召回注入、会话摘要和 A/B 门禁已完成
 - V0.4：多 Agent——Supervisor、专业 Agent、并行/执行治理、父子 Run、人工审批和单/多 Agent 对照已完成
 - V0.5：MCP 办公助手——只读连接器、持久化草稿、人工确认、可恢复 Operation 和 Graph 写适配已完成；继续完成 OAuth/Secret、最小权限部署与真实租户验收

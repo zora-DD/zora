@@ -143,7 +143,7 @@ func run(logger *slog.Logger) error {
 	}
 	knowledgeService, err := knowledge.NewService(database, embedder, knowledge.ChunkOptions{
 		MaxRunes: cfg.KnowledgeChunkSize, OverlapRunes: cfg.KnowledgeOverlap,
-	})
+	}, knowledge.WithPrincipal(cfg.KnowledgePrincipalID))
 	if err != nil {
 		return err
 	}

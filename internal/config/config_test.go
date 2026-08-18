@@ -23,6 +23,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if cfg.KnowledgeChunkSize != 800 || cfg.KnowledgeOverlap != 120 {
 		t.Fatalf("unexpected chunk defaults: %+v", cfg)
 	}
+	if cfg.KnowledgePrincipalID != "local-user" {
+		t.Fatalf("knowledge principal = %q, want local-user", cfg.KnowledgePrincipalID)
+	}
 	if !cfg.MemoryAutoCapture || cfg.MemoryMaxCandidates != 3 {
 		t.Fatalf("unexpected memory defaults: %+v", cfg)
 	}
@@ -167,7 +170,7 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_STORE_PROVIDER", "ZORA_POSTGRES_DSN", "ZORA_POSTGRES_MAX_CONNS",
 		"ZORA_EMBEDDING_PROVIDER", "ZORA_EMBEDDING_MODEL", "ZORA_EMBEDDING_API_KEY",
 		"ZORA_EMBEDDING_BASE_URL", "ZORA_EMBEDDING_DIMENSIONS", "ZORA_KNOWLEDGE_CHUNK_SIZE",
-		"ZORA_KNOWLEDGE_CHUNK_OVERLAP",
+		"ZORA_KNOWLEDGE_CHUNK_OVERLAP", "ZORA_KNOWLEDGE_PRINCIPAL_ID",
 		"ZORA_MEMORY_AUTO_CAPTURE", "ZORA_MEMORY_MAX_CANDIDATES",
 		"ZORA_MEMORY_RECALL_ENABLED", "ZORA_MEMORY_RECALL_LIMIT", "ZORA_MEMORY_RECALL_MIN_SCORE",
 		"ZORA_SUMMARY_ENABLED", "ZORA_SUMMARY_TRIGGER_MESSAGES", "ZORA_SUMMARY_KEEP_RECENT", "ZORA_SUMMARY_MAX_RUNES",
