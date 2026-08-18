@@ -165,6 +165,8 @@ flowchart TD
 | `ZORA_MODEL` | `qwen-plus` | openai 模式需要 | 模型名称 |
 | `ZORA_API_KEY` | 空 | openai 模式必填 | 模型服务密钥 |
 | `ZORA_BASE_URL` | 空 | 视 Provider 而定 | OpenAI-compatible 地址 |
+| `ZORA_MODELS_JSON` | 空 | 否 | 最多 20 个模型配置；配置后启用请求级选择并覆盖单模型入口 |
+| `ZORA_DEFAULT_MODEL_ID` | 第一项 | 多模型时可选 | 默认 Agent、自动记忆提取和摘要使用的模型配置 ID |
 | `ZORA_SYSTEM_PROMPT` | 内置中文指令 | 否 | Agent 系统指令 |
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 否 | 整次消息请求与模型客户端超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | 否 | ReAct 最大迭代，允许范围 1–50 |
@@ -217,6 +219,7 @@ flowchart TD
 配置原则：
 
 - 密钥只通过环境变量传入；
+- 多模型 JSON 只允许 `api_key_env` 引用密钥环境变量，显式拒绝内嵌 `api_key`；公开接口不返回 BaseURL 和密钥来源；
 - MCP 子进程只继承 `pass_env`，配置层禁止透传模型 Key、Embedding Key 和数据库 DSN；
 - 启动时校验 Provider 和 API Key 组合；
 - BaseURL 会移除末尾 `/`，降低路径拼接差异；
@@ -807,7 +810,7 @@ GET /api/health
 GET /api/info
 ```
 
-返回版本、Provider、Model、根 `agent_name`、`multi_agent` 开关和已启用能力。开启多 Agent 时 capabilities 增加 `supervisor`、`specialist-agents` 和 `agent-handoff-audit`。
+返回版本、默认 Provider/Model、`models` 安全模型元数据、`default_model_id`、根 `agent_name`、`multi_agent` 开关和已启用能力。模型元数据只包含 ID、展示名、Provider 和模型名，不返回 BaseURL、密钥环境变量名或 API Key。开启多 Agent 时 capabilities 增加 `supervisor`、`specialist-agents` 和 `agent-handoff-audit`。
 
 ### 10.3 创建对话
 
@@ -883,8 +886,10 @@ POST /api/conversations/{conversationID}/messages
 Accept: text/event-stream
 Content-Type: application/json
 
-{"content":"帮我计算 (128 + 72) * 3.5"}
+{"content":"帮我计算 (128 + 72) * 3.5","model_id":"deepseek-flash"}
 ```
+
+`model_id` 可选；缺省时使用 `ZORA_DEFAULT_MODEL_ID`。不存在的 ID 在创建用户消息和 Run 前即被拒绝。每次 Run 保存实际模型名，`run_started` 额外记录安全的模型配置 ID 与 Provider。
 
 SSE 示例：
 

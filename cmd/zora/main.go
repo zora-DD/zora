@@ -47,6 +47,15 @@ func main() {
 	}
 }
 
+func configForModel(base config.Config, profile config.ModelProfile) config.Config {
+	base.Provider = profile.Provider
+	base.Model = profile.Model
+	base.APIKey = profile.APIKey
+	base.BaseURL = profile.BaseURL
+	base.ModelExtraFields = profile.ExtraFields
+	return base
+}
+
 func run(logger *slog.Logger) error {
 	// 启动顺序遵循“配置 -> 持久化 -> 工具/Runtime -> HTTP”，任一步失败都立即退出。
 	cfg, err := config.Load()
@@ -181,24 +190,51 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	var runtime *agentruntime.Runtime
-	if cfg.MultiAgentEnabled {
-		// Supervisor 只看得到三个专业 Agent；文件、邮件、日历等 MCP 只读工具归 Document，不向 Research 扩权。
-		runtime, err = agentruntime.NewMultiAgentWithModel(context.Background(), cfg, agentruntime.SpecialistToolset{
-			Research: registeredTools,
-			Document: append([]tool.BaseTool{knowledgeTool}, mcpTools...),
-			Writer:   draftTools,
-		}, chatModel)
-	} else {
-		singleAgentTools := append(append([]tool.BaseTool{}, registeredTools...), mcpTools...)
-		singleAgentTools = append(singleAgentTools, knowledgeTool)
-		singleAgentTools = append(singleAgentTools, draftTools...)
-		runtime, err = agentruntime.NewWithModel(context.Background(), cfg, singleAgentTools, chatModel)
+	runtimeProfiles := make([]chat.RuntimeProfile, 0, len(cfg.ModelProfiles))
+	var defaultRuntime *agentruntime.Runtime
+	for _, profile := range cfg.ModelProfiles {
+		profileConfig := configForModel(cfg, profile)
+		profileChatModel := chatModel
+		if profile.ID != cfg.DefaultModelID {
+			profileChatModel, err = agentruntime.NewChatModel(context.Background(), profileConfig)
+			if err != nil {
+				return fmt.Errorf("创建模型配置 %s 失败：%w", profile.ID, err)
+			}
+		}
+		var profileRuntime *agentruntime.Runtime
+		if cfg.MultiAgentEnabled {
+			// Supervisor 只看得到三个专业 Agent；文件、邮件、日历等 MCP 只读工具归 Document，不向 Research 扩权。
+			profileRuntime, err = agentruntime.NewMultiAgentWithModel(context.Background(), profileConfig, agentruntime.SpecialistToolset{
+				Research: registeredTools,
+				Document: append([]tool.BaseTool{knowledgeTool}, mcpTools...),
+				Writer:   draftTools,
+			}, profileChatModel)
+		} else {
+			singleAgentTools := append(append([]tool.BaseTool{}, registeredTools...), mcpTools...)
+			singleAgentTools = append(singleAgentTools, knowledgeTool)
+			singleAgentTools = append(singleAgentTools, draftTools...)
+			profileRuntime, err = agentruntime.NewWithModel(context.Background(), profileConfig, singleAgentTools, profileChatModel)
+		}
+		if err != nil {
+			return fmt.Errorf("装配模型配置 %s 的 Agent Runtime 失败：%w", profile.ID, err)
+		}
+		if profile.ID == cfg.DefaultModelID {
+			defaultRuntime = profileRuntime
+		}
+		runtimeProfiles = append(runtimeProfiles, chat.RuntimeProfile{
+			ModelProfile: chat.ModelProfile{
+				ID: profile.ID, Name: profile.Name, Provider: profile.Provider, Model: profile.Model,
+			},
+			Runtime: profileRuntime,
+		})
 	}
-	if err != nil {
-		return err
+	if defaultRuntime == nil {
+		return fmt.Errorf("默认模型配置 %q 未完成 Runtime 装配", cfg.DefaultModelID)
 	}
-	chatOptions := []chat.Option{chat.WithMemoryCapturer(memoryService)}
+	chatOptions := []chat.Option{
+		chat.WithMemoryCapturer(memoryService),
+		chat.WithRuntimeProfiles(cfg.DefaultModelID, runtimeProfiles),
+	}
 	var approvalService *approval.Service
 	if cfg.MultiAgentEnabled && cfg.MultiAgentApprovalMode != approval.ModeOff {
 		approvalService, err = approval.NewService(database, approval.Options{
@@ -233,7 +269,7 @@ func run(logger *slog.Logger) error {
 		}
 		chatOptions = append(chatOptions, chat.WithConversationSummarizer(summaryService))
 	}
-	chatService := chat.NewService(database, runtime, chatOptions...)
+	chatService := chat.NewService(database, defaultRuntime, chatOptions...)
 	httpOptions := make([]httpapi.Option, 0, 3)
 	if approvalService != nil {
 		httpOptions = append(httpOptions, httpapi.WithApprovalService(approvalService))
@@ -260,6 +296,7 @@ func run(logger *slog.Logger) error {
 	go func() {
 		logger.Info("Zora 已就绪", "监听地址", cfg.Addr, "存储", cfg.StoreProvider,
 			"模型提供方", cfg.Provider, "模型", cfg.Model,
+			"模型配置数", len(cfg.ModelProfiles), "默认模型ID", cfg.DefaultModelID,
 			"向量提供方", cfg.EmbeddingProvider, "向量模型", embedder.Name(),
 			"自动记忆", cfg.MemoryAutoCapture, "记忆召回", cfg.MemoryRecallEnabled,
 			"会话摘要", cfg.SummaryEnabled, "多Agent", cfg.MultiAgentEnabled,

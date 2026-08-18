@@ -37,6 +37,8 @@ V0.1 直接使用 `ChatModelAgent + Runner`，以获得：
 
 项目保留自己的 `agentruntime.Event`，避免上层被某个 Eino 版本的数据结构锁死。Eino 当前固定在稳定版本，升级必须先通过现有集成测试。
 
+启动时可以从 `ZORA_MODELS_JSON` 为每个模型配置装配独立 Runtime，Chat 以安全 `model_id` 做请求级路由；未配置时仍保留单 Runtime。API 只公开模型展示元数据，密钥由各配置的 `api_key_env` 从服务端环境读取。自动记忆提取和摘要使用默认模型，避免后台增强链路随页面选择漂移并产生不可预测成本。
+
 ## 3. 数据模型
 
 ### Conversation / Message

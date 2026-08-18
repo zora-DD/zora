@@ -1,9 +1,15 @@
 .PHONY: run run-postgres build-mcp-files build-mcp-microsoft build-mcp-connectors postgres-up postgres-down test-postgres eval-rag eval-memory eval-agents test fmt vet check
 
 run:
+	@set -a; \
+	if [ -f .env.local ]; then . ./.env.local; elif [ -f .env ]; then . ./.env; fi; \
+	set +a; \
 	go run ./cmd/zora
 
 run-postgres:
+	@set -a; \
+	if [ -f .env.local ]; then . ./.env.local; elif [ -f .env ]; then . ./.env; fi; \
+	set +a; \
 	ZORA_STORE_PROVIDER=postgres \
 	ZORA_POSTGRES_DSN='postgres://zora:zora@localhost:54328/zora?sslmode=disable' \
 	go run ./cmd/zora

@@ -121,6 +121,7 @@ Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可�
 | 流式交互 | 已实现 | SSE 增量文本、工具轨迹、停止生成 |
 | Agent Runtime | 已实现 | Eino ReAct、最大迭代、上下文传递 |
 | 模型接入 | 已实现 | Mock 与 OpenAI-compatible Provider |
+| 多模型配置与选择 | 已实现 | 最多 20 个安全模型配置、环境变量密钥引用、请求级 Web/API 选择和实际模型 Run 审计 |
 | 工具系统 | 已实现 | 三个内置只读工具、知识库工具；MCP 工具使用 Server 名称空间、显式 allowlist 和 Schema 转换 |
 | 执行审计 | 已实现 | AgentRun 与 append-only RunEvent |
 | 本地持久化 | 已实现 | SQLite、WAL、事务与级联删除 |

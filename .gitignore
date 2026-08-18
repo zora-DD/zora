@@ -1,6 +1,7 @@
 .env
+.env.local
+.env.*.local
 .DS_Store
 /bin/
 /data/
 /coverage.out
-

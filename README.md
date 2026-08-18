@@ -13,6 +13,7 @@ Zora 的目标不是只提供一个聊天页面，而是逐步实现 Agent 产�
 | 流式对话 | 已完成 | SSE 增量回复、停止生成、超时取消 |
 | ReAct Agent | 已完成 | Eino ChatModelAgent、工具循环、最大迭代 |
 | 模型接入 | 已完成 | 本地 Mock、OpenAI-compatible、通义千问 |
+| 多模型选择 | 已完成 | 环境变量安全注册多个模型，Web 按消息切换，Run 记录实际模型；密钥不进入浏览器 |
 | 工具系统 | 已完成 | 三个内置只读工具、知识库工具和两个内部草稿工具；MCP 工具通过 Server 名称空间与本地白名单动态追加 |
 | 对话管理 | 已完成 | 创建、列表、自动标题、重命名、删除 |
 | 持久化 | 已完成 | SQLite 或 PostgreSQL 保存 Conversation、Message、AgentRun 和 RunEvent |
@@ -282,6 +283,21 @@ PostgreSQL 模式使用 HNSW 余弦向量索引和 GIN 全文索引生成两路�
 
 修改 `ZORA_EMBEDDING_DIMENSIONS` 后，现有 `vector(N)` 列不会被静默改写。服务会在启动时拒绝维度不一致的数据库，需要先迁移或重建知识索引。
 
+## 配置多个模型并自由切换
+
+`ZORA_MODELS_JSON` 可以注册最多 20 个模型配置，Web 顶部选择器会把 `model_id` 随每条消息发送。JSON 只能引用保存密钥的环境变量名，禁止内嵌 API Key。未配置该变量时，原有 `ZORA_MODEL_PROVIDER` 等单模型配置继续生效。
+
+DeepSeek V4 默认开启思考模式；当前 Zora 的 OpenAI-compatible 工具链尚未持久化并回传 `reasoning_content`，因此下面配置显式关闭思考模式，避免工具调用后的下一轮请求返回 400：
+
+```bash
+export DEEPSEEK_API_KEY='替换为轮换后的新 Key'
+export ZORA_DEFAULT_MODEL_ID='deepseek-flash'
+export ZORA_MODELS_JSON='[{"id":"local-mock","name":"本地 Mock","provider":"mock"},{"id":"deepseek-flash","name":"DeepSeek V4 Flash","provider":"openai","model":"deepseek-v4-flash","base_url":"https://api.deepseek.com","api_key_env":"DEEPSEEK_API_KEY","extra_fields":{"thinking":{"type":"disabled"}}},{"id":"deepseek-pro","name":"DeepSeek V4 Pro","provider":"openai","model":"deepseek-v4-pro","base_url":"https://api.deepseek.com","api_key_env":"DEEPSEEK_API_KEY","extra_fields":{"thinking":{"type":"disabled"}}}]'
+make run
+```
+
+模型选择作用于当前消息的 Agent Runtime，实际模型名会写入 AgentRun。自动记忆提取和会话摘要固定使用服务端默认模型，避免一次请求意外产生多套后台模型费用。浏览器只保存模型 ID，不接触 API Key。
+
 ## 接入通义千问
 
 Zora 使用 OpenAI-compatible 模型协议：
@@ -326,6 +342,8 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_MODEL` | `qwen-plus` | 真实模型名称 |
 | `ZORA_API_KEY` | 空 | openai 模式必填 |
 | `ZORA_BASE_URL` | 空 | OpenAI-compatible API 地址 |
+| `ZORA_MODELS_JSON` | 空 | 可选多模型 JSON；每项包含 id/name/provider/model/base_url/api_key_env/extra_fields，配置后覆盖单模型入口 |
+| `ZORA_DEFAULT_MODEL_ID` | 第一项 | 默认 Agent、记忆提取和摘要使用的模型配置 ID |
 | `ZORA_SYSTEM_PROMPT` | 内置中文指令 | Agent 系统指令 |
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 单次 Agent 请求超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | ReAct 最大迭代，范围 1–50 |
@@ -374,7 +392,7 @@ Embedding 配置默认复用上面的 DashScope Key 和 BaseURL，也可通过 `
 | `ZORA_OFFICE_MICROSOFT_*` | 空 | writer 独立 tenant/client/secret-file/user 配置，字段后缀与 reader 相同 |
 | `ZORA_OFFICE_MICROSOFT_WRITE_ENABLED` | `false` | Graph 执行器启用时必须同时显式设为 true |
 
-配置模板见 [.env.example](.env.example)。项目不会自动读取 `.env`；生产环境应通过容器、Secret 或部署平台注入环境变量。
+配置模板见 [.env.example](.env.example)。本地开发可执行 `cp .env.example .env.local`，然后只在 `.env.local` 中填写真实密钥；该文件已被 Git 忽略。`make run` 会优先加载 `.env.local`，其次加载 `.env`；直接执行 `go run ./cmd/zora` 不会自动加载文件。生产环境仍应通过容器、Secret 或部署平台注入环境变量。
 
 ## Docker
 
@@ -472,7 +490,7 @@ sequenceDiagram
 | `DELETE` | `/api/conversations/{id}` | 删除对话及关联数据 |
 | `GET` | `/api/conversations/{id}/messages` | 查询消息历史 |
 | `GET` | `/api/conversations/{id}/summary` | 查询当前增量会话摘要及覆盖范围 |
-| `POST` | `/api/conversations/{id}/messages` | 发送消息并接收 SSE |
+| `POST` | `/api/conversations/{id}/messages` | 发送 `content` 和可选 `model_id`，并接收 SSE |
 | `GET` | `/api/runs?limit=20` | 查询最近 Run 及聚合后的延迟、Token、工具和 Agent 交接指标，最多 100 条 |
 | `GET` | `/api/runs/{id}/metrics` | 查询单个 Run 与可重建运行指标 |
 | `GET` | `/api/runs/{id}/events` | 查询持久执行事件 |
@@ -516,6 +534,7 @@ cmd/zora-agent-eval/       隔离运行多 Agent 路由与协作评测
 cmd/zora-mcp-files/        只读文件 MCP stdio Server 入口
 cmd/zora-mcp-microsoft/    Microsoft Graph 邮件/日历只读 MCP Server 入口
 evals/                     可版本化的 RAG/Memory/Multi-Agent 数据、锚点与阈值
+testdata/knowledge/         可直接上传的手工测试知识文档
 internal/config/           环境配置与启动校验
 internal/domain/           Conversation、Message、Run、Event
 internal/observability/    RunEvent 指标聚合、Token 完整性和耗时计算
@@ -594,6 +613,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - Microsoft Graph 请求鉴权、查询时间窗、本地关键词过滤、默认只读工具集、OAuth 缓存/刷新、Secret 文件轮换、401 重试、错误脱敏和 Agent 中文结果整理。
 - 邮件/日程草稿参数校验、可信 Run 来源、内容哈希幂等、双数据库生命周期、Agent/Writer 路由、REST API、Web 草稿箱和一次性人工确认状态机。
 - Provider Token Usage 透传、Mock 缺失标记、TTFT/工具耗时事件、SQLite/PostgreSQL Run 查询、聚合 API、SSE 指标和 Web 监控入口。
+- 多模型配置校验、密钥环境变量引用、请求级模型选择、Run 实际模型审计和 Web 选择器。
 
 ## 文档导航
 
@@ -602,6 +622,9 @@ CGO_ENABLED=0 go build ./cmd/zora
 - [架构说明](docs/architecture.md)：当前边界及 RAG、Memory、Multi-Agent 接入点的简版说明。
 - [Roadmap](docs/roadmap.md)：各版本任务、状态和验收条件。
 - [Microsoft Entra 部署 Runbook](docs/microsoft-entra-deployment.md)：双应用、最小权限、Secret 和真实租户验收步骤。
+- [手工测试指南](docs/manual-test-guide.md)：多模型、RAG、记忆、多 Agent、安全和可观测性测试用例。
+- [星舟计划测试资料](testdata/knowledge/星舟计划测试资料.md)：可直接上传到知识库的冲突事实与 Prompt Injection 测试语料。
+- [调试与上线资源清单](docs/resource-preparation.md)：真实模型、Embedding、数据库、Microsoft 365 等资源的必要性、获取顺序和成本边界。
 
 ## 常见问题
 

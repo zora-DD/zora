@@ -20,6 +20,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if cfg.Addr != ":8088" {
 		t.Fatalf("default addr = %q, want :8088", cfg.Addr)
 	}
+	if cfg.DefaultModelID != "default" || len(cfg.ModelProfiles) != 1 || cfg.ModelProfiles[0].Model != "zora-mock" {
+		t.Fatalf("unexpected model profile defaults: %+v", cfg.ModelProfiles)
+	}
 	if cfg.KnowledgeChunkSize != 800 || cfg.KnowledgeOverlap != 120 {
 		t.Fatalf("unexpected chunk defaults: %+v", cfg)
 	}
@@ -52,6 +55,35 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	}
 	if cfg.OfficeMicrosoftWrite {
 		t.Fatal("Microsoft write protocol must be disabled by default")
+	}
+}
+
+func TestLoadMultipleModelProfiles(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("DEEPSEEK_TEST_KEY", "test-key")
+	t.Setenv("ZORA_MODELS_JSON", `[
+		{"id":"local","name":"本地 Mock","provider":"mock"},
+		{"id":"deepseek-flash","name":"DeepSeek Flash","provider":"openai","model":"deepseek-v4-flash","base_url":"https://api.deepseek.com/","api_key_env":"DEEPSEEK_TEST_KEY","extra_fields":{"thinking":{"type":"disabled"}}}
+	]`)
+	t.Setenv("ZORA_DEFAULT_MODEL_ID", "deepseek-flash")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.ModelProfiles) != 2 || cfg.DefaultModelID != "deepseek-flash" || cfg.Model != "deepseek-v4-flash" || cfg.APIKey != "test-key" {
+		t.Fatalf("unexpected multiple model config: %+v", cfg)
+	}
+	thinking, ok := cfg.ModelExtraFields["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "disabled" {
+		t.Fatalf("unexpected DeepSeek extra fields: %#v", cfg.ModelExtraFields)
+	}
+}
+
+func TestLoadModelProfilesRejectsInlineSecret(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ZORA_MODELS_JSON", `[{"id":"unsafe","provider":"openai","model":"example","api_key":"secret"}]`)
+	if _, err := Load(); err == nil {
+		t.Fatal("expected inline API key rejection")
 	}
 }
 
@@ -170,7 +202,7 @@ func clearEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		"ZORA_ADDR", "ZORA_DATA_DIR", "ZORA_MODEL_PROVIDER", "ZORA_MODEL", "ZORA_API_KEY",
-		"ZORA_BASE_URL", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
+		"ZORA_BASE_URL", "ZORA_MODELS_JSON", "ZORA_DEFAULT_MODEL_ID", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
 		"ZORA_MULTI_AGENT_ENABLED", "ZORA_MULTI_AGENT_MAX_HANDOFFS", "ZORA_MULTI_AGENT_MAX_PARALLEL",
 		"ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT", "ZORA_MULTI_AGENT_RETRY_COUNT",
 		"ZORA_MULTI_AGENT_APPROVAL_MODE", "ZORA_MULTI_AGENT_APPROVAL_TIMEOUT",

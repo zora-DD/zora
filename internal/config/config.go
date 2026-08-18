@@ -28,27 +28,42 @@ type MCPServerConfig struct {
 	PassEnv      []string `json:"pass_env"`
 }
 
+// ModelProfile 描述一个可在运行时选择的模型配置。
+// APIKey 只从 APIKeyEnv 指向的环境变量读取，不允许把密钥直接写进 JSON。
+type ModelProfile struct {
+	ID          string
+	Name        string
+	Provider    string
+	Model       string
+	APIKey      string
+	BaseURL     string
+	ExtraFields map[string]any
+}
+
 // Config 汇总服务启动所需的全部配置，避免业务代码直接读取环境变量。
 type Config struct {
-	Addr                        string        // HTTP 监听地址，例如 :8088。
-	DataDir                     string        // SQLite 等本地持久化文件的根目录。
-	StoreProvider               string        // sqlite 或 postgres；默认 sqlite 保持零依赖体验。
-	PostgresDSN                 string        // PostgreSQL 连接串，只允许通过环境变量注入。
-	PostgresMaxConns            int           // PostgreSQL 连接池最大连接数。
-	Provider                    string        // mock 或 openai；openai 兼容通义千问等接口。
-	Model                       string        // 发送给模型服务的模型名称。
-	APIKey                      string        // 仅从环境变量读取，禁止写入仓库。
-	BaseURL                     string        // OpenAI-compatible API 地址；留空时使用适配器默认值。
-	Instruction                 string        // Agent 的系统指令。
-	RequestTimeout              time.Duration // 单次模型请求和整条消息链路的超时上限。
-	MaxIterations               int           // ReAct 最大循环次数，防止模型无限调用工具。
-	MultiAgentEnabled           bool          // 是否启用 Supervisor + 专业 Agent；默认关闭以控制模型成本。
-	MultiAgentMaxHandoffs       int           // 单轮最多允许的专业 Agent 交接次数，避免失控循环。
-	MultiAgentMaxParallel       int           // 单轮专业 Agent 的最大并行数，限制瞬时模型请求压力。
-	MultiAgentSpecialistTimeout time.Duration // 每次专业 Agent 调用的独立超时时间。
-	MultiAgentRetryCount        int           // 专业 Agent 失败后的最大重试次数，不包含首次执行。
-	MultiAgentApprovalMode      string        // off、risky 或 all；控制人工审批触发范围。
-	MultiAgentApprovalTimeout   time.Duration // 等待人工审批的最长时间。
+	Addr                        string         // HTTP 监听地址，例如 :8088。
+	DataDir                     string         // SQLite 等本地持久化文件的根目录。
+	StoreProvider               string         // sqlite 或 postgres；默认 sqlite 保持零依赖体验。
+	PostgresDSN                 string         // PostgreSQL 连接串，只允许通过环境变量注入。
+	PostgresMaxConns            int            // PostgreSQL 连接池最大连接数。
+	Provider                    string         // mock 或 openai；openai 兼容通义千问等接口。
+	Model                       string         // 发送给模型服务的模型名称。
+	APIKey                      string         // 仅从环境变量读取，禁止写入仓库。
+	BaseURL                     string         // OpenAI-compatible API 地址；留空时使用适配器默认值。
+	ModelExtraFields            map[string]any // 供应商扩展请求字段，例如关闭 DeepSeek 思考模式。
+	ModelProfiles               []ModelProfile // 可以在每次请求中选择的模型列表。
+	DefaultModelID              string         // 未显式选择时使用的模型配置 ID。
+	Instruction                 string         // Agent 的系统指令。
+	RequestTimeout              time.Duration  // 单次模型请求和整条消息链路的超时上限。
+	MaxIterations               int            // ReAct 最大循环次数，防止模型无限调用工具。
+	MultiAgentEnabled           bool           // 是否启用 Supervisor + 专业 Agent；默认关闭以控制模型成本。
+	MultiAgentMaxHandoffs       int            // 单轮最多允许的专业 Agent 交接次数，避免失控循环。
+	MultiAgentMaxParallel       int            // 单轮专业 Agent 的最大并行数，限制瞬时模型请求压力。
+	MultiAgentSpecialistTimeout time.Duration  // 每次专业 Agent 调用的独立超时时间。
+	MultiAgentRetryCount        int            // 专业 Agent 失败后的最大重试次数，不包含首次执行。
+	MultiAgentApprovalMode      string         // off、risky 或 all；控制人工审批触发范围。
+	MultiAgentApprovalTimeout   time.Duration  // 等待人工审批的最长时间。
 
 	EmbeddingProvider    string // hash 用于本地开发，openai 用于真实语义向量。
 	EmbeddingModel       string // Embedding 模型名，如 text-embedding-v4。
@@ -285,16 +300,8 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("不支持的 ZORA_STORE_PROVIDER：%q，仅支持 sqlite 或 postgres", cfg.StoreProvider)
 	}
 
-	switch cfg.Provider {
-	case "mock":
-		// Mock 模式不依赖外部密钥，并固定模型名，便于测试结果可复现。
-		cfg.Model = "zora-mock"
-	case "openai":
-		if cfg.APIKey == "" {
-			return Config{}, fmt.Errorf("当 ZORA_MODEL_PROVIDER=openai 时，必须配置 ZORA_API_KEY")
-		}
-	default:
-		return Config{}, fmt.Errorf("不支持的 ZORA_MODEL_PROVIDER：%q，仅支持 mock 或 openai", cfg.Provider)
+	if err := configureModels(&cfg, os.Getenv("ZORA_MODELS_JSON"), os.Getenv("ZORA_DEFAULT_MODEL_ID")); err != nil {
+		return Config{}, err
 	}
 
 	switch cfg.EmbeddingProvider {
@@ -315,6 +322,135 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+type modelProfileInput struct {
+	ID          string         `json:"id"`
+	Name        string         `json:"name"`
+	Provider    string         `json:"provider"`
+	Model       string         `json:"model"`
+	APIKey      string         `json:"api_key"`
+	APIKeyEnv   string         `json:"api_key_env"`
+	BaseURL     string         `json:"base_url"`
+	ExtraFields map[string]any `json:"extra_fields"`
+}
+
+func configureModels(cfg *Config, raw, defaultID string) error {
+	if strings.TrimSpace(raw) == "" {
+		profile, err := buildModelProfile(modelProfileInput{
+			ID: "default", Provider: cfg.Provider, Model: cfg.Model,
+			APIKeyEnv: "ZORA_API_KEY", BaseURL: cfg.BaseURL,
+		})
+		if err != nil {
+			return err
+		}
+		cfg.ModelProfiles = []ModelProfile{profile}
+		cfg.DefaultModelID = profile.ID
+		applyDefaultModel(cfg, profile)
+		return nil
+	}
+
+	var inputs []modelProfileInput
+	if err := json.Unmarshal([]byte(raw), &inputs); err != nil {
+		return fmt.Errorf("ZORA_MODELS_JSON 必须是合法的 JSON 数组：%w", err)
+	}
+	if len(inputs) == 0 || len(inputs) > 20 {
+		return fmt.Errorf("ZORA_MODELS_JSON 必须包含 1 到 20 个模型配置")
+	}
+	profiles := make([]ModelProfile, 0, len(inputs))
+	seen := make(map[string]struct{}, len(inputs))
+	for _, input := range inputs {
+		profile, err := buildModelProfile(input)
+		if err != nil {
+			return err
+		}
+		if _, exists := seen[profile.ID]; exists {
+			return fmt.Errorf("模型配置 ID %q 重复", profile.ID)
+		}
+		seen[profile.ID] = struct{}{}
+		profiles = append(profiles, profile)
+	}
+	defaultID = strings.TrimSpace(defaultID)
+	if defaultID == "" {
+		defaultID = profiles[0].ID
+	}
+	var selected *ModelProfile
+	for index := range profiles {
+		if profiles[index].ID == defaultID {
+			selected = &profiles[index]
+			break
+		}
+	}
+	if selected == nil {
+		return fmt.Errorf("ZORA_DEFAULT_MODEL_ID=%q 不在 ZORA_MODELS_JSON 中", defaultID)
+	}
+	cfg.ModelProfiles = profiles
+	cfg.DefaultModelID = defaultID
+	applyDefaultModel(cfg, *selected)
+	return nil
+}
+
+func buildModelProfile(input modelProfileInput) (ModelProfile, error) {
+	input.ID = strings.TrimSpace(input.ID)
+	if !validConfigName(input.ID) {
+		return ModelProfile{}, fmt.Errorf("模型配置 ID %q 无效，只允许字母、数字、下划线和短横线，且必须以字母或数字开头", input.ID)
+	}
+	if strings.TrimSpace(input.APIKey) != "" {
+		return ModelProfile{}, fmt.Errorf("模型配置 %q 禁止在 JSON 中写 api_key，请改用 api_key_env", input.ID)
+	}
+	provider := strings.ToLower(strings.TrimSpace(input.Provider))
+	modelName := strings.TrimSpace(input.Model)
+	apiKeyEnv := strings.TrimSpace(input.APIKeyEnv)
+	profile := ModelProfile{
+		ID: input.ID, Name: strings.TrimSpace(input.Name), Provider: provider,
+		Model: modelName, BaseURL: strings.TrimRight(strings.TrimSpace(input.BaseURL), "/"),
+		ExtraFields: input.ExtraFields,
+	}
+	switch provider {
+	case "mock":
+		profile.Model = "zora-mock"
+	case "openai":
+		if modelName == "" {
+			return ModelProfile{}, fmt.Errorf("模型配置 %q 必须填写 model", input.ID)
+		}
+		if apiKeyEnv == "" {
+			apiKeyEnv = "ZORA_API_KEY"
+		}
+		if !validEnvironmentName(apiKeyEnv) {
+			return ModelProfile{}, fmt.Errorf("模型配置 %q 的 api_key_env=%q 无效", input.ID, apiKeyEnv)
+		}
+		profile.APIKey = strings.TrimSpace(os.Getenv(apiKeyEnv))
+		if profile.APIKey == "" {
+			return ModelProfile{}, fmt.Errorf("模型配置 %q 需要通过环境变量 %s 提供 API Key", input.ID, apiKeyEnv)
+		}
+	default:
+		return ModelProfile{}, fmt.Errorf("模型配置 %q 的 provider=%q 不受支持，仅支持 mock 或 openai", input.ID, provider)
+	}
+	if profile.Name == "" {
+		profile.Name = profile.Model
+	}
+	return profile, nil
+}
+
+func applyDefaultModel(cfg *Config, profile ModelProfile) {
+	cfg.Provider = profile.Provider
+	cfg.Model = profile.Model
+	cfg.APIKey = profile.APIKey
+	cfg.BaseURL = profile.BaseURL
+	cfg.ModelExtraFields = profile.ExtraFields
+}
+
+func validConfigName(value string) bool {
+	if value == "" || len(value) > 32 {
+		return false
+	}
+	for index, char := range value {
+		letterOrNumber := char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9'
+		if !letterOrNumber && (index == 0 || char != '_' && char != '-') {
+			return false
+		}
+	}
+	return true
 }
 
 func parseStringArray(key, raw string) ([]string, error) {

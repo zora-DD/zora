@@ -29,6 +29,7 @@ const defaultConversationTitle = "新对话"
 type StreamEvent struct {
 	Type           string                    `json:"type"`
 	RunID          string                    `json:"run_id,omitempty"`
+	ModelID        string                    `json:"model_id,omitempty"`
 	AgentName      string                    `json:"agent_name,omitempty"`
 	Content        string                    `json:"content,omitempty"`
 	ToolName       string                    `json:"tool_name,omitempty"`
@@ -47,6 +48,9 @@ type StreamEvent struct {
 type Service struct {
 	store        store.Store
 	runtime      *agentruntime.Runtime
+	runtimes     map[string]*agentruntime.Runtime
+	models       []ModelProfile
+	defaultModel string
 	memory       memoryCapturer
 	memoryRecall memoryRecaller
 	summary      conversationSummarizer
@@ -71,6 +75,21 @@ type conversationSummarizer interface {
 
 type Option func(*Service)
 
+// ModelProfile 是可以暴露给 Web 的安全模型元数据，不包含 API Key 与 BaseURL。
+type ModelProfile struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Default  bool   `json:"default"`
+}
+
+// RuntimeProfile 将一个公开模型 ID 与已经完成工具装配的 Runtime 关联。
+type RuntimeProfile struct {
+	ModelProfile
+	Runtime *agentruntime.Runtime
+}
+
 func WithMemoryCapturer(capturer memoryCapturer) Option {
 	return func(service *Service) { service.memory = capturer }
 }
@@ -87,8 +106,36 @@ func WithApprovalGate(gate *approval.Service) Option {
 	return func(service *Service) { service.approval = gate }
 }
 
+func WithRuntimeProfiles(defaultModel string, profiles []RuntimeProfile) Option {
+	return func(service *Service) {
+		if len(profiles) == 0 {
+			return
+		}
+		runtimes := make(map[string]*agentruntime.Runtime, len(profiles))
+		models := make([]ModelProfile, 0, len(profiles))
+		for _, profile := range profiles {
+			if profile.ID == "" || profile.Runtime == nil {
+				continue
+			}
+			profile.Default = profile.ID == defaultModel
+			runtimes[profile.ID] = profile.Runtime
+			models = append(models, profile.ModelProfile)
+		}
+		if selected := runtimes[defaultModel]; selected != nil {
+			service.runtime = selected
+			service.runtimes = runtimes
+			service.models = models
+			service.defaultModel = defaultModel
+		}
+	}
+}
+
 func NewService(store store.Store, runtime *agentruntime.Runtime, options ...Option) *Service {
-	service := &Service{store: store, runtime: runtime, locks: make(map[string]*sync.Mutex)}
+	service := &Service{
+		store: store, runtime: runtime, locks: make(map[string]*sync.Mutex),
+		runtimes: map[string]*agentruntime.Runtime{"default": runtime}, defaultModel: "default",
+		models: []ModelProfile{{ID: "default", Name: runtime.Model(), Provider: runtime.Provider(), Model: runtime.Model(), Default: true}},
+	}
 	for _, option := range options {
 		option(service)
 	}
@@ -102,6 +149,12 @@ func (s *Service) MultiAgentEnabled() bool   { return s.runtime.MultiAgentEnable
 func (s *Service) MemoryRecallEnabled() bool { return s.memoryRecall != nil }
 func (s *Service) SummaryEnabled() bool      { return s.summary != nil }
 func (s *Service) ApprovalEnabled() bool     { return s.approval != nil && s.approval.Enabled() }
+
+func (s *Service) ModelProfiles() []ModelProfile {
+	return append([]ModelProfile(nil), s.models...)
+}
+
+func (s *Service) DefaultModelID() string { return s.defaultModel }
 
 func (s *Service) CreateConversation(ctx context.Context, title string) (domain.Conversation, error) {
 	title = strings.TrimSpace(title)
@@ -200,14 +253,23 @@ func (s *Service) GetConversationSummary(ctx context.Context, conversationID str
 	return s.summary.Get(ctx, conversationID)
 }
 
-// Send 按“保存用户消息 -> 创建 Run -> 执行 Agent -> 保存回答”的顺序完成一次请求。
+// Send 保留原有调用方式，未指定模型时使用服务端默认模型。
 func (s *Service) Send(ctx context.Context, conversationID, content string, emit func(StreamEvent) error) error {
+	return s.SendWithModel(ctx, conversationID, content, "", emit)
+}
+
+// SendWithModel 按“选择模型 -> 保存用户消息 -> 创建 Run -> 执行 Agent -> 保存回答”的顺序完成一次请求。
+func (s *Service) SendWithModel(ctx context.Context, conversationID, content, modelID string, emit func(StreamEvent) error) error {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return fmt.Errorf("消息内容不能为空")
 	}
 	if utf8.RuneCountInString(content) > 20_000 {
 		return fmt.Errorf("消息内容不能超过 20000 个字符")
+	}
+	runtime, selectedModelID, err := s.selectRuntime(modelID)
+	if err != nil {
+		return err
 	}
 
 	// 同一会话串行执行，避免两个请求读取相同历史后交错写入回答。
@@ -237,18 +299,18 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 	run := domain.AgentRun{
 		ID: id.New("run"), ConversationID: conversationID,
 		UserMessageID: userMessage.ID, Status: domain.RunRunning,
-		Model: s.runtime.Model(), StartedAt: now,
+		Model: runtime.Model(), StartedAt: now,
 	}
 	if err := s.store.CreateRun(ctx, run); err != nil {
 		return err
 	}
 	if err := s.appendEvent(ctx, run.ID, "run_started", s.runtime.AgentName(), "", map[string]any{
-		"model": s.runtime.Model(), "provider": s.runtime.Provider(),
-		"multi_agent": s.runtime.MultiAgentEnabled(),
+		"model": runtime.Model(), "model_id": selectedModelID, "provider": runtime.Provider(),
+		"multi_agent": runtime.MultiAgentEnabled(),
 	}); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
-	if err := emit(StreamEvent{Type: "start", RunID: run.ID, Message: &userMessage}); err != nil {
+	if err := emit(StreamEvent{Type: "start", RunID: run.ID, ModelID: selectedModelID, Message: &userMessage}); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
 	if s.ApprovalEnabled() {
@@ -330,7 +392,7 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 	firstTokenRecorded := false
 	// 可信 Conversation/Run 身份通过 Context 传给本地草稿工具，模型参数中不暴露这些审计字段。
 	runtimeCtx := agentruntime.WithExecutionIdentity(ctx, conversationID, run.ID)
-	answer, err := s.runtime.Execute(runtimeCtx, history, func(event agentruntime.Event) error {
+	answer, err := runtime.Execute(runtimeCtx, history, func(event agentruntime.Event) error {
 		payload := map[string]any{}
 		var childRunID string
 		now := time.Now().UTC()
@@ -478,6 +540,18 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 		Type: "done", RunID: run.ID, Message: &assistantMessage,
 		Memory: captureResult, MemoryRecalled: recalledCount, Summary: summaryResult, Metrics: runMetrics,
 	})
+}
+
+func (s *Service) selectRuntime(modelID string) (*agentruntime.Runtime, string, error) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		modelID = s.defaultModel
+	}
+	runtime := s.runtimes[modelID]
+	if runtime == nil {
+		return nil, "", fmt.Errorf("模型配置 %q 不存在或未启用", modelID)
+	}
+	return runtime, modelID, nil
 }
 
 func (s *Service) finishActiveChildRuns(ctx context.Context, runs map[string]domain.AgentTaskRun, finished map[string]bool, cause error) {

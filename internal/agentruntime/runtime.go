@@ -69,6 +69,8 @@ func NewChatModel(ctx context.Context, cfg config.Config) (model.BaseChatModel, 
 			BaseURL:    cfg.BaseURL,
 			Model:      cfg.Model,
 			HTTPClient: client,
+			// DeepSeek 等兼容服务会通过扩展字段控制思考模式；配置层禁止在此放入密钥。
+			ExtraFields: cfg.ModelExtraFields,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("创建 OpenAI-compatible 模型失败：%w", err)

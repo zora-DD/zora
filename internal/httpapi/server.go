@@ -130,6 +130,9 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"knowledge-ingestion", "hybrid-retrieval", "knowledge-citations",
 		"semantic-memory", "episodic-memory", "memory-crud",
 	}
+	if len(s.chat.ModelProfiles()) > 1 {
+		capabilities = append(capabilities, "multi-model-selection")
+	}
 	if s.memory.AutoCaptureEnabled() {
 		capabilities = append(capabilities, "memory-auto-capture", "memory-consolidation")
 	}
@@ -161,6 +164,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": "Zora", "version": "0.6.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
+		"models": s.chat.ModelProfiles(), "default_model_id": s.chat.DefaultModelID(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
 		"human_approval":       s.chat.ApprovalEnabled(),
 		"embedding_model":      s.knowledge.EmbeddingModel(),
@@ -251,6 +255,7 @@ func (s *Server) deleteConversation(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Content string `json:"content"`
+		ModelID string `json:"model_id"`
 	}
 	if err := decodeJSON(w, r, &input); err != nil {
 		s.problem(w, err)
@@ -273,7 +278,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	// 请求 Context 会同时感知浏览器断开和服务端超时，并一路传递到 Eino/模型。
 	ctx, cancel := contextWithTimeout(r, s.requestTimeout)
 	defer cancel()
-	err := s.chat.Send(ctx, r.PathValue("conversationID"), input.Content, func(event chat.StreamEvent) error {
+	err := s.chat.SendWithModel(ctx, r.PathValue("conversationID"), input.Content, input.ModelID, func(event chat.StreamEvent) error {
 		payload, err := json.Marshal(event)
 		if err != nil {
 			return err

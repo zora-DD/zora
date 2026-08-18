@@ -9,6 +9,9 @@ const state = {
   officeDrafts: [],
   officeOperations: [],
   runSummaries: [],
+  models: [],
+  selectedModelID: null,
+  runtimeVersion: "",
   officeExecution: false,
   memoryAutoCapture: false,
   memoryRecall: false,
@@ -18,6 +21,8 @@ const state = {
   busy: false,
   controller: null,
   draft: null,
+  draftArticle: null,
+  draftRenderFrame: null,
 };
 
 const elements = {
@@ -39,6 +44,7 @@ const elements = {
   runtimeModel: document.querySelector("#runtimeModel"),
   runtimeProvider: document.querySelector("#runtimeProvider"),
   statusDot: document.querySelector("#statusDot"),
+  modelSelect: document.querySelector("#modelSelect"),
   toolBadge: document.querySelector("#toolBadge"),
   openKnowledge: document.querySelector("#openKnowledge"),
   closeKnowledge: document.querySelector("#closeKnowledge"),
@@ -104,10 +110,11 @@ async function initialize() {
       api("/api/office/drafts?limit=200"),
       api("/api/office/operations?limit=200"),
     ]);
-    elements.runtimeModel.textContent = info.model;
+    configureModelSelector(info);
     state.multiAgent = Boolean(info.multi_agent);
     state.humanApproval = Boolean(info.human_approval);
-    elements.runtimeProvider.textContent = `${info.provider} · ${info.version}${state.multiAgent ? " · 多 Agent" : ""}`;
+    state.runtimeVersion = info.version || "";
+    updateSelectedModelStatus();
     elements.toolBadge.innerHTML = `<i></i> ${Number(info.tool_count || 6)} 个受控工具${info.mcp_enabled ? " · MCP" : ""}`;
     state.conversations = result.conversations || [];
     state.documents = knowledgeResult.documents || [];
@@ -151,6 +158,11 @@ function bindEvents() {
   elements.closeOfficeDrafts.addEventListener("click", () => elements.officeDraftDialog.close());
   elements.openRunMetrics.addEventListener("click", openRunMetrics);
   elements.closeRunMetrics.addEventListener("click", () => elements.runMetricsDialog.close());
+  elements.modelSelect.addEventListener("change", () => {
+    state.selectedModelID = elements.modelSelect.value;
+    try { localStorage.setItem("zora.selectedModelID", state.selectedModelID); } catch (_) {}
+    updateSelectedModelStatus();
+  });
   elements.renameConversation.addEventListener("click", renameActiveConversation);
   elements.composer.addEventListener("submit", event => {
     event.preventDefault();
@@ -179,6 +191,33 @@ function bindEvents() {
   elements.openSidebar.addEventListener("click", openSidebar);
   elements.closeSidebar.addEventListener("click", closeSidebar);
   elements.sidebarScrim.addEventListener("click", closeSidebar);
+}
+
+function configureModelSelector(info) {
+  state.models = Array.isArray(info.models) && info.models.length
+    ? info.models
+    : [{ id: info.default_model_id || "default", name: info.model, provider: info.provider, model: info.model, default: true }];
+  let saved = null;
+  try { saved = localStorage.getItem("zora.selectedModelID"); } catch (_) {}
+  const defaultID = info.default_model_id || state.models.find(item => item.default)?.id || state.models[0].id;
+  state.selectedModelID = state.models.some(item => item.id === saved) ? saved : defaultID;
+  elements.modelSelect.replaceChildren();
+  for (const item of state.models) {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.textContent = item.name || item.model || item.id;
+    elements.modelSelect.append(option);
+  }
+  elements.modelSelect.value = state.selectedModelID;
+  elements.modelSelect.disabled = state.models.length < 2;
+}
+
+function updateSelectedModelStatus() {
+  const selected = state.models.find(item => item.id === state.selectedModelID) || state.models[0];
+  if (!selected) return;
+  elements.runtimeModel.textContent = selected.name || selected.model;
+  const suffix = state.runtimeVersion ? ` · ${state.runtimeVersion}` : "";
+  elements.runtimeProvider.textContent = `${selected.provider}${suffix}${state.multiAgent ? " · 多 Agent" : ""}`;
 }
 
 async function openKnowledge() {
@@ -851,7 +890,7 @@ async function sendMessage(rawContent) {
     const response = await fetch(`/api/conversations/${state.activeID}/messages`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, model_id: state.selectedModelID }),
       signal: controller.signal,
     });
     if (!response.ok || !response.body) {
@@ -869,11 +908,18 @@ async function sendMessage(rawContent) {
       state.draft.content = error.name === "AbortError" ? "生成已停止。" : `执行失败：${error.message}`;
     }
   } finally {
-    if (state.draft) state.draft.streaming = false;
+    if (state.draftRenderFrame !== null) {
+      cancelAnimationFrame(state.draftRenderFrame);
+      state.draftRenderFrame = null;
+    }
+    if (state.draft) {
+      state.draft.streaming = false;
+      renderDraftMessage();
+    }
     state.draft = null;
+    state.draftArticle = null;
     state.controller = null;
     setBusy(false);
-    renderMessages();
     await refreshConversations();
     elements.messageInput.focus();
   }
@@ -958,8 +1004,40 @@ function handleAgentEvent(type, event) {
     case "error":
       throw new Error(event.content || "Agent 执行失败");
   }
-  renderMessages();
-  scrollToBottom();
+  // 真实模型可能在极短时间内推送大量 token。这里按浏览器帧合并更新，
+  // 并且只刷新正在生成的消息，避免整页消息反复销毁造成闪烁。
+  scheduleDraftRender();
+}
+
+function scheduleDraftRender() {
+  if (state.draftRenderFrame !== null) return;
+  state.draftRenderFrame = requestAnimationFrame(() => {
+    state.draftRenderFrame = null;
+    renderDraftMessage();
+    scrollToBottom();
+  });
+}
+
+function renderDraftMessage() {
+  if (!state.draft || !state.draftArticle) return;
+  const article = state.draftArticle;
+  const approvalSlot = article.querySelector(".approval-slot");
+  const traceList = article.querySelector(".trace-list");
+  const bubble = article.querySelector(".bubble");
+  approvalSlot.replaceChildren();
+  traceList.replaceChildren();
+  renderApproval(approvalSlot, state.draft.approval);
+  renderTraces(traceList, state.draft.traces || []);
+  bubble.innerHTML = renderMarkdown(state.draft.content || "");
+  if (state.draft.streaming) {
+    const cursor = document.createElement("span");
+    cursor.className = "cursor";
+    bubble.append(cursor);
+  }
+  article.querySelector(".message-metrics")?.remove();
+  if (state.draft.metrics) {
+    article.querySelector(".message-content").append(renderMessageMetrics(state.draft.metrics));
+  }
 }
 
 function agentDisplayName(name) {
@@ -1028,6 +1106,7 @@ function renderConversations() {
 }
 
 function renderMessages() {
+  state.draftArticle = null;
   elements.messageList.querySelectorAll(".message").forEach(node => node.remove());
   elements.welcome.hidden = state.messages.length > 0;
   for (const message of state.messages) {
@@ -1050,6 +1129,7 @@ function renderMessages() {
     if (message.role !== "user" && message.metrics) {
       article.querySelector(".message-content").append(renderMessageMetrics(message.metrics));
     }
+    if (message === state.draft) state.draftArticle = article;
     elements.messageList.append(article);
   }
 }
@@ -1144,16 +1224,85 @@ function renderTraces(container, traces) {
 
 function renderMarkdown(value) {
   if (!value) return "";
-  const parts = value.split("```");
-  return parts.map((part, index) => {
-    if (index % 2 === 1) {
-      const lines = part.replace(/^\w+\n/, "");
-      return `<pre><code>${escapeHTML(lines.trim())}</code></pre>`;
+  const lines = String(value).replace(/\r\n?/g, "\n").split("\n");
+  const result = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) { index += 1; continue; }
+
+    const fence = line.match(/^\s*```\s*([\w+-]*)\s*$/);
+    if (fence) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) code.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      const language = fence[1] ? ` class="language-${escapeHTML(fence[1])}"` : "";
+      result.push(`<pre><code${language}>${escapeHTML(code.join("\n"))}</code></pre>`);
+      continue;
     }
+
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      result.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      index += 1;
+      continue;
+    }
+    if (/^\s*(?:---+|___+|\*\*\*+)\s*$/.test(line)) {
+      result.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    const unordered = line.match(/^\s*[-+*]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      const tag = unordered ? "ul" : "ol";
+      const pattern = unordered ? /^\s*[-+*]\s+(.+)$/ : /^\s*\d+[.)]\s+(.+)$/;
+      const items = [];
+      while (index < lines.length) {
+        const item = lines[index].match(pattern);
+        if (!item) break;
+        items.push(`<li>${renderInlineMarkdown(item[1])}</li>`);
+        index += 1;
+      }
+      result.push(`<${tag}>${items.join("")}</${tag}>`);
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quote = [];
+      while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+        quote.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      result.push(`<blockquote>${quote.map(renderInlineMarkdown).join("<br>")}</blockquote>`);
+      continue;
+    }
+
+    const paragraph = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines[index])) {
+      paragraph.push(lines[index++]);
+    }
+    result.push(`<p>${paragraph.map(renderInlineMarkdown).join("<br>")}</p>`);
+  }
+  return result.join("");
+}
+
+function isMarkdownBlockStart(line) {
+  return /^\s*```/.test(line) || /^#{1,6}\s+/.test(line) || /^\s*(?:[-+*]\s+|\d+[.)]\s+|>\s?)/.test(line) || /^\s*(?:---+|___+|\*\*\*+)\s*$/.test(line);
+}
+
+function renderInlineMarkdown(value) {
+  return String(value).split(/(`[^`]*`)/g).map(part => {
+    if (part.startsWith("`") && part.endsWith("`")) return `<code>${escapeHTML(part.slice(1, -1))}</code>`;
     return escapeHTML(part)
-      .split(/\n{2,}/)
-      .map(paragraph => `<p>${paragraph.replace(/\n/g, "<br>").replace(/`([^`]+)`/g, "<code>$1</code>")}</p>`)
-      .join("");
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/__([^_\n]+)__/g, "<strong>$1</strong>")
+      .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
+      .replace(/(^|[\s（(])\*([^*\n]+)\*/g, "$1<em>$2</em>");
   }).join("");
 }
 
@@ -1179,6 +1328,8 @@ function resizeInput() {
 
 function setBusy(busy) {
   state.busy = busy;
+  elements.chatScroll.classList.toggle("streaming", busy);
+  elements.modelSelect.disabled = busy || state.models.length < 2;
   elements.sendButton.disabled = !busy && !elements.messageInput.value.trim();
   elements.sendButton.classList.toggle("running", busy);
   elements.sendButton.title = busy ? "停止生成" : "发送";

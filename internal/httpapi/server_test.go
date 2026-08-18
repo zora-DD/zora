@@ -50,7 +50,14 @@ func TestConversationAndAgentSSE(t *testing.T) {
 	}
 	registeredTools = append(registeredTools, knowledgeTool)
 	runtime, err := agentruntime.New(context.Background(), config.Config{
-		Provider: "mock", Model: "zora-mock", Instruction: "Be helpful.",
+		Provider: "mock", Model: "zora-mock-primary", Instruction: "Be helpful.",
+		RequestTimeout: time.Second, MaxIterations: 5,
+	}, registeredTools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternateRuntime, err := agentruntime.New(context.Background(), config.Config{
+		Provider: "mock", Model: "zora-mock-alternate", Instruction: "Be helpful.",
 		RequestTimeout: time.Second, MaxIterations: 5,
 	}, registeredTools)
 	if err != nil {
@@ -58,11 +65,20 @@ func TestConversationAndAgentSSE(t *testing.T) {
 	}
 	memoryService := newTestMemoryService(t, database)
 	handler, err := New(chat.NewService(database, runtime,
+		chat.WithRuntimeProfiles("primary", []chat.RuntimeProfile{
+			{ModelProfile: chat.ModelProfile{ID: "primary", Name: "主模型", Provider: "mock", Model: "zora-mock-primary"}, Runtime: runtime},
+			{ModelProfile: chat.ModelProfile{ID: "alternate", Name: "备用模型", Provider: "mock", Model: "zora-mock-alternate"}, Runtime: alternateRuntime},
+		}),
 		chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService),
 		chat.WithConversationSummarizer(failingSummaryService{}),
 	), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
+	}
+	info := httptest.NewRecorder()
+	handler.ServeHTTP(info, httptest.NewRequest(http.MethodGet, "/api/info", nil))
+	if info.Code != http.StatusOK || !strings.Contains(info.Body.String(), `"default_model_id":"primary"`) || !strings.Contains(info.Body.String(), `"id":"alternate"`) {
+		t.Fatalf("unexpected multi-model info: %s", info.Body.String())
 	}
 
 	create := httptest.NewRequest(http.MethodPost, "/api/conversations", strings.NewReader(`{"title":"API test"}`))
@@ -79,7 +95,7 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	send := httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversation.ID+"/messages", bytes.NewBufferString(`{"content":"计算 6 * 7"}`))
+	send := httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversation.ID+"/messages", bytes.NewBufferString(`{"content":"计算 6 * 7","model_id":"alternate"}`))
 	send.Header.Set("Content-Type", "application/json")
 	stream := httptest.NewRecorder()
 	handler.ServeHTTP(stream, send)
@@ -92,6 +108,9 @@ func TestConversationAndAgentSSE(t *testing.T) {
 	}
 	if !strings.Contains(events, `"metrics":`) || !strings.Contains(events, `"model_calls":2`) {
 		t.Fatalf("done event does not include run metrics:\n%s", events)
+	}
+	if !strings.Contains(events, `"model_id":"alternate"`) {
+		t.Fatalf("start event does not include selected model:\n%s", events)
 	}
 
 	// Ensure every SSE frame contains valid JSON data.
@@ -121,7 +140,7 @@ func TestConversationAndAgentSSE(t *testing.T) {
 	if err := json.Unmarshal(runsResponse.Body.Bytes(), &runList); err != nil {
 		t.Fatal(err)
 	}
-	if len(runList.Runs) != 1 || runList.Runs[0].Metrics.ModelCalls != 2 || runList.Runs[0].Metrics.ToolCalls != 1 || runList.Runs[0].Metrics.UsageComplete {
+	if len(runList.Runs) != 1 || runList.Runs[0].Run.Model != "zora-mock-alternate" || runList.Runs[0].Metrics.ModelCalls != 2 || runList.Runs[0].Metrics.ToolCalls != 1 || runList.Runs[0].Metrics.UsageComplete {
 		t.Fatalf("unexpected run summaries: %+v", runList.Runs)
 	}
 	metricsResponse := httptest.NewRecorder()
@@ -504,6 +523,9 @@ func TestEmbeddedSPA(t *testing.T) {
 		}
 		if path == "/" && !strings.Contains(response.Body.String(), "运行监控") {
 			t.Fatalf("GET / did not include the run metrics entry")
+		}
+		if path == "/" && !strings.Contains(response.Body.String(), `id="modelSelect"`) {
+			t.Fatalf("GET / did not include the model selector")
 		}
 	}
 }

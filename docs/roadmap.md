@@ -103,6 +103,7 @@
 - [x] `GET /api/runs`、`GET /api/runs/{id}/metrics` 聚合接口
 - [x] `done.metrics` 实时结果和 Web 最近 50 次运行监控
 - [x] 聚合单元测试、Runtime Usage 测试、HTTP/SSE 纵向验收
+- [x] 多模型安全配置、请求级选择、Web 切换和实际模型 Run 审计
 
 验收条件：指标必须来自真实 Runtime 与持久化 RunEvent；Provider 不返回 Usage 时不得估算成“真实 Token”；同一 Run 的实时 `done.metrics`、聚合 API 和事件明细可以互相核对。
 
