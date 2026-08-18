@@ -5,8 +5,11 @@ package office
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 )
+
+var ErrStateConflict = errors.New("草稿状态冲突")
 
 const (
 	KindEmail    = "email"
@@ -61,10 +64,24 @@ type ListFilter struct {
 	Limit  int
 }
 
+// DraftEvent 记录不可变的草稿状态迁移，供确认过程审计和并发冲突排查。
+// Actor 当前固定为 user；接入身份系统后应替换为真实主体 ID。
+type DraftEvent struct {
+	ID         string    `json:"id"`
+	DraftID    string    `json:"draft_id"`
+	FromStatus string    `json:"from_status"`
+	ToStatus   string    `json:"to_status"`
+	Actor      string    `json:"actor"`
+	Reason     string    `json:"reason,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
 // Store 由 SQLite/PostgreSQL 实现；SaveDraft 通过 Run + 内容哈希提供重试幂等性。
 type Store interface {
 	SaveDraft(ctx context.Context, draft Draft) (saved Draft, created bool, err error)
 	GetDraft(ctx context.Context, id string) (Draft, error)
 	ListDrafts(ctx context.Context, filter ListFilter) ([]Draft, error)
 	DeleteDraft(ctx context.Context, id string) error
+	TransitionDraft(ctx context.Context, id, expectedStatus, nextStatus string, event DraftEvent) (Draft, error)
+	ListDraftEvents(ctx context.Context, draftID string) ([]DraftEvent, error)
 }

@@ -97,6 +97,77 @@ func (s *SQLite) DeleteDraft(ctx context.Context, id string) error {
 	return nil
 }
 
+// TransitionDraft 通过 compare-and-swap 更新状态，并在同一事务写入不可变审计事件。
+func (s *SQLite) TransitionDraft(ctx context.Context, id, expectedStatus, nextStatus string, event office.DraftEvent) (office.Draft, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return office.Draft{}, fmt.Errorf("开始办公草稿状态事务失败：%w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+UPDATE office_drafts SET status = ?, updated_at = ?
+WHERE id = ? AND status = ?`, nextStatus, formatTime(event.CreatedAt), id, expectedStatus)
+	if err != nil {
+		return office.Draft{}, fmt.Errorf("更新办公草稿状态失败：%w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return office.Draft{}, fmt.Errorf("读取办公草稿状态更新结果失败：%w", err)
+	}
+	if affected == 0 {
+		current, getErr := scanOfficeDraft(tx.QueryRowContext(ctx, officeDraftSelect+` WHERE id = ?`, id))
+		if getErr == sql.ErrNoRows {
+			return office.Draft{}, store.ErrNotFound
+		}
+		if getErr != nil {
+			return office.Draft{}, fmt.Errorf("查询办公草稿当前状态失败：%w", getErr)
+		}
+		return office.Draft{}, fmt.Errorf("%w：当前为 %s，不能按 %s 处理", office.ErrStateConflict, current.Status, expectedStatus)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO office_draft_events(id, draft_id, from_status, to_status, actor, reason, created_at)
+VALUES(?, ?, ?, ?, ?, ?, ?)`, event.ID, id, expectedStatus, nextStatus,
+		event.Actor, event.Reason, formatTime(event.CreatedAt)); err != nil {
+		return office.Draft{}, fmt.Errorf("保存办公草稿审计事件失败：%w", err)
+	}
+	updated, err := scanOfficeDraft(tx.QueryRowContext(ctx, officeDraftSelect+` WHERE id = ?`, id))
+	if err != nil {
+		return office.Draft{}, fmt.Errorf("读取更新后的办公草稿失败：%w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return office.Draft{}, fmt.Errorf("提交办公草稿状态事务失败：%w", err)
+	}
+	return updated, nil
+}
+
+func (s *SQLite) ListDraftEvents(ctx context.Context, draftID string) ([]office.DraftEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, draft_id, from_status, to_status, actor, reason, created_at
+FROM office_draft_events WHERE draft_id = ? ORDER BY created_at, id`, draftID)
+	if err != nil {
+		return nil, fmt.Errorf("查询办公草稿审计事件失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]office.DraftEvent, 0)
+	for rows.Next() {
+		var item office.DraftEvent
+		var createdAt string
+		if err := rows.Scan(&item.ID, &item.DraftID, &item.FromStatus, &item.ToStatus,
+			&item.Actor, &item.Reason, &createdAt); err != nil {
+			return nil, fmt.Errorf("读取办公草稿审计事件失败：%w", err)
+		}
+		item.CreatedAt, err = parseTime(createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("解析办公草稿审计时间失败：%w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历办公草稿审计事件失败：%w", err)
+	}
+	return items, nil
+}
+
 func (s *SQLite) getDraftByRunHash(ctx context.Context, runID, contentHash string) (office.Draft, error) {
 	row := s.db.QueryRowContext(ctx, officeDraftSelect+` WHERE source_run_id = ? AND content_hash = ?`, runID, contentHash)
 	item, err := scanOfficeDraft(row)

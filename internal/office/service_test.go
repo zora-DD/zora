@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -100,13 +101,56 @@ func TestDraftToolReturnsExplicitNoExternalEffect(t *testing.T) {
 	}
 }
 
+func TestDraftConfirmationStateMachineIsAuditableAndOneShot(t *testing.T) {
+	t.Parallel()
+	memoryStore := newMemoryDraftStore()
+	service, err := NewService(memoryStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.now = func() time.Time { return time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC) }
+	ctx := agentruntime.WithExecutionIdentity(context.Background(), "conv-1", "run-confirm")
+	draft, _, err := service.CreateEmailDraft(ctx, EmailDraft{
+		To: []string{"dev@example.com"}, Subject: "发布通知", Body: "项目将在周五发布。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := service.SubmitForConfirmation(ctx, draft.ID)
+	if err != nil || pending.Status != StatusPendingConfirmation {
+		t.Fatalf("pending draft = %+v, err=%v", pending, err)
+	}
+	if _, err := service.SubmitForConfirmation(ctx, draft.ID); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected duplicate submit conflict, got %v", err)
+	}
+	approved, err := service.Decide(ctx, draft.ID, StatusApproved, "内容和收件人已核对")
+	if err != nil || approved.Status != StatusApproved {
+		t.Fatalf("approved draft = %+v, err=%v", approved, err)
+	}
+	if _, err := service.Decide(ctx, draft.ID, StatusRejected, "重复决定"); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("expected duplicate decision conflict, got %v", err)
+	}
+	if err := service.Delete(ctx, draft.ID); err == nil || !strings.Contains(err.Error(), "draft 状态") {
+		t.Fatalf("expected approved delete rejection, got %v", err)
+	}
+	events, err := service.ListEvents(ctx, draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].FromStatus != StatusDraft || events[0].ToStatus != StatusPendingConfirmation ||
+		events[1].ToStatus != StatusApproved || events[1].Actor != "user" {
+		t.Fatalf("unexpected draft events: %+v", events)
+	}
+}
+
 type memoryDraftStore struct {
-	items map[string]Draft
-	keys  map[string]string
+	items  map[string]Draft
+	keys   map[string]string
+	events map[string][]DraftEvent
 }
 
 func newMemoryDraftStore() *memoryDraftStore {
-	return &memoryDraftStore{items: make(map[string]Draft), keys: make(map[string]string)}
+	return &memoryDraftStore{items: make(map[string]Draft), keys: make(map[string]string), events: make(map[string][]DraftEvent)}
 }
 
 func (s *memoryDraftStore) SaveDraft(_ context.Context, draft Draft) (Draft, bool, error) {
@@ -147,4 +191,23 @@ func (s *memoryDraftStore) DeleteDraft(_ context.Context, id string) error {
 	}
 	delete(s.items, id)
 	return nil
+}
+
+func (s *memoryDraftStore) TransitionDraft(_ context.Context, id, expectedStatus, nextStatus string, event DraftEvent) (Draft, error) {
+	item, ok := s.items[id]
+	if !ok {
+		return Draft{}, store.ErrNotFound
+	}
+	if item.Status != expectedStatus {
+		return Draft{}, fmt.Errorf("%w：当前为 %s", ErrStateConflict, item.Status)
+	}
+	item.Status = nextStatus
+	item.UpdatedAt = event.CreatedAt
+	s.items[id] = item
+	s.events[id] = append(s.events[id], event)
+	return item, nil
+}
+
+func (s *memoryDraftStore) ListDraftEvents(_ context.Context, draftID string) ([]DraftEvent, error) {
+	return append([]DraftEvent(nil), s.events[draftID]...), nil
 }

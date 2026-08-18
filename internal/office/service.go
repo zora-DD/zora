@@ -21,6 +21,7 @@ const (
 	maxSubject    = 200
 	maxBody       = 20_000
 	maxLocation   = 300
+	maxReason     = 500
 )
 
 type Service struct {
@@ -142,6 +143,47 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("只有 draft 状态的草稿可以删除")
 	}
 	return s.store.DeleteDraft(ctx, id)
+}
+
+// SubmitForConfirmation 冻结当前草稿内容并进入等待人工确认状态。
+// 状态迁移和审计事件由 Store 在同一事务中写入，重复提交只会有一个请求成功。
+func (s *Service) SubmitForConfirmation(ctx context.Context, draftID string) (Draft, error) {
+	if strings.TrimSpace(draftID) == "" {
+		return Draft{}, fmt.Errorf("草稿 ID 不能为空")
+	}
+	return s.transition(ctx, draftID, StatusDraft, StatusPendingConfirmation, "用户提交草稿，等待人工确认")
+}
+
+// Decide 只记录批准或拒绝决定，不会发送邮件或创建日程。
+func (s *Service) Decide(ctx context.Context, draftID, decision, reason string) (Draft, error) {
+	decision = strings.ToLower(strings.TrimSpace(decision))
+	if decision != StatusApproved && decision != StatusRejected {
+		return Draft{}, fmt.Errorf("草稿确认决定仅支持 approved 或 rejected")
+	}
+	reason = strings.TrimSpace(reason)
+	if err := validateText("确认原因", reason, 0, maxReason); err != nil {
+		return Draft{}, err
+	}
+	return s.transition(ctx, draftID, StatusPendingConfirmation, decision, reason)
+}
+
+func (s *Service) ListEvents(ctx context.Context, draftID string) ([]DraftEvent, error) {
+	if strings.TrimSpace(draftID) == "" {
+		return nil, fmt.Errorf("草稿 ID 不能为空")
+	}
+	if _, err := s.store.GetDraft(ctx, draftID); err != nil {
+		return nil, err
+	}
+	return s.store.ListDraftEvents(ctx, draftID)
+}
+
+func (s *Service) transition(ctx context.Context, draftID, from, to, reason string) (Draft, error) {
+	now := s.now().UTC()
+	event := DraftEvent{
+		ID: id.New("draft_event"), DraftID: draftID, FromStatus: from, ToStatus: to,
+		Actor: "user", Reason: reason, CreatedAt: now,
+	}
+	return s.store.TransitionDraft(ctx, draftID, from, to, event)
 }
 
 func (s *Service) save(ctx context.Context, identity agentruntime.ExecutionIdentity, kind, title string, payload any) (Draft, bool, error) {

@@ -20,7 +20,7 @@ Zora 将系统划分为十五个边界：
 12. `mcpbridge`：官方 MCP Client、stdio 生命周期、工具发现/白名单和 Eino 适配。
 13. `mcpfiles`：独立文件连接器的授权目录、路径校验和只读工具实现。
 14. `mcpmicrosoft`：独立 Microsoft Graph 连接器的 Token 边界、邮件/日历只读查询和外部内容安全标记。
-15. `office`：邮件/日程草稿模型、结构化校验、可信 Run 来源、重试幂等和内部预览工具。
+15. `office`：邮件/日程草稿模型、结构化校验、可信 Run 来源、重试幂等、人工确认状态机和内部预览工具。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -67,7 +67,7 @@ Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episo
 
 ### OfficeDraft
 
-OfficeDraft 是尚未产生外部影响的邮件或日程参数快照。它保存类型、状态、标题、规范化 JSON Payload、内容哈希、来源 Conversation/Run 和时间戳。当前 Service 只创建 `draft`，并只允许删除 `draft`；其余状态为后续写前确认与执行状态机预留，模型不能直接修改。
+OfficeDraft 是尚未产生外部影响的邮件或日程参数快照。它保存类型、状态、标题、规范化 JSON Payload、内容哈希、来源 Conversation/Run 和时间戳。当前 Service 支持 `draft → pending_confirmation → approved/rejected`，只允许删除 `draft`；每次迁移同时追加 OfficeDraftEvent。`executing/completed/failed/cancelled` 仍为后续外部执行预留，模型不能直接修改。
 
 ## 4. 并发与取消
 
@@ -75,6 +75,7 @@ OfficeDraft 是尚未产生外部影响的邮件或日程参数快照。它保�
 - 不同 Conversation 可以并发运行。
 - 浏览器 Abort、HTTP Context 取消和服务端 Deadline 会传入 Eino 与模型请求。
 - 模型客户端和整个消息请求都有超时。
+- 草稿状态迁移使用数据库 compare-and-swap；状态与审计事件在同一事务提交，重复或并发人工决定只有一个成功。
 
 PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业务对话锁仍是进程内 Mutex，多实例部署前还应升级为数据库 advisory lock 或带租约的分布式锁。
 
@@ -88,6 +89,7 @@ PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业�
 - API Key 只从环境变量读取。
 - 当前没有任何写入外部系统的工具。
 - 草稿工具只能从 Chat 注入的可信 Conversation/Run Context 取得来源，并固定返回 `external_effect=false`。
+- 草稿提交、批准和拒绝只能通过独立 REST/Web 操作；批准状态也不触发外部写入，避免把“确认”误当成“执行”。
 - 知识文档限制为 UTF-8 TXT/Markdown 且最大 5 MiB，文档删除需要用户确认。
 - 长期记忆内容最多 2,000 字符，类型/重要性/过期时间在 Service 层校验，来源字段不可由用户伪造，删除需要确认；候选提取 Prompt 隔离不可信聊天数据，Service 二次拒绝明显敏感凭据。
 - 会话摘要 Prompt 把旧摘要和消息编码为不可信 JSON，禁止保留密码或 Token；加载时仍按非指令背景数据注入，摘要失败自动退化为最近原始消息。
@@ -198,7 +200,7 @@ Web 将交接事件显示为带 `child_run_id` 的专业 Agent Trace，并显示
 
 ## 9. V0.5 MCP 办公连接器架构
 
-第三阶段在文件与 Microsoft Graph 两类只读连接器之上增加内部草稿层：
+第四阶段在文件与 Microsoft Graph 两类只读连接器和内部草稿层之上增加持久化人工确认：
 
 ```text
 Zora 主进程
@@ -215,7 +217,8 @@ Writer Agent / 单 Agent
 └── office.Service
     ├── preview_email_draft
     ├── preview_calendar_draft
-    └── office_drafts（SQLite / PostgreSQL）
+    ├── draft → pending_confirmation → approved / rejected
+    └── office_drafts + office_draft_events（SQLite / PostgreSQL）
 ```
 
 启动时，`mcpbridge` 按配置逐个启动 stdio Server，执行 MCP 握手和分页工具发现。一个工具必须同时出现在部署者提供的 `allowed_tools` 中，并由 Server 声明 `readOnlyHint=true`；之后才会以 `mcp_{server}_{tool}` 名称进入 Eino。主进程不经过 Shell，子进程也不默认继承环境；模型 Key、Embedding Key 与数据库 DSN 不能透传。
@@ -224,6 +227,6 @@ Writer Agent / 单 Agent
 
 Microsoft 连接器使用 Graph REST 统一查询邮件和日历。OAuth 登录、刷新和 Secret 保存不进入连接器：部署平台只向子进程注入短期 Token，委托访问使用 `me`，应用访问必须指定用户 ID。四个工具仅返回元数据和正文摘要，不下载邮件附件；默认日历窗口为 7 天、最长 93 天。外部内容始终附带不可信数据提示，系统 Prompt 也要求忽略其中的工具指令、链接和权限请求。
 
-`preview_email_draft` 和 `preview_calendar_draft` 会先校验邮箱、长度、RFC3339 时间窗与 IANA 时区，再保存结构化草稿。`source_run_id + content_hash` 唯一约束吸收 Agent/Writer 重试；REST 和 Web 只允许查看或删除 `draft`。当前没有 Graph 写接口，也没有草稿状态推进方法。
+`preview_email_draft` 和 `preview_calendar_draft` 会先校验邮箱、长度、RFC3339 时间窗与 IANA 时区，再保存结构化草稿。`source_run_id + content_hash` 唯一约束吸收 Agent/Writer 重试。REST/Web 可把 `draft` 提交为 `pending_confirmation`，再一次性批准或拒绝；Store 用预期状态条件更新，并把状态和 `office_draft_events` 记录放在同一事务中。只有 `draft` 可以删除，终态记录保留用于审计。
 
-未来写操作不能直接复用只读适配器：必须在现有草稿快照之上建立独立人工决定、幂等任务和恢复机制，避免“模型产生 ToolCall”直接等于外部副作用。
+当前没有 Graph 写接口，`approved` 明确表示“已批准、未执行”。下一阶段必须在批准快照之上建立独立幂等 Operation、失败恢复和凭据边界，避免“人工确认成功”直接等于一次不可追踪的外部副作用。

@@ -208,10 +208,55 @@ func TestOfficeDraftLifecycleAndRunIdempotency(t *testing.T) {
 	if err != nil || len(items) != 1 || items[0].SourceRunID != run.ID {
 		t.Fatalf("drafts = %+v, err=%v", items, err)
 	}
-	if err := service.Delete(ctx, first.ID); err != nil {
+	pending, err := service.SubmitForConfirmation(ctx, first.ID)
+	if err != nil || pending.Status != office.StatusPendingConfirmation {
+		t.Fatalf("pending draft = %+v, err=%v", pending, err)
+	}
+	if _, err := service.SubmitForConfirmation(ctx, first.ID); !errors.Is(err, office.ErrStateConflict) {
+		t.Fatalf("duplicate submit error = %v", err)
+	}
+	type decisionResult struct {
+		draft office.Draft
+		err   error
+	}
+	decisions := make(chan decisionResult, 2)
+	go func() {
+		item, decideErr := service.Decide(ctx, first.ID, office.StatusApproved, "已核对")
+		decisions <- decisionResult{draft: item, err: decideErr}
+	}()
+	go func() {
+		item, decideErr := service.Decide(ctx, first.ID, office.StatusRejected, "不批准")
+		decisions <- decisionResult{draft: item, err: decideErr}
+	}()
+	var winner office.Draft
+	conflicts := 0
+	for range 2 {
+		result := <-decisions
+		if result.err == nil {
+			winner = result.draft
+		} else if errors.Is(result.err, office.ErrStateConflict) {
+			conflicts++
+		} else {
+			t.Fatalf("unexpected decision error: %v", result.err)
+		}
+	}
+	if winner.ID != first.ID || conflicts != 1 || (winner.Status != office.StatusApproved && winner.Status != office.StatusRejected) {
+		t.Fatalf("winner = %+v, conflicts=%d", winner, conflicts)
+	}
+	events, err := service.ListEvents(ctx, first.ID)
+	if err != nil || len(events) != 2 || events[1].ToStatus != winner.Status {
+		t.Fatalf("draft events = %+v, err=%v", events, err)
+	}
+	deletable, created, err := service.CreateEmailDraft(executionCtx, office.EmailDraft{
+		To: []string{"dev@example.com"}, Subject: "临时草稿", Body: "仅用于验证删除。",
+	})
+	if err != nil || !created {
+		t.Fatalf("deletable draft = %+v, created=%v, err=%v", deletable, created, err)
+	}
+	if err := service.Delete(ctx, deletable.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Get(ctx, first.ID); !errors.Is(err, store.ErrNotFound) {
+	if _, err := service.Get(ctx, deletable.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("get deleted draft error = %v", err)
 	}
 }

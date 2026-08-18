@@ -87,6 +87,9 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 		mux.HandleFunc("GET /api/office/drafts", server.listOfficeDrafts)
 		mux.HandleFunc("GET /api/office/drafts/{draftID}", server.getOfficeDraft)
 		mux.HandleFunc("DELETE /api/office/drafts/{draftID}", server.deleteOfficeDraft)
+		mux.HandleFunc("POST /api/office/drafts/{draftID}/confirmation", server.submitOfficeDraftConfirmation)
+		mux.HandleFunc("POST /api/office/drafts/{draftID}/decision", server.decideOfficeDraft)
+		mux.HandleFunc("GET /api/office/drafts/{draftID}/events", server.listOfficeDraftEvents)
 	}
 	mux.HandleFunc("GET /api/knowledge/documents", server.listKnowledgeDocuments)
 	mux.HandleFunc("POST /api/knowledge/documents", server.uploadKnowledgeDocument)
@@ -138,7 +141,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "mcp-client", "mcp-readonly-tools")
 	}
 	if s.office != nil {
-		capabilities = append(capabilities, "office-draft-preview", "email-draft", "calendar-draft")
+		capabilities = append(capabilities, "office-draft-preview", "email-draft", "calendar-draft", "office-draft-confirmation")
 		toolCount += 2
 	}
 	if s.knowledge.RetrievalBackend() == "postgres-pgvector-fts" {
@@ -527,6 +530,50 @@ func (s *Server) deleteOfficeDraft(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) submitOfficeDraftConfirmation(w http.ResponseWriter, r *http.Request) {
+	item, err := s.office.SubmitForConfirmation(r.Context(), r.PathValue("draftID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"draft": item, "external_effect": false,
+		"message": "草稿已提交人工确认，尚未发送邮件或创建日程。",
+	})
+}
+
+func (s *Server) decideOfficeDraft(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		s.problem(w, err)
+		return
+	}
+	item, err := s.office.Decide(r.Context(), r.PathValue("draftID"), input.Decision, input.Reason)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	message := "草稿已拒绝，不会产生外部操作。"
+	if item.Status == office.StatusApproved {
+		message = "草稿已批准，但尚未执行；当前版本不会发送邮件或创建日程。"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"draft": item, "external_effect": false, "message": message,
+	})
+}
+
+func (s *Server) listOfficeDraftEvents(w http.ResponseWriter, r *http.Request) {
+	items, err := s.office.ListEvents(r.Context(), r.PathValue("draftID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": items})
+}
+
 type memoryRequest struct {
 	Kind       string
 	Content    string
@@ -559,7 +606,7 @@ func (s *Server) problem(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) || errors.Is(err, summary.ErrNotFound) {
 		status = http.StatusNotFound
-	} else if errors.Is(err, knowledge.ErrEmbeddingMismatch) {
+	} else if errors.Is(err, knowledge.ErrEmbeddingMismatch) || errors.Is(err, office.ErrStateConflict) {
 		status = http.StatusConflict
 	}
 	if status >= 500 {

@@ -98,8 +98,9 @@ func Build() ([]tool.BaseTool, error) {
 					"官方 MCP Go SDK 客户端、只读文件连接器与最小环境隔离",
 					"Microsoft Graph 邮件/日历只读连接器与外部内容安全标记",
 					"邮件/日程结构化草稿预览、持久化与 Run 来源追踪",
+					"Office 草稿持久化人工确认、一次性决策与状态迁移审计",
 				},
-				NextMilestone: "V0.5 办公写操作人工确认、幂等执行与凭据审计",
+				NextMilestone: "V0.5 办公写操作幂等执行、失败恢复与凭据审计",
 			}, nil
 		},
 	)

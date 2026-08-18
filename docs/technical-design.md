@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.5 Office Agent 第三阶段（持久化邮件/日历草稿预览）
+> 适用版本：V0.5 Office Agent 第四阶段（草稿级持久化人工确认）
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -55,7 +55,7 @@ internal/
 ├── mcpbridge/                 MCP Client、发现/白名单与 Eino Tool 适配
 ├── mcpfiles/                  文件目录沙箱与只读 MCP Tools
 ├── mcpmicrosoft/              Graph HTTP、邮件/日历工具和外部内容安全标记
-├── office/                    邮件/日历草稿校验、持久化与 Agent Tools
+├── office/                    邮件/日历草稿校验、持久化、人工确认与 Agent Tools
 ├── chat/                      应用用例和 Run 生命周期
 └── httpapi/                   REST、SSE、Web UI
 ```
@@ -679,19 +679,22 @@ recency = exp(-ln(2) * age / 90 days)
 
 ### 8.15 Office 草稿状态与一致性
 
-`office_drafts` 同时支持 SQLite JSON 文本和 PostgreSQL JSONB，保存 `kind`、`status`、归属 Conversation、来源 Agent Run、规范化 Payload、内容哈希和时间戳。当前可创建状态只有 `draft`；Schema 为后续确认和执行预留 `pending_confirmation`、`approved`、`executing`、`completed`、`rejected`、`failed`、`cancelled`，但当前 Service 不允许进入这些状态，避免把目标设计误当成交付能力。
+`office_drafts` 同时支持 SQLite JSON 文本和 PostgreSQL JSONB，保存 `kind`、`status`、归属 Conversation、来源 Agent Run、规范化 Payload、内容哈希和时间戳。当前 Service 支持 `draft`、`pending_confirmation`、`approved`、`rejected`；Schema 为后续执行预留 `executing`、`completed`、`failed`、`cancelled`，但当前 Service 不允许进入执行状态，避免把目标设计误当成交付能力。
 
 ```text
-当前阶段：draft（仅内部预览，可删除）
+当前阶段：
+draft → pending_confirmation → approved（已批准、未执行）
+                            └→ rejected
 
 下一阶段目标：
-draft → pending_confirmation → approved → executing → completed
-                            ├→ rejected
-                            ├→ cancelled
-                            └→ failed
+approved → executing → completed
+                    ├→ cancelled
+                    └→ failed
 ```
 
-Conversation 或 Agent Run 删除时，草稿通过 `ON DELETE SET NULL` 保留，避免审计对象随聊天清理而消失。只有 `draft` 状态允许删除；未来进入确认或执行链的记录必须通过显式状态迁移处理。`source_run_id + content_hash` 唯一约束为同一 Run 内的工具重试提供幂等性。
+Conversation 或 Agent Run 删除时，草稿通过 `ON DELETE SET NULL` 保留，避免审计对象随聊天清理而消失。只有 `draft` 状态允许删除；进入确认链后必须通过显式状态迁移处理。`source_run_id + content_hash` 唯一约束为同一 Run 内的工具重试提供幂等性。
+
+人工确认使用 compare-and-swap：SQL 只有在当前状态等于预期状态时才更新。提交确认要求 `draft`，决定要求 `pending_confirmation`；重复或并发请求返回 409。状态更新与 `office_draft_events` 插入在同一事务提交，事件记录 from/to、actor、原因和时间，避免状态与审计半完成。当前没有身份系统，actor 固定为 `user`；生产接入后必须替换为真实主体 ID。
 
 ## 9. 并发、取消与错误处理
 
@@ -1011,11 +1014,16 @@ DELETE /api/memories/{memoryID}
 GET /api/office/drafts?kind=email&status=draft&limit=100
 GET /api/office/drafts/{draftID}
 DELETE /api/office/drafts/{draftID}
+POST /api/office/drafts/{draftID}/confirmation
+POST /api/office/drafts/{draftID}/decision
+GET /api/office/drafts/{draftID}/events
 ```
 
 列表默认最多返回 100 条、按更新时间倒序，`kind` 可选 `email`/`calendar`，`status` 当前使用 `draft`。详情响应为完整 Draft；邮件 Payload 包含 `to`、`cc`、`subject`、`body`，日历 Payload 包含 `attendees`、`subject`、`start`、`end`、`timezone`、`location`、`body` 和 `is_all_day`。
 
 只有内部预览状态的草稿可以删除；成功返回 204，不存在返回 404，非法筛选参数返回 400。创建不开放独立 REST API，只能由 Agent 在有效 Run 中调用草稿预览 Tool，确保每条草稿都有可信 `source_run_id`。
+
+`POST .../confirmation` 无请求体，把 `draft` 原子推进到 `pending_confirmation`。决定请求为 `{"decision":"approved","reason":"收件人和正文已核对"}`，decision 只允许 approved/rejected，reason 最多 500 字符。重复提交或重复决定返回 409；成功响应固定包含 `external_effect:false` 和“尚未执行”提示。事件接口按时间返回不可变迁移记录。
 
 ## 11. SSE 事件契约
 
@@ -1041,7 +1049,7 @@ DELETE /api/office/drafts/{draftID}
 - 欢迎页提供三个可触发工具的示例；
 - 侧边栏知识库弹窗支持上传、文档列表、分块数和删除；
 - 侧边栏长期记忆面板支持 Semantic/Episodic 创建、编辑、重要性/过期时间设置和删除，展示手动/对话来源、人工修正状态及自动提取/召回开关状态；
-- 侧边栏办公草稿面板展示持久化邮件/日历预览、来源 Run、更新时间和“仅预览”状态，支持刷新、查看结构化内容和删除；
+- 侧边栏办公草稿面板展示持久化邮件/日历预览、来源 Run、更新时间和中文状态；支持删除 draft、提交确认、一次性批准/拒绝及查看迁移记录；
 - 使用 `fetch + ReadableStream` 解析 POST SSE；
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用和专业 Agent 协作均以可折叠 Trace 展示；专家中间输出不会进入最终回答气泡；
@@ -1074,6 +1082,7 @@ DELETE /api/office/drafts/{draftID}
 - 邮件/日历草稿只保存到 Zora 数据库；当前代码没有邮件发送或 Graph 日历写入调用，ToolResult 固定返回 `external_effect=false`。
 - 草稿归属的 Conversation/Run ID 由 Chat 注入 Context，模型参数不能覆盖；收件地址、时间窗、时区和内容长度在 Service 层二次校验。
 - 同一 Run 的同内容草稿由数据库唯一约束幂等去重；Web 和回答都明确标记“仅预览、尚未发送/创建”。
+- 人工确认状态迁移使用数据库 CAS 并与审计事件同事务；批准响应和页面仍标记“未执行”，当前没有任何 Graph 写调用。
 
 ### 上线前必须补充
 
@@ -1112,7 +1121,7 @@ DELETE /api/office/drafts/{draftID}
 | Memory A/B 测试 | 严格数据集校验；Control/Treatment 事实覆盖；意外召回与答案污染反例；RunEvent 召回 ID 解析；完整 CLI 基线 |
 | Multi-Agent 评测测试 | 严格数据集校验；路由序列、意外专家和答案完成指标；协作事件闭环；完整 Chat/RunEvent CLI 基线 |
 | MCP/Graph 测试 | in-memory MCP 握手、只读标注、白名单和环境隔离；纯内存 HTTP 验证 Graph Bearer Token、查询窗口、关键词过滤、错误脱敏和不可信内容警告 |
-| Office 草稿测试 | 邮件/日历参数归一化与拒绝规则；可信 Run Context；ToolResult 无外部副作用；SQLite 生命周期和幂等性；PostgreSQL Schema；Mock Agent→Tool→SQLite→SSE→REST 端到端 |
+| Office 草稿测试 | 邮件/日历参数归一化与拒绝规则；可信 Run Context；ToolResult 无外部副作用；SQLite 生命周期、幂等和一次性确认；PostgreSQL Schema；Mock Agent→Tool→SQLite→SSE→REST→确认/决定/事件端到端 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
 | HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404、自动提取/召回，以及摘要触发、查询和 Mock 上下文作答 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
@@ -1197,7 +1206,7 @@ flowchart LR
 
 ### 17.4 V0.5 Office Agent
 
-第三阶段在官方 MCP 只读链路基础上，增加了持久化邮件/日历草稿预览。现有只读连接器链路如下：
+第四阶段在官方 MCP 只读链路和持久化邮件/日历草稿预览基础上，增加了草稿级人工确认。现有只读连接器链路如下：
 
 ```mermaid
 sequenceDiagram
@@ -1242,9 +1251,11 @@ Graph 请求统一设置 Bearer Token、JSON Accept 和纯文本正文偏好，�
 
 当前调用继续复用已有 `tool_call` / `tool_result` RunEvent，因此无需新增 MCP 专属数据库表。`GET /api/info` 只公开 `mcp_enabled`、`mcp_tool_count` 和总工具数，不返回命令、参数、根目录或环境变量。in-memory MCP 端到端测试覆盖握手、发现、Schema 适配和调用；文件测试覆盖隐藏路径、`..` 与符号链接逃逸；Graph 使用纯内存 HTTP Transport 验证鉴权、查询、四工具只读标注与错误脱敏。由于当前开发环境没有 Microsoft 租户凭据，真实账号集成验收仍待专用测试租户完成。
 
-第三阶段新增 `preview_email_draft` 与 `preview_calendar_draft`。它们只生成规范化 Payload 并保存 `office_drafts`，返回 `external_effect=false`；单 Agent 可以直接使用，多 Agent 模式只授权 Writer 使用。草稿归属由执行 Context 提供，SQLite/PostgreSQL 使用 `(source_run_id, content_hash)` 去重，REST/Web 提供列表、详情和删除。该能力没有调用 `sendMail`、`events POST` 等外部写接口，因此“草稿已保存”不能表述为“邮件已发送”或“日程已创建”。
+第三阶段新增 `preview_email_draft` 与 `preview_calendar_draft`。它们只生成规范化 Payload 并保存 `office_drafts`，返回 `external_effect=false`；单 Agent 可以直接使用，多 Agent 模式只授权 Writer 使用。草稿归属由执行 Context 提供，SQLite/PostgreSQL 使用 `(source_run_id, content_hash)` 去重，REST/Web 提供列表、详情和删除。
 
-下一阶段需要把草稿状态推进到“等待用户确认 → 一次性批准 → 幂等执行 → 结果回写”，并补齐 OAuth 登录/刷新、Secret 托管、最小 Graph 写权限和真实租户集成测试。当前多 Agent 的通用审批门禁与 OfficeDraft 尚未绑定，不能直接视为办公写操作已安全落地。
+第四阶段将确认直接绑定到 OfficeDraft，而不是复用会暂停 Agent Run 的通用审批等待器。独立 REST/Web 流程执行 `draft → pending_confirmation → approved/rejected`，数据库 CAS 保证决定一次性，`office_draft_events` 与状态原子落库。该能力仍没有调用 `sendMail`、`events POST` 等外部写接口，因此“草稿已批准”也不能表述为“邮件已发送”或“日程已创建”。
+
+下一阶段需要从 approved 草稿创建独立幂等 Operation，增加执行租约、失败恢复、结果回写，并补齐 OAuth 登录/刷新、Secret 托管、最小 Graph 写权限和真实租户集成测试。当前人工确认完成不代表办公写操作已安全落地。
 
 ## 18. 维护约定
 

@@ -6,9 +6,9 @@ const state = {
   messages: [],
   documents: [],
   memories: [],
-	officeDrafts: [],
-	memoryAutoCapture: false,
-	memoryRecall: false,
+  officeDrafts: [],
+  memoryAutoCapture: false,
+  memoryRecall: false,
   multiAgent: false,
   humanApproval: false,
   editingMemoryID: null,
@@ -36,7 +36,7 @@ const elements = {
   runtimeModel: document.querySelector("#runtimeModel"),
   runtimeProvider: document.querySelector("#runtimeProvider"),
   statusDot: document.querySelector("#statusDot"),
-	toolBadge: document.querySelector("#toolBadge"),
+  toolBadge: document.querySelector("#toolBadge"),
   openKnowledge: document.querySelector("#openKnowledge"),
   closeKnowledge: document.querySelector("#closeKnowledge"),
   knowledgeDialog: document.querySelector("#knowledgeDialog"),
@@ -93,25 +93,25 @@ async function initialize() {
     const [info, result, knowledgeResult, memoryResult, officeDraftResult] = await Promise.all([
       api("/api/info"), api("/api/conversations"), api("/api/knowledge/documents"),
       api("/api/memories?include_expired=true"),
-      api("/api/office/drafts?status=draft"),
+      api("/api/office/drafts?limit=200"),
     ]);
     elements.runtimeModel.textContent = info.model;
     state.multiAgent = Boolean(info.multi_agent);
     state.humanApproval = Boolean(info.human_approval);
     elements.runtimeProvider.textContent = `${info.provider} · ${info.version}${state.multiAgent ? " · 多 Agent" : ""}`;
-	elements.toolBadge.innerHTML = `<i></i> ${Number(info.tool_count || 6)} 个受控工具${info.mcp_enabled ? " · MCP" : ""}`;
+    elements.toolBadge.innerHTML = `<i></i> ${Number(info.tool_count || 6)} 个受控工具${info.mcp_enabled ? " · MCP" : ""}`;
     state.conversations = result.conversations || [];
     state.documents = knowledgeResult.documents || [];
     state.memories = memoryResult.memories || [];
-	state.officeDrafts = officeDraftResult.drafts || [];
-	state.memoryAutoCapture = Boolean(info.memory_auto_capture);
-	state.memoryRecall = Boolean(info.memory_recall);
-	elements.memoryDescription.textContent = memoryStatusText();
+    state.officeDrafts = officeDraftResult.drafts || [];
+    state.memoryAutoCapture = Boolean(info.memory_auto_capture);
+    state.memoryRecall = Boolean(info.memory_recall);
+    elements.memoryDescription.textContent = memoryStatusText();
     elements.embeddingModel.textContent = `Embedding: ${info.embedding_model}`;
     renderConversations();
     renderKnowledgeDocuments();
     renderMemories();
-	renderOfficeDrafts();
+    renderOfficeDrafts();
     if (state.conversations.length) {
       await selectConversation(state.conversations[0].id);
     }
@@ -199,7 +199,7 @@ async function openOfficeDrafts() {
 }
 
 async function refreshOfficeDrafts() {
-  const result = await api("/api/office/drafts?status=draft");
+  const result = await api("/api/office/drafts?limit=200");
   state.officeDrafts = result.drafts || [];
   renderOfficeDrafts();
 }
@@ -225,7 +225,8 @@ function officeDraftNode(item) {
   const kind = document.createElement("strong");
   kind.textContent = item.kind === "email" ? "邮件" : "日程";
   const status = document.createElement("span");
-  status.textContent = item.status === "draft" ? "仅预览" : item.status;
+  status.textContent = officeDraftStatusText(item.status);
+  status.className = `status-${item.status}`;
   heading.append(kind, status);
   const title = document.createElement("h3");
   title.textContent = item.title;
@@ -240,13 +241,102 @@ function officeDraftNode(item) {
   meta.textContent = `创建于 ${formatDateTime(item.created_at)} · 草稿 ID ${item.id}`;
   const actions = document.createElement("div");
   actions.className = "office-draft-actions";
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.textContent = "删除草稿";
-  remove.addEventListener("click", () => deleteOfficeDraft(item));
-  actions.append(remove);
-  card.append(heading, title, detail, meta, actions);
+  if (item.status === "draft") {
+    actions.append(
+      officeDraftAction("提交人工确认", "primary", () => submitOfficeDraft(item)),
+      officeDraftAction("删除草稿", "danger", () => deleteOfficeDraft(item)),
+    );
+  } else if (item.status === "pending_confirmation") {
+    actions.append(
+      officeDraftAction("拒绝", "danger", () => decideOfficeDraft(item, "rejected")),
+      officeDraftAction("批准", "primary", () => decideOfficeDraft(item, "approved")),
+    );
+  }
+  actions.append(officeDraftAction("查看记录", "", () => showOfficeDraftEvents(item, card)));
+  const safety = document.createElement("p");
+  safety.className = "office-draft-safety";
+  safety.textContent = item.status === "approved"
+    ? "已记录批准决定，但尚未执行外部操作。"
+    : item.status === "rejected"
+      ? "已拒绝，不会产生外部操作。"
+      : item.status === "pending_confirmation"
+        ? "正在等待人工决定，内容已冻结。"
+        : "仅保存在 Zora 内部，尚未提交确认。";
+  card.append(heading, title, detail, meta, safety, actions);
   return card;
+}
+
+function officeDraftStatusText(status) {
+  return ({
+    draft: "仅预览",
+    pending_confirmation: "等待确认",
+    approved: "已批准 · 未执行",
+    rejected: "已拒绝",
+    executing: "执行中",
+    completed: "已完成",
+    failed: "执行失败",
+    cancelled: "已取消",
+  })[status] || status;
+}
+
+function officeDraftAction(label, style, action) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = label;
+  if (style) button.classList.add(style);
+  button.addEventListener("click", action);
+  return button;
+}
+
+async function submitOfficeDraft(item) {
+  if (!confirm(`提交草稿「${item.title}」进行人工确认？提交后内容将冻结。`)) return;
+  try {
+    const result = await api(`/api/office/drafts/${item.id}/confirmation`, { method: "POST" });
+    await refreshOfficeDrafts();
+    notify(result.message || "草稿已进入等待确认状态");
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function decideOfficeDraft(item, decision) {
+  const approved = decision === "approved";
+  const action = approved ? "批准" : "拒绝";
+  const warning = approved ? "批准只记录决定，当前版本不会立即发送或创建日程。" : "拒绝后不会产生外部操作。";
+  if (!confirm(`${action}草稿「${item.title}」？\n\n${warning}`)) return;
+  try {
+    const result = await api(`/api/office/drafts/${item.id}/decision`, {
+      method: "POST",
+      body: JSON.stringify({ decision, reason: `用户在 Web 草稿箱${action}` }),
+    });
+    await refreshOfficeDrafts();
+    notify(result.message);
+  } catch (error) {
+    notify(error.message);
+  }
+}
+
+async function showOfficeDraftEvents(item, card) {
+  try {
+    const result = await api(`/api/office/drafts/${item.id}/events`);
+    card.querySelector(".office-draft-events")?.remove();
+    const list = document.createElement("ol");
+    list.className = "office-draft-events";
+    const events = result.events || [];
+    if (!events.length) {
+      const row = document.createElement("li");
+      row.textContent = "尚无状态迁移记录";
+      list.append(row);
+    }
+    for (const event of events) {
+      const row = document.createElement("li");
+      row.textContent = `${formatDateTime(event.created_at)} · ${officeDraftStatusText(event.from_status)} → ${officeDraftStatusText(event.to_status)}${event.reason ? ` · ${event.reason}` : ""}`;
+      list.append(row);
+    }
+    card.append(list);
+  } catch (error) {
+    notify(error.message);
+  }
 }
 
 async function deleteOfficeDraft(item) {

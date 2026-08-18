@@ -404,12 +404,20 @@ button { color: inherit; }
 .office-draft-heading { display: flex; align-items: center; gap: 8px; }
 .office-draft-heading strong { padding: 3px 7px; border-radius: 6px; background: var(--accent-soft); color: #cfc9ff; font-size: 9px; }
 .office-draft-heading span { margin-left: auto; color: #77d9b1; font-size: 9px; }
+.office-draft-heading .status-pending_confirmation { color: #f2c66d; }
+.office-draft-heading .status-approved { color: #77d9b1; }
+.office-draft-heading .status-rejected, .office-draft-heading .status-failed { color: var(--danger); }
 .office-draft-item h3 { margin: 10px 0 8px; font-size: 12px; }
 .office-draft-item pre { max-height: 190px; margin: 0 0 9px; overflow: auto; color: #d8d9de; font: inherit; font-size: 10px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
 .office-draft-item small { color: var(--muted-2); font-size: 9px; }
-.office-draft-actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+.office-draft-safety { margin: 9px 0 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.office-draft-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; margin-top: 10px; }
 .office-draft-actions button { padding: 6px 9px; border: 0; border-radius: 7px; background: var(--panel-3); color: var(--muted); font-size: 9px; cursor: pointer; }
 .office-draft-actions button:hover { background: rgba(255,107,125,.12); color: var(--danger); }
+.office-draft-actions button.primary { background: var(--accent-soft); color: #d5d0ff; }
+.office-draft-actions button.primary:hover { background: rgba(124,102,255,.24); color: white; }
+.office-draft-actions button.danger:hover { background: rgba(255,107,125,.12); color: var(--danger); }
+.office-draft-events { margin: 12px 0 0; padding: 10px 10px 10px 26px; border-radius: 9px; background: rgba(0,0,0,.16); color: var(--muted); font-size: 9px; line-height: 1.7; }
 .mobile-only { display: none; }
 .sidebar-scrim { display: none; }
 

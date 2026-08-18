@@ -88,6 +88,18 @@ CREATE TABLE IF NOT EXISTS office_drafts (
 CREATE INDEX IF NOT EXISTS idx_office_drafts_status_updated
     ON office_drafts(status, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS office_draft_events (
+    id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL REFERENCES office_drafts(id) ON DELETE CASCADE,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_office_draft_events_draft_created
+    ON office_draft_events(draft_id, created_at, id);
+
 CREATE TABLE IF NOT EXISTS run_events (
     sequence BIGSERIAL PRIMARY KEY,
     id TEXT NOT NULL UNIQUE,
@@ -179,4 +191,5 @@ INSERT INTO zora_schema_versions(version) VALUES (3) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (4) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (5) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (6) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (7) ON CONFLICT DO NOTHING;
 `

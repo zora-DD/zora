@@ -164,11 +164,33 @@ func TestAgentCreatesPersistedEmailDraftPreview(t *testing.T) {
 	if len(response.Drafts) != 1 || response.Drafts[0].ConversationID != conversation.ID || response.Drafts[0].Status != office.StatusDraft {
 		t.Fatalf("unexpected drafts: %+v", response.Drafts)
 	}
-	deleteRequest := httptest.NewRequest(http.MethodDelete, "/api/office/drafts/"+response.Drafts[0].ID, nil)
-	deleted := httptest.NewRecorder()
-	handler.ServeHTTP(deleted, deleteRequest)
-	if deleted.Code != http.StatusNoContent {
-		t.Fatalf("delete status = %d, body = %s", deleted.Code, deleted.Body.String())
+	draftID := response.Drafts[0].ID
+	submitRequest := httptest.NewRequest(http.MethodPost, "/api/office/drafts/"+draftID+"/confirmation", nil)
+	submitted := httptest.NewRecorder()
+	handler.ServeHTTP(submitted, submitRequest)
+	if submitted.Code != http.StatusOK || !strings.Contains(submitted.Body.String(), `"status":"pending_confirmation"`) ||
+		!strings.Contains(submitted.Body.String(), `"external_effect":false`) {
+		t.Fatalf("submit status = %d, body = %s", submitted.Code, submitted.Body.String())
+	}
+	duplicateSubmit := httptest.NewRecorder()
+	handler.ServeHTTP(duplicateSubmit, httptest.NewRequest(http.MethodPost, "/api/office/drafts/"+draftID+"/confirmation", nil))
+	if duplicateSubmit.Code != http.StatusConflict {
+		t.Fatalf("duplicate submit status = %d, body = %s", duplicateSubmit.Code, duplicateSubmit.Body.String())
+	}
+	decisionRequest := httptest.NewRequest(http.MethodPost, "/api/office/drafts/"+draftID+"/decision",
+		strings.NewReader(`{"decision":"approved","reason":"收件人和正文已核对"}`))
+	decisionRequest.Header.Set("Content-Type", "application/json")
+	decided := httptest.NewRecorder()
+	handler.ServeHTTP(decided, decisionRequest)
+	if decided.Code != http.StatusOK || !strings.Contains(decided.Body.String(), `"status":"approved"`) ||
+		!strings.Contains(decided.Body.String(), "尚未执行") {
+		t.Fatalf("decision status = %d, body = %s", decided.Code, decided.Body.String())
+	}
+	eventsRequest := httptest.NewRequest(http.MethodGet, "/api/office/drafts/"+draftID+"/events", nil)
+	eventsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(eventsResponse, eventsRequest)
+	if eventsResponse.Code != http.StatusOK || !strings.Contains(eventsResponse.Body.String(), `"to_status":"approved"`) {
+		t.Fatalf("events status = %d, body = %s", eventsResponse.Code, eventsResponse.Body.String())
 	}
 }
 

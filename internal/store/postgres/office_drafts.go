@@ -94,6 +94,67 @@ func (p *Postgres) DeleteDraft(ctx context.Context, id string) error {
 	return nil
 }
 
+// TransitionDraft 通过 compare-and-swap 更新状态，并在同一事务写入不可变审计事件。
+func (p *Postgres) TransitionDraft(ctx context.Context, id, expectedStatus, nextStatus string, event office.DraftEvent) (office.Draft, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return office.Draft{}, fmt.Errorf("开始办公草稿状态事务失败：%w", err)
+	}
+	defer tx.Rollback(ctx)
+	updated, err := scanOfficeDraft(tx.QueryRow(ctx, `
+UPDATE office_drafts SET status = $1, updated_at = $2
+WHERE id = $3 AND status = $4
+RETURNING id, kind, status, conversation_id, source_run_id, title, payload::text,
+          content_hash, created_at, updated_at`, nextStatus, normalizeTime(event.CreatedAt), id, expectedStatus))
+	if errors.Is(err, pgx.ErrNoRows) {
+		current, getErr := scanOfficeDraft(tx.QueryRow(ctx, officeDraftSelect+` WHERE id = $1`, id))
+		if errors.Is(getErr, pgx.ErrNoRows) {
+			return office.Draft{}, store.ErrNotFound
+		}
+		if getErr != nil {
+			return office.Draft{}, fmt.Errorf("查询办公草稿当前状态失败：%w", getErr)
+		}
+		return office.Draft{}, fmt.Errorf("%w：当前为 %s，不能按 %s 处理", office.ErrStateConflict, current.Status, expectedStatus)
+	}
+	if err != nil {
+		return office.Draft{}, fmt.Errorf("更新办公草稿状态失败：%w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+INSERT INTO office_draft_events(id, draft_id, from_status, to_status, actor, reason, created_at)
+VALUES($1, $2, $3, $4, $5, $6, $7)`, event.ID, id, expectedStatus, nextStatus,
+		event.Actor, event.Reason, normalizeTime(event.CreatedAt)); err != nil {
+		return office.Draft{}, fmt.Errorf("保存办公草稿审计事件失败：%w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return office.Draft{}, fmt.Errorf("提交办公草稿状态事务失败：%w", err)
+	}
+	return updated, nil
+}
+
+func (p *Postgres) ListDraftEvents(ctx context.Context, draftID string) ([]office.DraftEvent, error) {
+	rows, err := p.pool.Query(ctx, `
+SELECT id, draft_id, from_status, to_status, actor, reason, created_at
+FROM office_draft_events WHERE draft_id = $1 ORDER BY created_at, id`, draftID)
+	if err != nil {
+		return nil, fmt.Errorf("查询办公草稿审计事件失败：%w", err)
+	}
+	defer rows.Close()
+	items := make([]office.DraftEvent, 0)
+	for rows.Next() {
+		var item office.DraftEvent
+		if err := rows.Scan(&item.ID, &item.DraftID, &item.FromStatus, &item.ToStatus,
+			&item.Actor, &item.Reason, &item.CreatedAt); err != nil {
+			return nil, fmt.Errorf("读取办公草稿审计事件失败：%w", err)
+		}
+		item.CreatedAt = normalizeTime(item.CreatedAt)
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历办公草稿审计事件失败：%w", err)
+	}
+	return items, nil
+}
+
 func (p *Postgres) getDraftByRunHash(ctx context.Context, runID, contentHash string) (office.Draft, error) {
 	row := p.pool.QueryRow(ctx, officeDraftSelect+` WHERE source_run_id = $1 AND content_hash = $2`, runID, contentHash)
 	item, err := scanOfficeDraft(row)
