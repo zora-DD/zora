@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "default_model_id": "primary",
+  "models": [
+    {
+      "id": "primary",
+      "name": "主模型",
+      "provider": "openai",
+      "model": "CHANGE_ME_LLM_MODEL",
+      "base_url": "CHANGE_ME_LLM_BASE_URL",
+      "api_key_env": "ZORA_LLM_API_KEY"
+    }
+  ],
+  "embedding": {
+    "provider": "openai",
+    "model": "CHANGE_ME_EMBEDDING_MODEL",
+    "base_url": "CHANGE_ME_EMBEDDING_BASE_URL",
+    "dimensions": 1024,
+    "api_key_env": "ZORA_EMBEDDING_API_KEY"
+  }
+}

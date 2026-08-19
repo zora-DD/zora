@@ -55,7 +55,7 @@ func (s *Service) PrepareOperation(ctx context.Context, draftID string) (Operati
 	}
 	event := OperationEvent{
 		ID: id.New("operation_event"), OperationID: operation.ID,
-		FromStatus: "", ToStatus: OperationPending, Actor: "user",
+		FromStatus: "", ToStatus: OperationPending, Actor: userActor(ctx),
 		Reason: "用户为已批准草稿准备执行任务", CreatedAt: now,
 	}
 	return s.store.CreateOperation(ctx, operation, event)

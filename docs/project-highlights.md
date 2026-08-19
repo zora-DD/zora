@@ -137,6 +137,8 @@ Go Context 是跨层取消的标准机制，会话级锁比全局锁并发度更
 ### 关键代码位置
 
 - [`internal/config/config.go`](../internal/config/config.go)：`ModelProfile` 解析、校验和 Key 引用；
+- [`internal/config/ai_config.go`](../internal/config/ai_config.go)：仓库外 AI 配置文件、严格 JSON 和配置源冲突校验；
+- [`internal/secrets/secrets.go`](../internal/secrets/secrets.go)：权限收紧的 Secret/运行时配置文件加载；
 - [`cmd/zora/main.go`](../cmd/zora/main.go)：为每个 Profile 装配独立 Runtime；
 - [`internal/chat/service.go`](../internal/chat/service.go)：`WithRuntimeProfiles`、`selectRuntime`；
 - [`internal/httpapi/web/app.js`](../internal/httpapi/web/app.js)：模型选择器与 `model_id` 请求参数。
@@ -151,11 +153,11 @@ Go Context 是跨层取消的标准机制，会话级锁比全局锁并发度更
 
 ### 技术实现
 
-服务启动时从 `ZORA_MODELS_JSON` 构建最多 20 个可信 Profile。JSON 只允许引用 `api_key_env`，禁止内嵌 Key。每个 Profile 拥有独立 Runtime，请求只能提交白名单内的 `model_id`。实际模型写入 AgentRun，后台记忆提取和摘要固定使用默认模型。
+服务优先从 `ZORA_AI_CONFIG_FILE` 构建最多 20 个可信 Profile，并同时加载 Embedding 元数据；旧 `ZORA_MODELS_JSON` 仅用于兼容。外置文件强制普通文件、64 KiB 上限和 0400/0600 权限，使用严格 JSON 拒绝未知字段，只允许引用 `api_key_env`，禁止内嵌 Key，也禁止与旧模型环境变量混用。每个 Profile 拥有独立 Runtime，请求只能提交白名单内的 `model_id`。实际模型写入 AgentRun，后台记忆提取和摘要固定使用默认模型。
 
 ### 为什么这样实现
 
-模型选择是服务端注册表路由，而不是客户端动态配置。这样兼顾自由切换、密钥安全、并发隔离与结果审计。
+模型选择是服务端注册表路由，而不是客户端动态配置。配置变更通过重启或滚动重启原子生效，避免在途请求同时看到新旧 Runtime；Embedding 变化要求显式重建索引，避免不同模型或维度的向量混用。这样兼顾自由切换、密钥安全、并发隔离与结果审计。
 
 ## 6. 文档摄取、版本、ACL 与可定位引用
 
@@ -579,11 +581,16 @@ Store 在同一个事务中保存 assistant Message 和 pending CaptureJob；`ru
 
 数据库任务表在当前规模下比引入 MQ 更容易部署，同时已经具备恢复、多实例竞争、状态查询和人工运维能力。按 kind 独立 Worker 保留资源隔离，类型化 Handler 又避免把业务逻辑塞进通用调度器。未来需要 Kafka/RabbitMQ 时，可以替换 Queue/Store 边界而不改 Knowledge 和 Summary Service。
 
-## 22. API 安全边界不是一个网关开关
+## 22. 多用户、多副本安全边界不是一个网关开关
 
 ### 关键代码位置
 
 - [`internal/security/security.go`](../internal/security/security.go)：可信客户端 IP、令牌桶、CORS、CSRF 与配额中间件；
+- [`internal/security/redis_limiter.go`](../internal/security/redis_limiter.go)：使用 Redis TIME 与 Lua 原子执行的跨副本令牌桶；
+- [`internal/authn/github.go`](../internal/authn/github.go)：GitHub OAuth、state、PKCE、服务端 Session 与身份中间件；
+- [`internal/identity/identity.go`](../internal/identity/identity.go)：可信 principal/tenant 请求上下文；
+- [`internal/store/postgres/scope.go`](../internal/store/postgres/scope.go)：PostgreSQL 查询作用域；
+- [`internal/store/postgres/conversation_lock.go`](../internal/store/postgres/conversation_lock.go)：跨副本同会话 advisory lock；
 - [`internal/store/sqlite/api_quota.go`](../internal/store/sqlite/api_quota.go)：SQLite 持久化配额原子扣减；
 - [`internal/store/postgres/api_quota.go`](../internal/store/postgres/api_quota.go)：PostgreSQL 条件 Upsert；
 - [`internal/secrets/secrets.go`](../internal/secrets/secrets.go)：环境变量/Secret 文件互斥加载与权限校验；
@@ -591,7 +598,7 @@ Store 在同一个事务中保存 assistant Message 和 pending CaptureJob；`ru
 
 ### 业务场景
 
-Agent 的一次请求可能触发多次模型、Embedding 和工具调用，公网滥用的成本远高于普通 CRUD。Web 又需要 Cookie 与跨源部署，模型 Key 和数据库密码也不能留在仓库或进程参数里。
+Agent 的一次请求可能触发多次模型、Embedding 和工具调用，公网滥用的成本远高于普通 CRUD。真实用户还必须只能看到自己的会话、记忆、私有文档与草稿；任意 Pod 都要能承接 OAuth 回调和后续请求。Web 又需要 Cookie 与跨源部署，模型 Key 和数据库密码也不能留在仓库或进程参数里。
 
 ### 问题分析
 
@@ -599,11 +606,13 @@ Agent 的一次请求可能触发多次模型、Embedding 和工具调用，公�
 
 ### 技术实现
 
-应用先做精确 Origin/CORS 校验，再按可信代理解析出的客户端 IP 使用互斥令牌桶限制突发。写请求在扣减配额前校验 256 bit 随机双提交 CSRF Token。请求、Chat Run 和上传字节按 UTC 日写入 `api_usage_daily`，SQLite/PostgreSQL 都使用条件 Upsert 原子完成“检查 + 扣减”。核心凭据支持直接环境变量或 `_FILE`，启动时拒绝双配、非普通文件、超过 64 KiB 和 group/other 可读权限。响应使用 429、`Retry-After` 与限额 Header。
+GitHub OAuth 使用一次性 state 和 PKCE S256；回调读取稳定数字 ID 后，把 principal 保存到 Redis 随机会话，浏览器只有 HttpOnly Cookie。身份中间件位于配额和业务 Handler 外层，tenant/principal 只能来自服务端 Context。PostgreSQL 的会话、消息、Run、知识、记忆、任务、审批与草稿查询都附加作用域。同一会话跨 Pod 的 Agent Run 使用 advisory lock 串行；人工审批以 PostgreSQL 为事实源并轮询终态，所以确认请求落到其他 Pod 也能唤醒原 SSE。
+
+应用再做精确 Origin/CORS 校验，按可信代理解析出的客户端 IP 使用 Redis Lua 或本地互斥令牌桶限制突发。写请求在扣减配额前校验 256 bit 随机双提交 CSRF Token。请求、Chat Run 和上传字节按 UTC 日写入 `api_usage_daily`，SQLite/PostgreSQL 都使用条件 Upsert 原子完成“检查 + 扣减”。核心凭据支持直接环境变量或 `_FILE`，启动时拒绝双配、非普通文件、超过 64 KiB 和 group/other 可读权限。响应使用 429、`Retry-After` 与限额 Header。
 
 ### 为什么这样实现
 
-进程内令牌桶成本低，适合当前单实例；数据库日配额能够跨重启并自然迁移到 PostgreSQL 多实例。双提交 Token 无需额外 Session Store，适合当前自包含 Web。精确 Origin 与可信代理白名单避免“为了能用而全放开”。代码同时明确边界：真正多租户仍需 JWT/OIDC，真正多副本瞬时限流仍应下沉到网关或 Redis，Secret 自动轮换仍交给 Vault/KMS。
+本地模式保留进程内令牌桶，减少开发依赖；配置 Redis/Tair 后改用 Lua 原子令牌桶，让副本扩缩容不改变总限流语义。GitHub OAuth state 与随机 Session 都放 Redis，业务表则使用稳定 GitHub 数字 ID 派生的 tenant/principal 过滤。数据库日配额跨重启，双提交 CSRF Token 不需要把 CSRF 状态写入 Session。精确 Origin 与可信代理白名单避免“为了能用而全放开”。边界也很明确：当前是“每个 GitHub 用户一个租户”，组织共享/RBAC/RLS 与 Secret 自动轮换仍需后续完成。
 
 ## 如何向面试官总结这些亮点
 

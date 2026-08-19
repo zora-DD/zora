@@ -1,0 +1,149 @@
+name: zora-staging
+
+# 低成本 staging 使用单台轻量应用服务器承载全部容器。
+# 该方案支持真实多用户登录，但不具备跨主机容灾能力，不能替代生产 ACK 多副本架构。
+services:
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      zora:
+        condition: service_healthy
+    environment:
+      ZORA_DOMAIN: ${ZORA_DOMAIN:?必须配置 ZORA_DOMAIN}
+      ZORA_ACME_EMAIL: ${ZORA_ACME_EMAIL:?必须配置 ZORA_ACME_EMAIL}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      zora-net:
+        ipv4_address: 172.28.0.2
+    mem_limit: 64m
+
+  zora:
+    image: ${ZORA_IMAGE:?必须配置 ZORA_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # 应用只在容器网络监听，公网流量必须先经过 Caddy HTTPS 入口。
+      ZORA_ADDR: :8088
+      ZORA_STORE_PROVIDER: postgres
+      ZORA_POSTGRES_DSN_FILE: /run/zora-secrets/postgres_dsn
+      ZORA_POSTGRES_MAX_CONNS: 5
+      ZORA_REDIS_URL_FILE: /run/zora-secrets/redis_url
+      ZORA_REPLICA_COUNT: 1
+
+      # staging 启用真实 GitHub 登录和安全 Cookie；回调地址必须与 OAuth App 完全一致。
+      ZORA_AUTH_ENABLED: "true"
+      ZORA_GITHUB_OAUTH_CLIENT_ID: ${ZORA_GITHUB_OAUTH_CLIENT_ID:?必须配置 GitHub Client ID}
+      ZORA_GITHUB_OAUTH_CLIENT_SECRET_FILE: /run/zora-secrets/github_oauth_client_secret
+      ZORA_GITHUB_OAUTH_REDIRECT_URL: https://${ZORA_DOMAIN}/api/auth/callback
+      ZORA_COOKIE_SECURE: "true"
+      ZORA_CSRF_ENABLED: "true"
+      ZORA_RATE_LIMIT_ENABLED: "true"
+      ZORA_RATE_LIMIT_REQUESTS_PER_SECOND: ${ZORA_RATE_LIMIT_REQUESTS_PER_SECOND:-5}
+      ZORA_RATE_LIMIT_BURST: ${ZORA_RATE_LIMIT_BURST:-10}
+      ZORA_DAILY_REQUEST_QUOTA: ${ZORA_DAILY_REQUEST_QUOTA:-2000}
+      ZORA_DAILY_CHAT_QUOTA: ${ZORA_DAILY_CHAT_QUOTA:-100}
+      ZORA_DAILY_UPLOAD_BYTES_QUOTA: ${ZORA_DAILY_UPLOAD_BYTES_QUOTA:-52428800}
+      # Caddy 使用固定 Compose 子网，应用只信任该小网段传来的代理请求头。
+      ZORA_TRUSTED_PROXY_CIDRS: 172.28.0.0/24
+
+      # 模型与 Embedding 参数从仓库外的只读文件加载；文件内只能引用 Key，不能保存 Key。
+      ZORA_AI_CONFIG_FILE: /run/zora-config/ai-config.json
+      ZORA_LLM_API_KEY_FILE: /run/zora-secrets/llm_api_key
+      ZORA_EMBEDDING_API_KEY_FILE: /run/zora-secrets/embedding_api_key
+      ZORA_REQUEST_TIMEOUT: ${ZORA_REQUEST_TIMEOUT:-120s}
+      ZORA_MAX_ITERATIONS: ${ZORA_MAX_ITERATIONS:-8}
+      ZORA_MULTI_AGENT_ENABLED: ${ZORA_MULTI_AGENT_ENABLED:-false}
+
+      # 轻量服务器不额外运行 Jaeger/Prometheus，避免占满内存；指标端点仍可供验收抓取。
+      ZORA_OTEL_ENVIRONMENT: staging
+      ZORA_OTEL_ENABLED: "false"
+      ZORA_PROMETHEUS_ENABLED: "true"
+      ZORA_METRICS_TOKEN_FILE: /run/zora-secrets/metrics_token
+      ZORA_MCP_ENABLED: "false"
+    volumes:
+      - ./.secrets/postgres_dsn:/run/zora-secrets/postgres_dsn:ro
+      - ./.secrets/redis_url:/run/zora-secrets/redis_url:ro
+      - ./.secrets/github_oauth_client_secret:/run/zora-secrets/github_oauth_client_secret:ro
+      - ./.secrets/llm_api_key:/run/zora-secrets/llm_api_key:ro
+      - ./.secrets/embedding_api_key:/run/zora-secrets/embedding_api_key:ro
+      - ./.secrets/metrics_token:/run/zora-secrets/metrics_token:ro
+      - ./.runtime/ai-config.json:/run/zora-config/ai-config.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    networks:
+      zora-net:
+        ipv4_address: 172.28.0.3
+    mem_limit: 320m
+
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: zora
+      POSTGRES_USER: zora
+      POSTGRES_PASSWORD_FILE: /run/zora-secrets/postgres_password
+    command:
+      - postgres
+      - -c
+      - max_connections=30
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=32MB
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./.secrets/postgres_password:/run/zora-secrets/postgres_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zora -d zora"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      zora-net:
+        ipv4_address: 172.28.0.4
+    mem_limit: 320m
+
+  redis:
+    image: redis:8.2-alpine
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/opt/zora/redis-entrypoint.sh"]
+    volumes:
+      - redis-data:/data
+      - ./redis-entrypoint.sh:/opt/zora/redis-entrypoint.sh:ro
+      - ./.secrets/redis_password:/run/zora-secrets/redis_password:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$(cat /run/zora-secrets/redis_password)\" ping 2>/dev/null | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks:
+      zora-net:
+        ipv4_address: 172.28.0.5
+    mem_limit: 96m
+
+networks:
+  zora-net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  postgres-data:
+  redis-data:
+  caddy-data:
+  caddy-config:

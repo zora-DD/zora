@@ -22,34 +22,40 @@ func Resolve(valueEnv, fileEnv string) (string, error) {
 	if path == "" {
 		return value, nil
 	}
+	return ReadSecureFile(path, fileEnv)
+}
+
+// ReadSecureFile 读取一个权限收紧的普通文件。它同时用于 Secret 和不应进入仓库的运行时配置：
+// 文件不能超过 64 KiB，Unix 下不得允许 group/other 访问。
+func ReadSecureFile(path, source string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("读取 %s 指向的 Secret 文件失败：%w", fileEnv, err)
+		return "", fmt.Errorf("读取 %s 指向的安全文件失败：%w", source, err)
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
-		return "", fmt.Errorf("检查 %s 指向的 Secret 文件失败：%w", fileEnv, err)
+		return "", fmt.Errorf("检查 %s 指向的安全文件失败：%w", source, err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s 必须指向普通文件", fileEnv)
+		return "", fmt.Errorf("%s 必须指向普通文件", source)
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		return "", fmt.Errorf("%s 的权限过宽（%04o），请使用 0400 或 0600", fileEnv, info.Mode().Perm())
+		return "", fmt.Errorf("%s 的权限过宽（%04o），请使用 0400 或 0600", source, info.Mode().Perm())
 	}
 	if info.Size() > maxSecretBytes {
-		return "", fmt.Errorf("%s 指向的 Secret 文件不能超过 64 KiB", fileEnv)
+		return "", fmt.Errorf("%s 指向的安全文件不能超过 64 KiB", source)
 	}
 	contents, err := io.ReadAll(io.LimitReader(file, maxSecretBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("读取 %s 指向的 Secret 文件失败：%w", fileEnv, err)
+		return "", fmt.Errorf("读取 %s 指向的安全文件失败：%w", source, err)
 	}
 	if len(contents) > maxSecretBytes {
-		return "", fmt.Errorf("%s 指向的 Secret 文件不能超过 64 KiB", fileEnv)
+		return "", fmt.Errorf("%s 指向的安全文件不能超过 64 KiB", source)
 	}
 	secret := strings.TrimSpace(string(contents))
 	if secret == "" {
-		return "", fmt.Errorf("%s 指向的 Secret 文件不能为空", fileEnv)
+		return "", fmt.Errorf("%s 指向的安全文件不能为空", source)
 	}
 	return secret, nil
 }

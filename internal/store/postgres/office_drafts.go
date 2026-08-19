@@ -13,13 +13,14 @@ import (
 )
 
 func (p *Postgres) SaveDraft(ctx context.Context, draft office.Draft) (office.Draft, bool, error) {
+	scope := requestScope(ctx)
 	result, err := p.pool.Exec(ctx, `
 INSERT INTO office_drafts(
-    id, kind, status, conversation_id, source_run_id, title, payload,
+    id, tenant_id, principal_id, kind, status, conversation_id, source_run_id, title, payload,
     content_hash, created_at, updated_at
-) VALUES($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10)
+) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12)
 ON CONFLICT(source_run_id, content_hash) DO NOTHING`,
-		draft.ID, draft.Kind, draft.Status, draft.ConversationID, draft.SourceRunID,
+		draft.ID, scope.TenantID, scope.ID, draft.Kind, draft.Status, draft.ConversationID, draft.SourceRunID,
 		draft.Title, string(draft.Payload), draft.ContentHash,
 		normalizeTime(draft.CreatedAt), normalizeTime(draft.UpdatedAt))
 	if err != nil {
@@ -34,7 +35,8 @@ ON CONFLICT(source_run_id, content_hash) DO NOTHING`,
 }
 
 func (p *Postgres) GetDraft(ctx context.Context, id string) (office.Draft, error) {
-	row := p.pool.QueryRow(ctx, officeDraftSelect+` WHERE id = $1`, id)
+	scope := requestScope(ctx)
+	row := p.pool.QueryRow(ctx, officeDraftSelect+` WHERE id = $1 AND tenant_id=$2 AND principal_id=$3`, id, scope.TenantID, scope.ID)
 	item, err := scanOfficeDraft(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return office.Draft{}, store.ErrNotFound
@@ -46,9 +48,10 @@ func (p *Postgres) GetDraft(ctx context.Context, id string) (office.Draft, error
 }
 
 func (p *Postgres) ListDrafts(ctx context.Context, filter office.ListFilter) ([]office.Draft, error) {
-	query := officeDraftSelect + ` WHERE 1=1`
-	args := make([]any, 0, 3)
-	position := 1
+	scope := requestScope(ctx)
+	query := officeDraftSelect + ` WHERE tenant_id=$1 AND principal_id=$2`
+	args := []any{scope.TenantID, scope.ID}
+	position := 3
 	if filter.Kind != "" {
 		query += fmt.Sprintf(" AND kind = $%d", position)
 		args = append(args, filter.Kind)
@@ -81,7 +84,8 @@ func (p *Postgres) ListDrafts(ctx context.Context, filter office.ListFilter) ([]
 }
 
 func (p *Postgres) DeleteDraft(ctx context.Context, id string) error {
-	result, err := p.pool.Exec(ctx, `DELETE FROM office_drafts WHERE id = $1 AND status = 'draft'`, id)
+	scope := requestScope(ctx)
+	result, err := p.pool.Exec(ctx, `DELETE FROM office_drafts WHERE id = $1 AND tenant_id=$2 AND principal_id=$3 AND status = 'draft'`, id, scope.TenantID, scope.ID)
 	if err != nil {
 		return fmt.Errorf("删除办公草稿失败：%w", err)
 	}
@@ -96,6 +100,7 @@ func (p *Postgres) DeleteDraft(ctx context.Context, id string) error {
 
 // TransitionDraft 通过 compare-and-swap 更新状态，并在同一事务写入不可变审计事件。
 func (p *Postgres) TransitionDraft(ctx context.Context, id, expectedStatus, nextStatus string, event office.DraftEvent) (office.Draft, error) {
+	scope := requestScope(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return office.Draft{}, fmt.Errorf("开始办公草稿状态事务失败：%w", err)
@@ -103,11 +108,11 @@ func (p *Postgres) TransitionDraft(ctx context.Context, id, expectedStatus, next
 	defer tx.Rollback(ctx)
 	updated, err := scanOfficeDraft(tx.QueryRow(ctx, `
 UPDATE office_drafts SET status = $1, updated_at = $2
-WHERE id = $3 AND status = $4
+WHERE id = $3 AND tenant_id=$4 AND principal_id=$5 AND status = $6
 RETURNING id, kind, status, conversation_id, source_run_id, title, payload::text,
-          content_hash, created_at, updated_at`, nextStatus, normalizeTime(event.CreatedAt), id, expectedStatus))
+          content_hash, created_at, updated_at`, nextStatus, normalizeTime(event.CreatedAt), id, scope.TenantID, scope.ID, expectedStatus))
 	if errors.Is(err, pgx.ErrNoRows) {
-		current, getErr := scanOfficeDraft(tx.QueryRow(ctx, officeDraftSelect+` WHERE id = $1`, id))
+		current, getErr := scanOfficeDraft(tx.QueryRow(ctx, officeDraftSelect+` WHERE id = $1 AND tenant_id=$2 AND principal_id=$3`, id, scope.TenantID, scope.ID))
 		if errors.Is(getErr, pgx.ErrNoRows) {
 			return office.Draft{}, store.ErrNotFound
 		}
@@ -132,9 +137,12 @@ VALUES($1, $2, $3, $4, $5, $6, $7)`, event.ID, id, expectedStatus, nextStatus,
 }
 
 func (p *Postgres) ListDraftEvents(ctx context.Context, draftID string) ([]office.DraftEvent, error) {
+	scope := requestScope(ctx)
 	rows, err := p.pool.Query(ctx, `
 SELECT id, draft_id, from_status, to_status, actor, reason, created_at
-FROM office_draft_events WHERE draft_id = $1 ORDER BY created_at, id`, draftID)
+FROM office_draft_events e JOIN office_drafts d ON d.id=e.draft_id
+WHERE e.draft_id = $1 AND d.tenant_id=$2 AND d.principal_id=$3
+ORDER BY e.created_at, e.id`, draftID, scope.TenantID, scope.ID)
 	if err != nil {
 		return nil, fmt.Errorf("查询办公草稿审计事件失败：%w", err)
 	}
@@ -156,7 +164,8 @@ FROM office_draft_events WHERE draft_id = $1 ORDER BY created_at, id`, draftID)
 }
 
 func (p *Postgres) getDraftByRunHash(ctx context.Context, runID, contentHash string) (office.Draft, error) {
-	row := p.pool.QueryRow(ctx, officeDraftSelect+` WHERE source_run_id = $1 AND content_hash = $2`, runID, contentHash)
+	scope := requestScope(ctx)
+	row := p.pool.QueryRow(ctx, officeDraftSelect+` WHERE source_run_id = $1 AND content_hash = $2 AND tenant_id=$3 AND principal_id=$4`, runID, contentHash, scope.TenantID, scope.ID)
 	item, err := scanOfficeDraft(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return office.Draft{}, store.ErrNotFound

@@ -150,8 +150,8 @@ func (s *Service) Replace(ctx context.Context, memoryID string, input ReplaceInp
 	return current, nil
 }
 
-// Capture 提取并合并一轮对话中的长期记忆。进程内串行化可避免并发请求产生重复 Key；
-// 多副本部署仍应在后续用数据库唯一约束或任务队列提供全局串行语义。
+// Capture 提取并合并一轮对话中的长期记忆。进程内锁减少同副本冲突，PostgreSQL 的
+// tenant + principal + kind + memory_key 唯一索引负责多副本下的最终防重。
 func (s *Service) Capture(ctx context.Context, input CaptureInput) (CaptureResult, error) {
 	result := CaptureResult{Enabled: s.extractor != nil}
 	if s.extractor == nil {

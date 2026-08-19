@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/identity"
 )
 
 type Handler func(ctx context.Context, payload json.RawMessage) (any, error)
@@ -123,6 +124,9 @@ func (w *Worker) processNext(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	jobCtx, cancel := context.WithTimeout(ctx, w.options.TaskTimeout)
+	jobCtx = identity.WithPrincipal(jobCtx, identity.Principal{
+		ID: job.PrincipalID, TenantID: job.TenantID, Provider: "job", Subject: job.PrincipalID, Username: job.PrincipalID,
+	})
 	finishInstrumentation := func(string, error) {}
 	if w.options.Instrumentation != nil {
 		jobCtx, finishInstrumentation = w.options.Instrumentation.BeginBackgroundJob(jobCtx, job)
@@ -178,6 +182,9 @@ func (w *Worker) observe(job Job, err error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	ctx = identity.WithPrincipal(ctx, identity.Principal{
+		ID: job.PrincipalID, TenantID: job.TenantID, Provider: "job", Subject: job.PrincipalID, Username: job.PrincipalID,
+	})
 	w.options.Observer(ctx, job, err)
 }
 func truncateError(value string) string {

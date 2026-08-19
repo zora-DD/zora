@@ -543,7 +543,7 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
 		t.Fatalf("info body = %s", response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"version":"0.11.0-dev"`) ||
+	if !strings.Contains(response.Body.String(), `"version":"0.12.0-dev"`) ||
 		!strings.Contains(response.Body.String(), `"tool_count":4`) ||
 		!strings.Contains(response.Body.String(), `"run-metrics"`) ||
 		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||
@@ -591,6 +591,29 @@ func TestSecurityCSRFEndpointAndWriteProtection(t *testing.T) {
 	handler.ServeHTTP(valid, validRequest)
 	if valid.Code != http.StatusCreated {
 		t.Fatalf("valid csrf status=%d body=%s", valid.Code, valid.Body.String())
+	}
+}
+
+func TestHTTPSResponsesIncludeBrowserSecurityHeaders(t *testing.T) {
+	handler := newTestHandlerWithOptions(t, func(database *sqlite.SQLite) []Option {
+		manager, err := security.New(security.Config{TrustedProxyCIDRs: []string{"10.20.0.0/24"}, PrincipalID: "test"}, database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []Option{WithSecurity(manager)}
+	})
+	request := httptest.NewRequest(http.MethodGet, "http://zora.example.com/api/info", nil)
+	request.Host = "zora.example.com"
+	request.RemoteAddr = "10.20.0.8:12345"
+	request.Header.Set("X-Forwarded-Proto", "https")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("info status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Strict-Transport-Security") == "" || response.Header().Get("X-Frame-Options") != "DENY" ||
+		!strings.Contains(response.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Fatalf("HTTPS 安全响应头不完整：%v", response.Header())
 	}
 }
 
@@ -825,6 +848,25 @@ func TestAsyncMemoryCaptureReturnsJobAndExposesStatusAPI(t *testing.T) {
 
 func newTestHandler(t *testing.T) http.Handler {
 	return newTestHandlerWithOptions(t, nil)
+}
+
+func TestReadinessReflectsSharedDependencyFailure(t *testing.T) {
+	t.Parallel()
+	handler := newTestHandlerWithOptions(t, func(*sqlite.SQLite) []Option {
+		return []Option{WithReadinessCheck(func(context.Context) error {
+			return errors.New("redis unavailable")
+		})}
+	})
+	ready := httptest.NewRecorder()
+	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/api/ready", nil))
+	if ready.Code != http.StatusServiceUnavailable || !strings.Contains(ready.Body.String(), "共享依赖暂时不可用") {
+		t.Fatalf("readiness = %d, %s", ready.Code, ready.Body.String())
+	}
+	health := httptest.NewRecorder()
+	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	if health.Code != http.StatusOK {
+		t.Fatalf("liveness 不应被依赖故障影响：%d", health.Code)
+	}
 }
 
 func newTestHandlerWithOptions(t *testing.T, buildOptions func(*sqlite.SQLite) []Option) http.Handler {

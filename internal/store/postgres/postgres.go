@@ -99,6 +99,9 @@ func (p *Postgres) Close() error {
 	return nil
 }
 
+// Ping 供 Kubernetes readiness 探针检查共享数据库，而不是只判断 HTTP 进程是否存活。
+func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
+
 func (p *Postgres) migrate(ctx context.Context) error {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {

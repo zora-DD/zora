@@ -17,6 +17,7 @@ import (
 	pdf "github.com/ledongthuc/pdf"
 
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/identity"
 )
 
 const (
@@ -127,7 +128,7 @@ func (s *Service) Ingest(ctx context.Context, input IngestInput) (IngestResult, 
 	now := time.Now().UTC()
 	groupDigest := sha256.Sum256([]byte(principalID + "\x00" + strings.ToLower(input.Name)))
 	document := Document{
-		ID: id.New("doc"), VersionGroupID: "doc_group_" + hex.EncodeToString(groupDigest[:12]),
+		ID: id.New("doc"), TenantID: s.tenant(ctx), VersionGroupID: "doc_group_" + hex.EncodeToString(groupDigest[:12]),
 		Name: input.Name, SourceType: input.SourceType,
 		MIMEType: input.MIMEType, ContentHash: contentHash,
 		OwnerID: principalID, Visibility: input.Visibility,
@@ -247,10 +248,20 @@ func (s *Service) SearchWithMode(ctx context.Context, query string, topK int, mo
 }
 
 func (s *Service) principal(ctx context.Context) string {
+	if authenticated, ok := identity.FromContext(ctx); ok {
+		return authenticated.ID
+	}
 	if value, ok := PrincipalFromContext(ctx); ok {
 		return value
 	}
 	return s.principalID
+}
+
+func (s *Service) tenant(ctx context.Context) string {
+	if authenticated, ok := identity.FromContext(ctx); ok {
+		return authenticated.TenantID
+	}
+	return "local"
 }
 
 type principalContextKey struct{}

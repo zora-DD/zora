@@ -11,8 +11,8 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/zora ./cmd/zora \
 FROM alpine:3.23
 
 RUN apk add --no-cache ca-certificates tzdata \
-    && addgroup -S zora \
-    && adduser -S -G zora zora \
+    && addgroup -S -g 10001 zora \
+    && adduser -S -D -H -u 10001 -G zora zora \
     && mkdir -p /app/data \
     && chown -R zora:zora /app
 

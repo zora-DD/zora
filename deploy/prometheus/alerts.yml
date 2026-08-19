@@ -1,0 +1,61 @@
+groups:
+  - name: zora-production
+    rules:
+      - alert: ZoraTargetDown
+        expr: up{job=~".*zora.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Zora 监控目标不可用"
+          description: "Prometheus 已连续 2 分钟无法抓取 Zora 指标。"
+
+      - alert: ZoraHTTP5xxHigh
+        expr: >-
+          sum(rate(zora_http_server_requests_total{http_response_status_code=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(zora_http_server_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zora HTTP 5xx 比例超过 5%"
+
+      - alert: ZoraModelErrorsHigh
+        expr: >-
+          sum(rate(zora_gen_ai_client_calls_total{zora_call_status="error"}[10m]))
+          /
+          clamp_min(sum(rate(zora_gen_ai_client_calls_total[10m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zora 模型调用错误率超过 10%"
+
+      - alert: ZoraEmbeddingErrorsHigh
+        expr: >-
+          sum(rate(zora_embedding_calls_total{zora_call_status="error"}[10m]))
+          /
+          clamp_min(sum(rate(zora_embedding_calls_total[10m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zora Embedding 调用错误率超过 10%"
+
+      - alert: ZoraBackgroundJobFailed
+        expr: increase(zora_background_jobs_total{zora_background_job_status="failed"}[15m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zora 文档摄取或会话摘要任务失败"
+
+      - alert: ZoraTokenUsageSpike
+        expr: sum(increase(zora_gen_ai_client_tokens_total{gen_ai_token_type="total"}[1h])) > 1000000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zora 最近一小时模型 Token 用量超过 100 万"
+          description: "阈值只是模板，请按实际预算、模型单价和流量调整。"

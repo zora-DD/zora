@@ -442,6 +442,8 @@ func ensureMemoryColumns(db *sql.DB) error {
 
 func (s *SQLite) Close() error { return s.db.Close() }
 
+func (s *SQLite) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
 func (s *SQLite) CreateConversation(ctx context.Context, c domain.Conversation) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO conversations(id, title, created_at, updated_at) VALUES(?, ?, ?, ?)`,

@@ -26,6 +26,8 @@ var (
 
 type Job struct {
 	ID             string          `json:"id"`
+	TenantID       string          `json:"-"`
+	PrincipalID    string          `json:"-"`
 	Kind           string          `json:"kind"`
 	DedupeKey      string          `json:"-"`
 	RunID          string          `json:"run_id,omitempty"`

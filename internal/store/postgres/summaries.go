@@ -12,10 +12,12 @@ import (
 )
 
 func (p *Postgres) GetConversationSummary(ctx context.Context, conversationID string) (summary.Summary, error) {
+	scope := requestScope(ctx)
 	var item summary.Summary
 	err := p.pool.QueryRow(ctx, `
 SELECT conversation_id, content, through_sequence, message_count, model, updated_at
-FROM conversation_summaries WHERE conversation_id = $1`, conversationID).Scan(
+FROM conversation_summaries s JOIN conversations c ON c.id=s.conversation_id
+WHERE s.conversation_id = $1 AND c.tenant_id=$2 AND c.principal_id=$3`, conversationID, scope.TenantID, scope.ID).Scan(
 		&item.ConversationID, &item.Content, &item.ThroughSequence,
 		&item.MessageCount, &item.Model, &item.UpdatedAt,
 	)
@@ -30,10 +32,12 @@ FROM conversation_summaries WHERE conversation_id = $1`, conversationID).Scan(
 }
 
 func (p *Postgres) UpsertConversationSummary(ctx context.Context, item summary.Summary) error {
+	scope := requestScope(ctx)
 	_, err := p.pool.Exec(ctx, `
 INSERT INTO conversation_summaries(
     conversation_id, content, through_sequence, message_count, model, updated_at
-) VALUES($1, $2, $3, $4, $5, $6)
+) SELECT $1, $2, $3, $4, $5, $6
+WHERE EXISTS(SELECT 1 FROM conversations WHERE id=$1 AND tenant_id=$7 AND principal_id=$8)
 ON CONFLICT(conversation_id) DO UPDATE SET
     content = EXCLUDED.content,
     through_sequence = EXCLUDED.through_sequence,
@@ -41,7 +45,7 @@ ON CONFLICT(conversation_id) DO UPDATE SET
     model = EXCLUDED.model,
     updated_at = EXCLUDED.updated_at`,
 		item.ConversationID, item.Content, item.ThroughSequence,
-		item.MessageCount, item.Model, normalizeTime(item.UpdatedAt),
+		item.MessageCount, item.Model, normalizeTime(item.UpdatedAt), scope.TenantID, scope.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("保存会话摘要失败：%w", err)
@@ -50,12 +54,14 @@ ON CONFLICT(conversation_id) DO UPDATE SET
 }
 
 func (p *Postgres) ListMessagesForSummary(ctx context.Context, conversationID string, afterSequence, throughSequence int64, limit int) ([]domain.Message, error) {
+	scope := requestScope(ctx)
 	rows, err := p.pool.Query(ctx, `
-SELECT id, conversation_id, role, content, tool_name, tool_call_id, sequence, created_at
-FROM messages
-WHERE conversation_id = $1 AND sequence > $2 AND sequence <= $3
-ORDER BY sequence ASC
-LIMIT $4`, conversationID, afterSequence, throughSequence, limit)
+SELECT m.id, m.conversation_id, m.role, m.content, m.tool_name, m.tool_call_id, m.sequence, m.created_at
+FROM messages m JOIN conversations c ON c.id=m.conversation_id
+WHERE m.conversation_id = $1 AND m.sequence > $2 AND m.sequence <= $3
+  AND c.tenant_id=$4 AND c.principal_id=$5
+ORDER BY m.sequence ASC
+LIMIT $6`, conversationID, afterSequence, throughSequence, scope.TenantID, scope.ID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询待摘要消息失败：%w", err)
 	}

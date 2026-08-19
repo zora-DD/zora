@@ -25,6 +25,13 @@ const state = {
   draftRenderFrame: null,
   csrfToken: null,
   csrfPromise: null,
+  principal: null,
+  authEnabled: false,
+  pinnedConversationIDs: new Set(),
+  conversationQuery: "",
+  pinnedOnly: false,
+  menuConversationID: null,
+  renamingConversationID: null,
 };
 
 const elements = {
@@ -33,9 +40,17 @@ const elements = {
   openSidebar: document.querySelector("#openSidebar"),
   closeSidebar: document.querySelector("#closeSidebar"),
   newConversation: document.querySelector("#newConversation"),
+  conversationSearch: document.querySelector("#conversationSearch"),
+  conversationFilter: document.querySelector("#conversationFilter"),
   conversationList: document.querySelector("#conversationList"),
   conversationTitle: document.querySelector("#conversationTitle"),
+  conversationTitleRow: document.querySelector("#conversationTitleRow"),
   renameConversation: document.querySelector("#renameConversation"),
+  conversationRenameForm: document.querySelector("#conversationRenameForm"),
+  conversationRenameInput: document.querySelector("#conversationRenameInput"),
+  cancelConversationRename: document.querySelector("#cancelConversationRename"),
+  conversationMenu: document.querySelector("#conversationMenu"),
+  pinConversationLabel: document.querySelector("#pinConversationLabel"),
   messageList: document.querySelector("#messageList"),
   welcome: document.querySelector("#welcome"),
   chatScroll: document.querySelector("#chatScroll"),
@@ -47,7 +62,12 @@ const elements = {
   runtimeProvider: document.querySelector("#runtimeProvider"),
   statusDot: document.querySelector("#statusDot"),
   modelSelect: document.querySelector("#modelSelect"),
+  openRunMetricsTop: document.querySelector("#openRunMetricsTop"),
   toolBadge: document.querySelector("#toolBadge"),
+  composerAttach: document.querySelector("#composerAttach"),
+  composerTools: document.querySelector("#composerTools"),
+  composerSlash: document.querySelector("#composerSlash"),
+  toolMenu: document.querySelector("#toolMenu"),
   openKnowledge: document.querySelector("#openKnowledge"),
   closeKnowledge: document.querySelector("#closeKnowledge"),
   knowledgeDialog: document.querySelector("#knowledgeDialog"),
@@ -82,6 +102,16 @@ const elements = {
   runMetricsDialog: document.querySelector("#runMetricsDialog"),
   runMetricsList: document.querySelector("#runMetricsList"),
   toast: document.querySelector("#toast"),
+  authGate: document.querySelector("#authGate"),
+  userCard: document.querySelector("#userCard"),
+  userAvatar: document.querySelector("#userAvatar"),
+  userAvatarFallback: document.querySelector("#userAvatarFallback"),
+  userName: document.querySelector("#userName"),
+  userSubtitle: document.querySelector("#userSubtitle"),
+  accountMenu: document.querySelector("#accountMenu"),
+  accountMenuName: document.querySelector("#accountMenuName"),
+  accountMenuDetail: document.querySelector("#accountMenuDetail"),
+  logout: document.querySelector("#logout"),
 };
 
 async function api(path, options = {}) {
@@ -102,6 +132,7 @@ async function api(path, options = {}) {
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
+    if (response.status === 401) showLogin();
     throw new Error(body.error || `请求失败 (${response.status})`);
   }
   if (response.status === 204) return null;
@@ -126,6 +157,7 @@ async function getCSRFToken() {
 async function initialize() {
   bindEvents();
   resizeInput();
+  if (!(await ensureAuthenticated())) return;
   try {
     const [info, result, knowledgeResult, memoryResult, officeDraftResult, officeOperationResult] = await Promise.all([
       api("/api/info"), api("/api/conversations"), api("/api/knowledge/documents"),
@@ -154,9 +186,12 @@ async function initialize() {
     renderMemories();
     renderOfficeDrafts();
     if (state.conversations.length) {
-      await selectConversation(state.conversations[0].id);
+      const linkedID = conversationIDFromLocation();
+      const initial = state.conversations.find(item => item.id === linkedID) || sortedConversations()[0];
+      if (initial) await selectConversation(initial.id);
     }
   } catch (error) {
+    document.body.classList.remove("auth-pending");
     elements.statusDot.classList.add("offline");
     elements.runtimeModel.textContent = "服务不可用";
     elements.runtimeProvider.textContent = "请检查后端日志";
@@ -166,7 +201,32 @@ async function initialize() {
 }
 
 function bindEvents() {
+  elements.logout.addEventListener("click", logout);
+  elements.userCard.addEventListener("click", toggleAccountEntry);
+  elements.userCard.addEventListener("keydown", event => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      toggleAccountEntry(event);
+    }
+  });
+  elements.userAvatar.addEventListener("error", () => {
+    elements.userAvatar.hidden = true;
+    elements.userAvatarFallback.hidden = false;
+  });
   elements.newConversation.addEventListener("click", () => createConversation());
+  elements.conversationSearch.addEventListener("input", () => {
+    state.conversationQuery = elements.conversationSearch.value.trim();
+    closeConversationMenu();
+    renderConversations();
+  });
+  elements.conversationFilter.addEventListener("click", () => {
+    state.pinnedOnly = !state.pinnedOnly;
+    elements.conversationFilter.setAttribute("aria-pressed", String(state.pinnedOnly));
+    const label = state.pinnedOnly ? "显示全部对话" : "仅显示置顶对话";
+    elements.conversationFilter.title = label;
+    elements.conversationFilter.setAttribute("aria-label", label);
+    renderConversations();
+  });
   elements.openKnowledge.addEventListener("click", openKnowledge);
   elements.closeKnowledge.addEventListener("click", () => elements.knowledgeDialog.close());
   elements.knowledgeUpload.addEventListener("submit", uploadKnowledgeDocument);
@@ -180,6 +240,7 @@ function bindEvents() {
   elements.openOfficeDrafts.addEventListener("click", openOfficeDrafts);
   elements.closeOfficeDrafts.addEventListener("click", () => elements.officeDraftDialog.close());
   elements.openRunMetrics.addEventListener("click", openRunMetrics);
+  elements.openRunMetricsTop.addEventListener("click", openRunMetrics);
   elements.closeRunMetrics.addEventListener("click", () => elements.runMetricsDialog.close());
   elements.modelSelect.addEventListener("change", () => {
     state.selectedModelID = elements.modelSelect.value;
@@ -187,6 +248,21 @@ function bindEvents() {
     updateSelectedModelStatus();
   });
   elements.renameConversation.addEventListener("click", renameActiveConversation);
+  elements.conversationTitle.addEventListener("dblclick", renameActiveConversation);
+  elements.conversationTitle.addEventListener("keydown", event => {
+    if (event.key === "Enter") renameActiveConversation();
+  });
+  elements.conversationRenameForm.addEventListener("submit", submitConversationRename);
+  elements.cancelConversationRename.addEventListener("click", cancelConversationRename);
+  elements.conversationRenameInput.addEventListener("keydown", event => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelConversationRename();
+    } else if (event.key === "Enter" && !event.isComposing) {
+      event.preventDefault();
+      elements.conversationRenameForm.requestSubmit();
+    }
+  });
   elements.composer.addEventListener("submit", event => {
     event.preventDefault();
     if (state.busy) {
@@ -202,18 +278,222 @@ function bindEvents() {
       elements.composer.requestSubmit();
     }
   });
+  elements.composerAttach.addEventListener("click", openKnowledge);
+  elements.composerTools.addEventListener("click", event => {
+    event.stopPropagation();
+    toggleToolMenu();
+  });
+  elements.composerSlash.addEventListener("click", () => {
+    if (!elements.messageInput.value.trim()) elements.messageInput.value = "/";
+    else if (!elements.messageInput.value.endsWith(" ")) elements.messageInput.value += " ";
+    elements.messageInput.focus();
+    resizeInput();
+    openToolMenu();
+  });
+  elements.toolMenu.querySelectorAll("[data-tool-prompt]").forEach(button => {
+    button.addEventListener("click", () => {
+      elements.messageInput.value = button.dataset.toolPrompt || "";
+      closeToolMenu();
+      elements.messageInput.focus();
+      resizeInput();
+    });
+  });
+  elements.conversationMenu.querySelectorAll("[data-action]").forEach(button => {
+    button.addEventListener("click", () => handleConversationMenuAction(button.dataset.action));
+  });
   document.addEventListener("keydown", event => {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
       createConversation();
     }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+      event.preventDefault();
+      openSidebar();
+      elements.conversationSearch.focus();
+      elements.conversationSearch.select();
+    }
+    if (event.key === "Escape") {
+      closeConversationMenu();
+      closeAccountMenu();
+      closeToolMenu();
+    }
   });
+  document.addEventListener("click", event => {
+    if (!elements.conversationMenu.contains(event.target)) closeConversationMenu();
+    if (!elements.accountMenu.contains(event.target) && !elements.userCard.contains(event.target)) closeAccountMenu();
+    if (!elements.toolMenu.contains(event.target) && !elements.composerTools.contains(event.target)) closeToolMenu();
+  });
+  window.addEventListener("resize", () => {
+    closeConversationMenu();
+    closeAccountMenu();
+  });
+  window.addEventListener("hashchange", () => {
+    const id = conversationIDFromLocation();
+    if (id && id !== state.activeID && state.conversations.some(item => item.id === id)) selectConversation(id);
+  });
+  elements.conversationList.addEventListener("scroll", closeConversationMenu, { passive: true });
   document.querySelectorAll(".suggestion").forEach(button => {
     button.addEventListener("click", () => sendMessage(button.dataset.prompt));
   });
   elements.openSidebar.addEventListener("click", openSidebar);
   elements.closeSidebar.addEventListener("click", closeSidebar);
   elements.sidebarScrim.addEventListener("click", closeSidebar);
+}
+
+async function ensureAuthenticated() {
+  try {
+    const statusResponse = await fetch("/api/auth/status", { credentials: "same-origin" });
+    if (!statusResponse.ok) throw new Error(`认证配置检查失败 (${statusResponse.status})`);
+    const authStatus = await statusResponse.json();
+    state.authEnabled = Boolean(authStatus.enabled);
+    const response = await fetch("/api/auth/me", { credentials: "same-origin" });
+    if (response.status === 401) {
+      showLogin();
+      return false;
+    }
+    if (!response.ok) throw new Error(`登录状态检查失败 (${response.status})`);
+    const body = await response.json();
+    state.principal = body.principal || null;
+    loadPinnedPreferences();
+    document.body.classList.remove("auth-pending", "auth-required");
+    elements.authGate.hidden = true;
+    if (state.principal?.provider === "github") {
+      elements.userCard.hidden = false;
+      elements.userCard.classList.remove("logged-out");
+      elements.userAvatar.hidden = false;
+      elements.userAvatarFallback.hidden = true;
+      elements.userName.textContent = state.principal.username || "GitHub 用户";
+      elements.userSubtitle.textContent = "GitHub 用户";
+      elements.userAvatar.src = state.principal.avatar_url || "";
+      elements.accountMenuName.textContent = state.principal.username || "GitHub 用户";
+      elements.accountMenuDetail.textContent = "已通过 GitHub 登录";
+      elements.logout.hidden = false;
+    } else if (!state.authEnabled) {
+      elements.userCard.hidden = false;
+      elements.userCard.classList.add("logged-out");
+      elements.userAvatar.hidden = true;
+      elements.userAvatarFallback.hidden = false;
+      elements.userName.textContent = "登录 / 注册";
+      elements.userSubtitle.textContent = "同步对话、记忆与设置";
+      elements.logout.hidden = true;
+    }
+    return true;
+  } catch (error) {
+    document.body.classList.remove("auth-pending");
+    elements.statusDot.classList.add("offline");
+    notify(error.message);
+    return false;
+  }
+}
+
+function showLogin() {
+  closeConversationMenu();
+  closeAccountMenu();
+  closeToolMenu();
+  document.body.classList.remove("auth-pending");
+  document.body.classList.add("auth-required");
+  elements.authGate.hidden = false;
+  elements.userCard.hidden = true;
+}
+
+async function logout() {
+  try {
+    await api("/api/auth/logout", { method: "POST", body: "{}" });
+  } catch (error) {
+    notify(error.message);
+    return;
+  }
+  state.csrfToken = null;
+  state.principal = null;
+  showLogin();
+}
+
+function toggleAccountEntry(event) {
+  event?.stopPropagation();
+  closeConversationMenu();
+  closeToolMenu();
+  if (!state.authEnabled || state.principal?.provider !== "github") {
+    notify("当前为本地开发模式，请配置 GitHub OAuth 后登录");
+    return;
+  }
+  if (elements.accountMenu.hidden) openAccountMenu();
+  else closeAccountMenu();
+}
+
+function openAccountMenu() {
+  closeConversationMenu();
+  elements.accountMenu.hidden = false;
+  elements.userCard.setAttribute("aria-expanded", "true");
+  const rect = elements.userCard.getBoundingClientRect();
+  const width = elements.accountMenu.offsetWidth;
+  const height = elements.accountMenu.offsetHeight;
+  elements.accountMenu.style.left = `${Math.max(12, Math.min(rect.left, window.innerWidth - width - 12))}px`;
+  elements.accountMenu.style.top = `${Math.max(12, rect.top - height - 8)}px`;
+}
+
+function closeAccountMenu() {
+  elements.accountMenu.hidden = true;
+  elements.userCard.setAttribute("aria-expanded", "false");
+}
+
+function openToolMenu() {
+  elements.toolMenu.hidden = false;
+  elements.composerTools.setAttribute("aria-expanded", "true");
+}
+
+function closeToolMenu() {
+  elements.toolMenu.hidden = true;
+  elements.composerTools.setAttribute("aria-expanded", "false");
+}
+
+function toggleToolMenu() {
+  if (elements.toolMenu.hidden) openToolMenu();
+  else closeToolMenu();
+}
+
+function pinnedStorageKey() {
+  const principalID = state.principal?.id || "local";
+  return `zora.pinnedConversations.${principalID}`;
+}
+
+function loadPinnedPreferences() {
+  try {
+    const value = JSON.parse(localStorage.getItem(pinnedStorageKey()) || "[]");
+    state.pinnedConversationIDs = new Set(Array.isArray(value) ? value.filter(item => typeof item === "string") : []);
+  } catch (_) {
+    state.pinnedConversationIDs = new Set();
+  }
+}
+
+function savePinnedPreferences() {
+  try {
+    localStorage.setItem(pinnedStorageKey(), JSON.stringify([...state.pinnedConversationIDs]));
+  } catch (_) {
+    notify("浏览器未允许保存置顶偏好");
+  }
+}
+
+function isConversationPinned(id) {
+  return state.pinnedConversationIDs.has(id);
+}
+
+function sortedConversations() {
+  return [...state.conversations].sort((left, right) => {
+    const pinned = Number(isConversationPinned(right.id)) - Number(isConversationPinned(left.id));
+    if (pinned) return pinned;
+    return new Date(right.updated_at || right.created_at || 0) - new Date(left.updated_at || left.created_at || 0);
+  });
+}
+
+function conversationIDFromLocation() {
+  return new URLSearchParams(window.location.hash.slice(1)).get("conversation") || "";
+}
+
+function updateConversationLocation(id) {
+  const url = new URL(window.location.href);
+  if (id) url.hash = new URLSearchParams({ conversation: id }).toString();
+  else url.hash = "";
+  history.replaceState(null, "", url);
 }
 
 function configureModelSelector(info) {
@@ -856,9 +1136,12 @@ async function createConversation() {
 
 async function selectConversation(id) {
   if (state.busy || id === state.activeID) return;
+  cancelConversationRename();
+  closeConversationMenu();
   state.activeID = id;
   const conversation = state.conversations.find(item => item.id === id);
   elements.conversationTitle.textContent = conversation?.title || "对话";
+  updateConversationLocation(id);
   renderConversations();
   try {
     const result = await api(`/api/conversations/${id}/messages`);
@@ -875,33 +1158,86 @@ async function deleteConversation(id) {
   try {
     await api(`/api/conversations/${id}`, { method: "DELETE" });
     state.conversations = state.conversations.filter(item => item.id !== id);
+    state.pinnedConversationIDs.delete(id);
+    savePinnedPreferences();
     if (state.activeID === id) {
       state.activeID = null;
       state.messages = [];
-      if (state.conversations.length) await selectConversation(state.conversations[0].id);
-      else renderMessages();
+      const next = sortedConversations()[0];
+      if (next) await selectConversation(next.id);
+      else {
+        elements.conversationTitle.textContent = "新对话";
+        updateConversationLocation("");
+        renderMessages();
+      }
     }
     renderConversations();
+    notify("对话已删除");
   } catch (error) {
     notify(error.message);
   }
 }
 
-async function renameActiveConversation() {
+function renameActiveConversation() {
   if (!state.activeID || state.busy) return;
+  startConversationRename(state.activeID);
+}
+
+async function startConversationRename(id) {
+  if (!id || state.busy) return;
+  if (id !== state.activeID) await selectConversation(id);
   const current = state.conversations.find(item => item.id === state.activeID);
-  const title = prompt("对话名称", current?.title || "");
-  if (!title || title.trim() === current?.title) return;
+  if (!current) return;
+  closeConversationMenu();
+  state.renamingConversationID = current.id;
+  elements.conversationRenameInput.value = current.title || "";
+  elements.conversationTitleRow.hidden = true;
+  elements.conversationRenameForm.hidden = false;
+  requestAnimationFrame(() => {
+    elements.conversationRenameInput.focus();
+    elements.conversationRenameInput.select();
+  });
+}
+
+function cancelConversationRename() {
+  state.renamingConversationID = null;
+  elements.conversationRenameForm.hidden = true;
+  elements.conversationTitleRow.hidden = false;
+}
+
+async function submitConversationRename(event) {
+  event.preventDefault();
+  const id = state.renamingConversationID;
+  const title = elements.conversationRenameInput.value.trim();
+  const current = state.conversations.find(item => item.id === id);
+  if (!id || !current) {
+    cancelConversationRename();
+    return;
+  }
+  if (!title) {
+    notify("对话名称不能为空");
+    elements.conversationRenameInput.focus();
+    return;
+  }
+  if (title === current.title) {
+    cancelConversationRename();
+    return;
+  }
+  elements.conversationRenameInput.disabled = true;
   try {
-    await api(`/api/conversations/${state.activeID}`, {
+    await api(`/api/conversations/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ title: title.trim() }),
+      body: JSON.stringify({ title }),
     });
-    current.title = title.trim();
+    current.title = title;
     elements.conversationTitle.textContent = current.title;
+    cancelConversationRename();
     renderConversations();
+    notify("对话名称已更新");
   } catch (error) {
     notify(error.message);
+  } finally {
+    elements.conversationRenameInput.disabled = false;
   }
 }
 
@@ -1124,22 +1460,119 @@ async function refreshConversations() {
 
 function renderConversations() {
   elements.conversationList.replaceChildren();
-  for (const conversation of state.conversations) {
+  const query = state.conversationQuery.toLocaleLowerCase("zh-CN");
+  const conversations = sortedConversations().filter(conversation => {
+    if (state.pinnedOnly && !isConversationPinned(conversation.id)) return false;
+    return !query || String(conversation.title || "").toLocaleLowerCase("zh-CN").includes(query);
+  });
+  if (!conversations.length) {
+    const empty = document.createElement("div");
+    empty.className = "conversation-empty";
+    empty.textContent = state.conversationQuery ? "没有匹配的对话" : state.pinnedOnly ? "还没有置顶对话" : "还没有对话，开始一个新话题吧";
+    elements.conversationList.append(empty);
+    return;
+  }
+  for (const conversation of conversations) {
     const item = document.createElement("div");
-    item.className = `conversation-item${conversation.id === state.activeID ? " active" : ""}`;
+    item.className = `conversation-item${conversation.id === state.activeID ? " active" : ""}${conversation.message_count ? " has-messages" : ""}${isConversationPinned(conversation.id) ? " pinned" : ""}`;
     item.setAttribute("role", "button");
+    item.setAttribute("aria-current", conversation.id === state.activeID ? "page" : "false");
     item.tabIndex = 0;
-    item.innerHTML = `<span class="bubble-icon">◌</span><span class="item-title"></span><button type="button" class="conversation-delete" title="删除" aria-label="删除">×</button>`;
-    item.querySelector(".item-title").textContent = conversation.title;
+    item.innerHTML = `<span class="conversation-status" aria-hidden="true"></span><span class="conversation-main"><span class="item-title"></span><span class="item-meta"></span></span><button type="button" class="conversation-more" title="更多操作" aria-label="更多对话操作" aria-haspopup="menu" aria-expanded="false">···</button>`;
+    item.querySelector(".item-title").textContent = conversation.title || "新对话";
+    const count = Number(conversation.message_count || 0);
+    item.querySelector(".item-meta").textContent = `${formatConversationTime(conversation.updated_at || conversation.created_at)}${count ? ` · ${count} 条消息` : ""}`;
     item.addEventListener("click", () => selectConversation(conversation.id));
-    item.addEventListener("keydown", event => {
-      if (event.key === "Enter" || event.key === " ") selectConversation(conversation.id);
-    });
-    item.querySelector(".conversation-delete").addEventListener("click", event => {
+    item.querySelector(".conversation-main").addEventListener("dblclick", event => {
       event.stopPropagation();
-      deleteConversation(conversation.id);
+      startConversationRename(conversation.id);
+    });
+    item.addEventListener("keydown", event => {
+      if ((event.key === "Enter" || event.key === " ") && event.target === item) {
+        event.preventDefault();
+        selectConversation(conversation.id);
+      }
+    });
+    item.querySelector(".conversation-more").addEventListener("click", event => {
+      event.stopPropagation();
+      openConversationMenu(conversation.id, event.currentTarget);
     });
     elements.conversationList.append(item);
+  }
+}
+
+function formatConversationTime(value) {
+  const date = new Date(value || Date.now());
+  if (Number.isNaN(date.getTime())) return "刚刚";
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (sameDay) return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+  if (date.toDateString() === yesterday.toDateString()) return "昨天";
+  if (date.getFullYear() === now.getFullYear()) return new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric" }).format(date);
+  return new Intl.DateTimeFormat("zh-CN", { year: "2-digit", month: "numeric", day: "numeric" }).format(date);
+}
+
+function openConversationMenu(id, anchor) {
+  if (state.menuConversationID === id && !elements.conversationMenu.hidden) {
+    closeConversationMenu();
+    return;
+  }
+  closeAccountMenu();
+  closeToolMenu();
+  closeConversationMenu();
+  state.menuConversationID = id;
+  elements.pinConversationLabel.textContent = isConversationPinned(id) ? "取消置顶" : "置顶对话";
+  anchor.setAttribute("aria-expanded", "true");
+  elements.conversationMenu.hidden = false;
+  const rect = anchor.getBoundingClientRect();
+  const width = elements.conversationMenu.offsetWidth;
+  const height = elements.conversationMenu.offsetHeight;
+  const preferredLeft = rect.right + 8;
+  elements.conversationMenu.style.left = `${Math.max(12, Math.min(preferredLeft, window.innerWidth - width - 12))}px`;
+  elements.conversationMenu.style.top = `${Math.max(12, Math.min(rect.top - 8, window.innerHeight - height - 12))}px`;
+}
+
+function closeConversationMenu() {
+  elements.conversationMenu.hidden = true;
+  state.menuConversationID = null;
+  elements.conversationList.querySelectorAll('.conversation-more[aria-expanded="true"]').forEach(button => button.setAttribute("aria-expanded", "false"));
+}
+
+async function handleConversationMenuAction(action) {
+  const id = state.menuConversationID;
+  if (!id) return;
+  closeConversationMenu();
+  if (action === "rename") await startConversationRename(id);
+  if (action === "pin") togglePinnedConversation(id);
+  if (action === "copy") await copyConversationLink(id);
+  if (action === "delete") await deleteConversation(id);
+}
+
+function togglePinnedConversation(id) {
+  if (isConversationPinned(id)) state.pinnedConversationIDs.delete(id);
+  else state.pinnedConversationIDs.add(id);
+  savePinnedPreferences();
+  renderConversations();
+  notify(isConversationPinned(id) ? "对话已置顶" : "已取消置顶");
+}
+
+async function copyConversationLink(id) {
+  const url = new URL(window.location.href);
+  url.hash = new URLSearchParams({ conversation: id }).toString();
+  try {
+    await navigator.clipboard.writeText(url.toString());
+    notify("对话链接已复制");
+  } catch (_) {
+    const textarea = document.createElement("textarea");
+    textarea.value = url.toString();
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    textarea.remove();
+    notify(copied ? "对话链接已复制" : "复制失败，请从地址栏复制");
   }
 }
 

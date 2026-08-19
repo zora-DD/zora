@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/zhiruo/zora/internal/identity"
 )
 
 const (
@@ -54,13 +56,24 @@ type Config struct {
 type Manager struct {
 	config         Config
 	quota          QuotaStore
-	limiter        *ipLimiter
+	limiter        RateLimiter
 	allowedOrigins map[string]struct{}
 	trustedProxies []*net.IPNet
 	now            func() time.Time
 }
 
-func New(config Config, quota QuotaStore) (*Manager, error) {
+// RateLimiter 的实现必须原子判断一次请求；生产多副本使用 Redis，本地开发使用进程内实现。
+type RateLimiter interface {
+	Allow(ctx context.Context, key string, now time.Time) (bool, time.Duration, error)
+}
+
+type Option func(*Manager)
+
+func WithRateLimiter(limiter RateLimiter) Option {
+	return func(manager *Manager) { manager.limiter = limiter }
+}
+
+func New(config Config, quota QuotaStore, options ...Option) (*Manager, error) {
 	if quota == nil {
 		return nil, fmt.Errorf("API 配额存储不能为空")
 	}
@@ -92,11 +105,22 @@ func New(config Config, quota QuotaStore) (*Manager, error) {
 	if config.RateLimitEnabled {
 		manager.limiter = newIPLimiter(config.RequestsPerSecond, config.Burst)
 	}
+	for _, option := range options {
+		option(manager)
+	}
+	if config.RateLimitEnabled && manager.limiter == nil {
+		return nil, fmt.Errorf("已启用 API 限流，但限流器为空")
+	}
 	return manager, nil
 }
 
 func (m *Manager) CSRFEnabled() bool      { return m != nil && m.config.CSRFEnabled }
 func (m *Manager) RateLimitEnabled() bool { return m != nil && m.config.RateLimitEnabled }
+
+// SecureRequest 只根据直接 TLS 或可信代理提供的协议判断，供入口安全响应头复用。
+func (m *Manager) SecureRequest(r *http.Request) bool {
+	return m != nil && strings.HasPrefix(m.requestOrigin(r), "https://")
+}
 func (m *Manager) QuotaEnabled() bool {
 	return m != nil && (m.config.DailyRequestQuota > 0 || m.config.DailyChatQuota > 0 || m.config.DailyUploadByteQuota > 0)
 }
@@ -126,13 +150,18 @@ func (m *Manager) Middleware(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		if !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/health" || r.URL.Path == "/api/security/csrf" {
+		// 只有 Kubernetes 存活/就绪探针绕过业务限流；OAuth 与 CSRF 端点同样可能被滥用。
+		if !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/health" || r.URL.Path == "/api/ready" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		clientIP := m.clientIP(r)
 		if m.limiter != nil {
-			allowed, retryAfter := m.limiter.Allow(clientIP, m.now())
+			allowed, retryAfter, err := m.limiter.Allow(r.Context(), clientIP, m.now())
+			if err != nil {
+				writeProblem(w, http.StatusServiceUnavailable, "限流服务暂时不可用，请稍后重试")
+				return
+			}
 			if !allowed {
 				w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(retryAfter.Seconds())))))
 				writeProblem(w, http.StatusTooManyRequests, "请求过于频繁，请稍后重试")
@@ -148,6 +177,9 @@ func (m *Manager) Middleware(next http.Handler) http.Handler {
 			}
 		}
 		principal := m.config.PrincipalID + ":" + clientIP
+		if authenticated, ok := identity.FromContext(r.Context()); ok {
+			principal = authenticated.TenantID + ":" + authenticated.ID
+		}
 		if !m.consume(w, r, principal, ResourceRequests, 1, m.config.DailyRequestQuota) {
 			return
 		}
@@ -300,7 +332,7 @@ func newIPLimiter(rate float64, burst int) *ipLimiter {
 	return &ipLimiter{rate: rate, burst: float64(burst), buckets: make(map[string]bucket)}
 }
 
-func (l *ipLimiter) Allow(key string, now time.Time) (bool, time.Duration) {
+func (l *ipLimiter) Allow(_ context.Context, key string, now time.Time) (bool, time.Duration, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	entry, exists := l.buckets[key]
@@ -329,5 +361,5 @@ func (l *ipLimiter) Allow(key string, now time.Time) (bool, time.Duration) {
 			}
 		}
 	}
-	return allowed, retry
+	return allowed, retry, nil
 }

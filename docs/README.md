@@ -13,6 +13,8 @@
 | [第三阶段：Memory Capture Outbox](phase-3-memory-outbox.md) | 后端开发者、面试复习 | 事务入队、租约 Worker、退避重试、状态 API 与异步 Trace |
 | [第四阶段：后台任务异步化](phase-4-background-jobs.md) | 后端开发者、面试复习 | 文档摄取、会话摘要、任务租约、重试和异步 Trace |
 | [部署前 API 安全](deployment-security.md) | 开发者、运维、面试复习 | 限流、持久化配额、CSRF/CORS、可信代理与 Secret 文件 |
+| [阿里云生产部署 Runbook](aliyun-deployment.md) | 开发者、运维、首次部署者 | 域名与资源采购、GitHub OAuth、ACK/RDS/Tair/ALB、staging 验证、备份与轮换 |
+| [阿里云轻量服务器 staging 指南](staging-single-server.md) | 开发者、首次部署者 | 低成本单机容器部署、资源作用、Secret 管理与验收边界 |
 
 ## 文档维护原则
 

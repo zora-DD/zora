@@ -14,6 +14,7 @@ import (
 
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/identity"
 )
 
 const (
@@ -213,9 +214,17 @@ func (s *Service) transition(ctx context.Context, draftID, from, to, reason stri
 	now := s.now().UTC()
 	event := DraftEvent{
 		ID: id.New("draft_event"), DraftID: draftID, FromStatus: from, ToStatus: to,
-		Actor: "user", Reason: reason, CreatedAt: now,
+		Actor: userActor(ctx), Reason: reason, CreatedAt: now,
 	}
 	return s.store.TransitionDraft(ctx, draftID, from, to, event)
+}
+
+// userActor 只信任认证中间件写入 Context 的主体；本地无认证模式保留兼容名称。
+func userActor(ctx context.Context) string {
+	if principal, ok := identity.FromContext(ctx); ok {
+		return principal.ID
+	}
+	return "user"
 }
 
 func (s *Service) save(ctx context.Context, identity agentruntime.ExecutionIdentity, kind, title string, payload any) (Draft, bool, error) {

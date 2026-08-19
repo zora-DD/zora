@@ -14,10 +14,10 @@ func (p *Postgres) ConsumeAPIQuota(ctx context.Context, date, principal, resourc
 	var used int64
 	err := p.pool.QueryRow(ctx, `
 INSERT INTO api_usage_daily(usage_date,principal_id,resource,used,updated_at)
-SELECT $1::date,$2,$3,$4,$5 WHERE $4<=$6
+SELECT $1::date,$2,$3,$4::bigint,$5 WHERE $4::bigint<=$6::bigint
 ON CONFLICT(usage_date,principal_id,resource) DO UPDATE SET
     used=api_usage_daily.used+EXCLUDED.used,updated_at=EXCLUDED.updated_at
-WHERE api_usage_daily.used+EXCLUDED.used<=$6
+WHERE api_usage_daily.used+EXCLUDED.used<=$6::bigint
 RETURNING used`, date, principal, resource, amount, now, limit).Scan(&used)
 	allowed := true
 	if errors.Is(err, pgx.ErrNoRows) {

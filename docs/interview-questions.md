@@ -175,3 +175,254 @@ flowchart LR
 | [`internal/store/postgres/semantic.go`](../internal/store/postgres/semantic.go) | PostgreSQL 两套 pgvector 查询实现 |
 | [`internal/memory/retriever.go`](../internal/memory/retriever.go) | 词项/向量相关性、重要性和时效性联合召回 |
 | [`internal/memory/capture_worker.go`](../internal/memory/capture_worker.go) | 回答后批量写入消息向量 |
+
+---
+
+## 二、RAG
+
+### 1. 你这个项目中 RAG 现在是怎么实现的？用的什么向量模型，用的什么数据库？
+
+#### 面试简答
+
+Zora 现在实现的是一套 **Agent 工具驱动的 Hybrid RAG**，不是每轮对话都固定检索。文档上传后由后台 Worker 提取文本，按默认 800 个 Unicode 字符、120 个字符重叠进行分块，再用 OpenAI-compatible Embedding 接口批量向量化。当前真实配置使用 `text-embedding-v4`，向量维度是 1024。
+
+在线问答时，Agent 判断问题涉及用户上传的资料后调用 `knowledge_search`。系统用同一个 Embedding 模型生成查询向量，同时提取关键词；在 PostgreSQL 中分别用 pgvector 的 HNSW 做余弦向量召回、用 FTS + GIN 做关键词召回，两路各取最多 50 个候选，再在 Service 层用 RRF 按名次融合，默认返回前 5 个证据分块。证据包含文档名、分块编号和原文坐标，模型基于这些证据生成带引用的答案。
+
+数据库的生产方案是 **PostgreSQL + pgvector**：`knowledge_documents` 保存文档、版本和权限元数据，`knowledge_chunks` 保存原文、`vector(1024)` 向量与全文检索字段。项目同时保留 SQLite 作为本地开发和测试后端；SQLite 把向量保存为 JSON，并在 Go 进程内做精确余弦和 BM25 计算，所以它不是专用向量数据库。
+
+#### 详细实现
+
+```mermaid
+flowchart LR
+    Upload["上传文档"] --> Job["异步摄取任务"]
+    Job --> Chunk["提取文本并分块"]
+    Chunk --> DocEmbedding["text-embedding-v4 / 1024 维"]
+    DocEmbedding --> Store["PostgreSQL + pgvector / FTS"]
+
+    Question["用户问题"] --> Agent["Agent 判断是否需要私有资料"]
+    Agent --> Tool["knowledge_search"]
+    Tool --> QueryEmbedding["生成 Query Embedding"]
+    Tool --> QueryTerms["提取查询词项"]
+    QueryEmbedding --> HNSW["HNSW 向量候选"]
+    QueryTerms --> FTS["FTS / GIN 关键词候选"]
+    HNSW --> RRF["RRF 名次融合"]
+    FTS --> RRF
+    RRF --> Evidence["Top-K 原文 + 引用坐标"]
+    Evidence --> Answer["LLM 生成带引用答案"]
+```
+
+1. **离线摄取**
+
+   HTTP 层接收 TXT、Markdown 或带文本层的 PDF，校验后创建持久化 `knowledge_ingestion` Job 并立即返回 202。Worker 按 `owner + 文件内容` 计算 SHA-256 去重，提取纯文本后做递归字符边界分块。默认 Chunk Size 是 800、Overlap 是 120，既避免中文 UTF-8 被切坏，也减少关键信息落在分块边界上的损失。
+
+2. **向量模型**
+
+   当前真实配置为：
+
+   | 配置项 | 当前值 |
+   |---|---|
+   | Provider 协议 | OpenAI-compatible `/embeddings` |
+   | 模型 | `text-embedding-v4` |
+   | 维度 | 1024 |
+   | 单批大小 | 最多 10 个分块 |
+   | 相似度 | L2 归一化后计算 cosine similarity |
+
+   文档分块和查询必须使用同一个模型与维度。模型名和维度会随文档保存；发现旧索引不兼容时直接返回 `ErrEmbeddingMismatch`，要求重建索引，而不是跨向量空间比较。代码还提供确定性的 Hash Embedding，但它只用于零密钥开发和链路测试，不代表真实语义检索效果。
+
+3. **在线召回与融合**
+
+   线上默认使用 Hybrid 模式：查询同时走向量和关键词两路召回。PostgreSQL 侧用 `embedding <=> query_vector` 做 cosine distance 排序，HNSW 加速向量 Top-N；关键词侧使用 `tsvector`、GIN 和 `ts_rank_cd`。两路分数的量纲不同，因此不直接相加，而是使用 `RRF(k=60)` 融合名次。`knowledge_search` 默认返回 5 个结果、最多返回 8 个；当前没有单独的 Cross-Encoder Reranker。
+
+4. **权限、版本和引用**
+
+   SQL 候选查询只允许命中当前租户内“本人所有或公开”的最新版文档，ACL 和 `is_latest` 过滤发生在召回阶段，避免先取出越权内容再做应用层过滤。每个检索结果保留 `document_name`、`ordinal`、`start_rune`、`end_rune` 和原文，Agent 的工具说明要求最终答案引用文档名与分块编号。多 Agent 模式下则由 `document_agent` 强制调用 `knowledge_search`，Supervisor 不直接访问底层知识库工具。
+
+5. **数据库后端**
+
+   | 后端 | 文档向量存储 | 召回方式 | 定位 |
+   |---|---|---|---|
+   | PostgreSQL + pgvector | `knowledge_chunks.embedding vector(1024)` | HNSW 向量召回 + FTS/GIN 关键词召回 | 当前生产化方案 |
+   | SQLite | JSON 文本 | Go 内最多扫描 10,000 个可见 Chunk，计算余弦与 BM25 | 本地开发、演示和测试 |
+
+所以面试中如果只问“用了什么向量库”，可以回答：**生产方案使用 PostgreSQL 的 pgvector 扩展，不是单独部署 Milvus、Pinecone 之类的向量数据库；本地模式则使用 SQLite 精确扫描。**
+
+#### 关键代码位置
+
+| 代码 | 作用 |
+|---|---|
+| [`cmd/zora/main.go`](../cmd/zora/main.go) | 装配 Embedding、知识库 Service 和 `knowledge_search` 工具 |
+| [`internal/knowledge/service.go`](../internal/knowledge/service.go) | 文档摄取、查询向量化、Hybrid 检索和 RRF 融合 |
+| [`internal/knowledge/embedder.go`](../internal/knowledge/embedder.go) | `text-embedding-v4` 的 OpenAI-compatible 调用及 Hash 测试实现 |
+| [`internal/knowledge/tool.go`](../internal/knowledge/tool.go) | 将检索注册为 Agent 工具并返回引用信息 |
+| [`internal/store/postgres/knowledge.go`](../internal/store/postgres/knowledge.go) | pgvector HNSW 与 PostgreSQL FTS 候选召回 |
+| [`internal/store/postgres/schema.go`](../internal/store/postgres/schema.go) | `vector(n)`、HNSW、`tsvector` 和 GIN 表结构 |
+| [`internal/store/sqlite/sqlite.go`](../internal/store/sqlite/sqlite.go) | SQLite JSON 向量存储与精确扫描后端 |
+| [`internal/agentruntime/multi_agent.go`](../internal/agentruntime/multi_agent.go) | 多 Agent 模式下 Document Agent 的 RAG 工具边界 |
+
+---
+
+## 三、评估量化
+
+### 1. 怎么判断回答的是否有问题？是否需要下轮循环继续？是通过 Prompt 吗？
+
+#### 面试简答
+
+这里要区分**单次请求内的 ReAct 循环**和**回答质量评估**。
+
+单次请求内是否继续，不是先生成答案、再用一个 Prompt 打分决定。模型本轮如果返回结构化 `ToolCalls`，Eino 就执行工具，把 Tool Result 回填上下文，再调用模型进入下一轮；模型不再调用工具并输出最终 Assistant 文本时，本次 ReAct 结束。所以 Prompt 和 Tool Description 会影响模型“该不该查工具”的判断，但真正驱动状态转换的是结构化 Tool Call，不是解析一段“继续/停止”的自然语言。
+
+系统还有确定性的工程兜底：默认 `MaxIterations=8`，并受请求超时、Context 取消、工具/模型错误、空回答校验约束；多 Agent 另外限制交接次数、并发数和专业 Agent 超时。这些能发现执行异常和无限循环，但不能证明答案在语义上正确。
+
+Zora 当前**没有在线 Critic/LLM Judge 自动审查最终答案并触发重答**。语义质量通过固定数据集离线评测：检查检索命中、预期事实、有效引用和证据支持度，低于阈值时评测命令返回非零状态用于 CI 门禁，而不是在用户请求中自动无限重试。开放式幻觉目前仍需要真实模型评测集、人工抽检，或者未来接入经过校准的 LLM Judge。
+
+#### 运行时循环如何决定下一步
+
+```mermaid
+flowchart TD
+    Input["用户输入 + 历史上下文"] --> Model["调用 Chat Model"]
+    Model --> Decision{"响应里是否有 ToolCalls"}
+    Decision -- 是 --> Guard{"是否超过迭代/交接/超时限制"}
+    Guard -- 否 --> Tool["执行白名单 Tool"]
+    Tool --> Result["Tool Result 回填上下文"]
+    Result --> Model
+    Guard -- 是 --> Fail["终止并记录失败"]
+    Decision -- 否 --> Answer{"是否有非空最终回答"}
+    Answer -- 是 --> Done["保存回答与 RunEvent"]
+    Answer -- 否 --> Fail
+
+    Done -. 离线 .-> Eval["固定数据集质量评测"]
+    Eval --> Gate{"是否达到指标阈值"}
+    Gate -- 否 --> CI["CI 失败并定位用例"]
+    Gate -- 是 --> Pass["评测通过"]
+```
+
+具体分为三层：
+
+1. **模型决策层**
+
+   System Prompt、Agent Instruction 和 Tool Description 告诉模型何时应该查知识库、计算、调用专业 Agent，以及证据不足时应如何回答。这一层是概率性的策略引导。例如 Document Agent 的 Prompt 明确要求先调用 `knowledge_search`，Supervisor 的 Prompt 规定私有资料必须交给 Document Agent。
+
+2. **框架状态层**
+
+   Eino 根据 Assistant Message 中是否存在结构化 Tool Call 决定是否进入下一轮。存在 Tool Call 就执行工具并把结果作为 Tool Message 回填；不存在 Tool Call 时，把模型文本视为最终回答。`finish_reason` 和模型 Usage 会被记录用于审计，但 Zora 没有依靠某个 Prompt 字段手写循环状态机。
+
+3. **确定性控制与质量层**
+
+   | 判断对象 | 当前机制 | 是否依赖 Prompt |
+   |---|---|---:|
+   | 是否调用工具、调用哪个工具 | 模型根据 Prompt、工具描述和上下文生成 Tool Call | 是，Prompt 影响决策 |
+   | 是否进入下一轮 ReAct | 是否产生结构化 Tool Call | 否，由框架读取结构化响应 |
+   | 防止无限调用 | `MaxIterations`，默认 8，允许配置 1–50 | 否 |
+   | 模型/工具失败、请求取消 | Error、Context、Timeout | 否 |
+   | 最终回答为空 | Runtime 返回 `Agent 未返回助手回答` | 否 |
+   | 回答事实和引用是否正确 | 离线固定数据集、锚点和阈值门禁 | 否，不在当前在线循环中 |
+   | 开放式语义或标注外幻觉 | 当前依赖人工抽检；可扩展校准后的 LLM Judge | 当前未实现 |
+
+当前没有加“生成 → Critic 打分 → 重写”的在线循环，是因为 Judge 本身也可能误判，而且会增加一次或多次模型调用、延迟与费用。若后续增加，应把验证结果设计成严格结构化输出，限定重试次数，并让引用核验、Schema 校验等确定性检查优先于 LLM Judge。
+
+#### 关键代码位置
+
+| 代码 | 作用 |
+|---|---|
+| [`internal/agentruntime/runtime.go`](../internal/agentruntime/runtime.go) | 组装 Eino Agent、消费模型/工具事件并校验非空最终回答 |
+| [`internal/agentruntime/multi_agent.go`](../internal/agentruntime/multi_agent.go) | Supervisor 与专业 Agent 的 Prompt、工具边界和循环上限 |
+| [`internal/agentruntime/execution_control.go`](../internal/agentruntime/execution_control.go) | 多 Agent 交接、并发、超时和重试控制 |
+| [`internal/config/config.go`](../internal/config/config.go) | `ZORA_MAX_ITERATIONS` 等确定性限制 |
+| [`internal/rageval/answer.go`](../internal/rageval/answer.go) | 回答事实、引用和证据支持的离线检查 |
+
+---
+
+### 2. 你项目中量化评估的指标有哪些？
+
+#### 面试简答
+
+Zora 没有用一个模糊的“总分”评价所有能力，而是把指标分成四层：
+
+- **RAG 检索层**：`Recall@K`、MRR、Hit Rate、平均检索延迟，并对比 Hybrid 相对 Vector 和 Keyword 的增益；
+- **RAG 答案层**：事实覆盖率、有效引用覆盖率、引用忠实度；
+- **能力 A/B 层**：Memory 的预期召回率、意外召回率、事实覆盖增益和污染率；多 Agent 的路由准确率、意外 Agent 调用率、答案完成率、质量增益、延迟比和调用次数比；
+- **运行效率与成本层**：总耗时、首 Token 延迟、模型/工具调用次数与耗时、Agent 交接次数与耗时，以及 Provider 返回的 Prompt、Completion、Cached、Reasoning 和 Total Token。
+
+评测使用版本化固定数据集，在隔离临时数据库中走和线上相同的 Service、Agent 和 Tool 链路。每个指标在数据集中配置上下限，未达门槛时 CLI 输出失败报告并以非零状态退出。当前答案质量主要使用规范化字符串锚点，优点是稳定、零额外 Judge 费用且容易定位失败；缺点是对同义表达和标注外幻觉覆盖有限。
+
+#### RAG 检索指标
+
+| 指标 | 定义 | 说明 |
+|---|---|---|
+| `Recall@K` | Top-K 中覆盖的唯一相关文档数 ÷ 标注相关文档总数 | 判断该找的证据有没有找全 |
+| MRR | 第一个相关结果排名的倒数，再对问题取平均 | 越早出现相关证据，得分越高 |
+| Hit Rate | Top-K 至少命中一个相关文档的问题数 ÷ 总问题数 | 适合观察“有没有命中” |
+| `average_latency_ms` | 所有问题的平均检索耗时 | 不包含固定语料摄取时间 |
+| Hybrid Delta | Hybrid 的 Recall/MRR 减去 Vector 或 Keyword 的结果 | 判断混合检索是否真的优于单路 |
+
+检索评测会对同一批问题分别运行 `vector`、`keyword`、`hybrid`，最终门禁主要检查线上使用的 Hybrid Recall@K 和 MRR。
+
+#### RAG 答案指标
+
+| 指标 | 定义 | 主要防止的问题 |
+|---|---|---|
+| `fact_coverage` | 答案中出现的预期事实数 ÷ 标注事实总数 | 检索到了但回答漏掉关键事实 |
+| `citation_coverage` | 带本次有效引用的已出现事实数 ÷ 已出现事实数 | 有事实却不给证据，或伪造未检索到的引用 |
+| `citation_faithfulness` | 能被所引原文锚点支持的事实数 ÷ 带有效引用的事实数 | 引用了文档，但原文并不支持结论 |
+
+有效引用必须能解析为本次 `knowledge_search` 真正返回的 `[文档名#分块编号]`，只满足引用格式但没有对应 Tool Evidence 不能得分。检索门禁和答案门禁采用逻辑与：任一层不合格，整份 RAG 报告都不通过。
+
+#### Memory Control/Treatment 指标
+
+| 指标 | 含义 |
+|---|---|
+| Memory `Recall@K` | Treatment 实际注入的预期 Memory 数 ÷ 标注预期 Memory 数 |
+| `unexpected_recall_rate` | 意外 Memory 数 ÷ Treatment 召回 Memory 总数 |
+| Treatment Fact Coverage | 开启 Memory 后答案覆盖预期个性化事实的比例 |
+| Fact Coverage Delta | Treatment Fact Coverage − Control Fact Coverage |
+| Forbidden Fact Rate | 硬负例答案中出现禁止污染事实的比例 |
+| Average Latency / Overhead | Control、Treatment 平均延迟及两者差值 |
+
+Control 完全关闭召回，Treatment 开启召回，两组都通过真实 `chat.Send → Eino Runtime → RunEvent` 链路。Control 如果出现任何 Memory Recall 也会直接失败，这能发现实验组隔离错误。
+
+#### 单 Agent / 多 Agent 指标
+
+| 指标 | 含义 |
+|---|---|
+| `route_accuracy` | 实际专业 Agent 调用序列与标注序列完全一致的问题比例 |
+| `unexpected_agent_rate` | 非预期专业 Agent 调用数 ÷ 实际交接总数 |
+| `answer_completion` | 非空且包含预期事实锚点的答案比例 |
+| `average_latency_ms` | 多 Agent 每题平均端到端耗时 |
+| `quality_gain` | Multi-Agent Treatment 答案锚点覆盖 − Single-Agent Control |
+| `latency_ratio` | Treatment 平均延迟 ÷ Control 平均延迟 |
+| `invocation_ratio` | Treatment 平均调用次数 ÷ Control 平均调用次数 |
+
+这里的调用次数用“根 Agent + 专业 Agent 交接数”作为稳定成本代理，不把它伪装成真实 Token 成本；接真实 Provider 后，费用分析仍以 ResponseMeta 返回的 Token Usage 为准。
+
+#### 线上运行与成本指标
+
+离线质量评测之外，每个 Agent Run 还从持久化 RunEvent 聚合以下可核对指标：
+
+| 类别 | 指标 |
+|---|---|
+| 延迟 | 总耗时、TTFT、模型耗时、工具总/最大耗时、Agent 交接总/最大耗时 |
+| 调用 | 模型调用数、工具调用/完成数、Agent 交接/完成数、Embedding 调用和输入数 |
+| Token | Prompt、Completion、Total、Cached、Reasoning Token |
+| 完整性 | `usage_reported_calls`、`usage_complete`，明确标识 Provider 是否为每次调用返回 Usage |
+| 后台任务 | Memory Capture 和文档摄取/摘要任务的执行次数、耗时、排队延迟与状态 |
+
+Token 只统计 Provider 真实返回值；如果某次调用没有 Usage，就标记 `usage_complete=false`，不会按字符数估算一个看似精确的成本。Prometheus 指标使用有限的 provider、model、tool、status 等低基数标签，Prompt、正文和 Run ID 不进入 Metric Label。
+
+#### 评测边界
+
+当前固定锚点评测擅长发现回归、漏答、错误引用、路由错误和上下文污染，但它不能完整判断自由文本的同义改写，也不能发现所有标注之外的幻觉。因此项目把它定位为**稳定的自动化回归下限**，不是对真实回答质量的绝对证明。真实上线还需要扩充真实业务数据集、按风险分层人工抽检，并在有标注集校准后再考虑引入 LLM Judge。
+
+#### 关键代码位置
+
+| 代码 | 作用 |
+|---|---|
+| [`internal/rageval/evaluator.go`](../internal/rageval/evaluator.go) | Recall@K、MRR、Hit Rate、检索延迟和三种模式对比 |
+| [`internal/rageval/answer.go`](../internal/rageval/answer.go) | 事实覆盖、有效引用覆盖和引用忠实度 |
+| [`internal/memoryeval/evaluator.go`](../internal/memoryeval/evaluator.go) | Memory Control/Treatment 召回、污染、覆盖率和延迟指标 |
+| [`internal/agentseval/evaluator.go`](../internal/agentseval/evaluator.go) | 多 Agent 路由指标及单/多 Agent 质量、延迟、调用比 |
+| [`internal/observability/metrics.go`](../internal/observability/metrics.go) | 从 RunEvent 重建每次运行的延迟、调用和 Token 指标 |
+| [`internal/observability/telemetry.go`](../internal/observability/telemetry.go) | Prometheus 指标定义与低基数导出 |
+| [`cmd/zora-eval`](../cmd/zora-eval) | RAG 评测命令和联合门禁 |
+| [`cmd/zora-memory-eval`](../cmd/zora-memory-eval) | Memory A/B 评测命令 |
+| [`cmd/zora-agent-eval`](../cmd/zora-agent-eval) | 单 Agent / 多 Agent 对照评测命令 |
+| [`evals`](../evals) | 固定语料、问题、标注事实和阈值 |

@@ -17,6 +17,8 @@ import (
 
 // CreateDocument 在同一事务中保存文档、pgvector 向量和 FTS 词项。
 func (p *Postgres) CreateDocument(ctx context.Context, document knowledge.Document, chunks []knowledge.Chunk) (knowledge.Document, error) {
+	scope := requestScope(ctx)
+	document.TenantID, document.OwnerID = scope.TenantID, scope.ID
 	if document.EmbeddingDimensions != p.embeddingDimensions {
 		return knowledge.Document{}, fmt.Errorf("文档向量维度为 %d，但 PostgreSQL 列维度为 %d", document.EmbeddingDimensions, p.embeddingDimensions)
 	}
@@ -25,23 +27,24 @@ func (p *Postgres) CreateDocument(ctx context.Context, document knowledge.Docume
 		return knowledge.Document{}, fmt.Errorf("开始保存知识库文档事务失败：%w", err)
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, document.VersionGroupID); err != nil {
+	versionLockKey := scope.TenantID + "\x00" + scope.ID + "\x00" + document.VersionGroupID
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 4931))`, versionLockKey); err != nil {
 		return knowledge.Document{}, fmt.Errorf("锁定知识库文档版本组失败：%w", err)
 	}
-	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) + 1 FROM knowledge_documents WHERE version_group_id = $1`, document.VersionGroupID).Scan(&document.Version); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) + 1 FROM knowledge_documents WHERE version_group_id = $1 AND tenant_id = $2 AND owner_id = $3`, document.VersionGroupID, scope.TenantID, scope.ID).Scan(&document.Version); err != nil {
 		return knowledge.Document{}, fmt.Errorf("计算知识库文档版本失败：%w", err)
 	}
 	document.IsLatest = true
-	if _, err := tx.Exec(ctx, `UPDATE knowledge_documents SET is_latest = FALSE, updated_at = $1 WHERE version_group_id = $2 AND is_latest = TRUE`, normalizeTime(document.UpdatedAt), document.VersionGroupID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE knowledge_documents SET is_latest = FALSE, updated_at = $1 WHERE version_group_id = $2 AND tenant_id = $3 AND owner_id = $4 AND is_latest = TRUE`, normalizeTime(document.UpdatedAt), document.VersionGroupID, scope.TenantID, scope.ID); err != nil {
 		return knowledge.Document{}, fmt.Errorf("更新知识库旧版本状态失败：%w", err)
 	}
 
 	_, err = tx.Exec(ctx, `
 INSERT INTO knowledge_documents(
-    id, version_group_id, version, is_latest, name, source_type, mime_type, content_hash,
+    id, tenant_id, version_group_id, version, is_latest, name, source_type, mime_type, content_hash,
     owner_id, visibility, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
-) VALUES($1, $2, $3, TRUE, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-		document.ID, document.VersionGroupID, document.Version, document.Name, document.SourceType,
+) VALUES($1, $2, $3, $4, TRUE, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+		document.ID, scope.TenantID, document.VersionGroupID, document.Version, document.Name, document.SourceType,
 		document.MIMEType, document.ContentHash, document.OwnerID, document.Visibility,
 		document.EmbeddingModel, document.EmbeddingDimensions, document.ChunkCount,
 		normalizeTime(document.CreatedAt), normalizeTime(document.UpdatedAt),
@@ -79,7 +82,8 @@ INSERT INTO knowledge_chunks(
 }
 
 func (p *Postgres) GetDocumentByHash(ctx context.Context, contentHash string) (knowledge.Document, error) {
-	document, err := scanKnowledgeDocument(p.pool.QueryRow(ctx, postgresKnowledgeDocumentSelect+` WHERE content_hash = $1`, contentHash))
+	scope := requestScope(ctx)
+	document, err := scanKnowledgeDocument(p.pool.QueryRow(ctx, postgresKnowledgeDocumentSelect+` WHERE content_hash = $1 AND tenant_id = $2 AND owner_id = $3`, contentHash, scope.TenantID, scope.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return knowledge.Document{}, knowledge.ErrNotFound
 	}
@@ -90,11 +94,12 @@ func (p *Postgres) GetDocumentByHash(ctx context.Context, contentHash string) (k
 }
 
 func (p *Postgres) ListDocuments(ctx context.Context, principalID string, includeHistory bool, limit int) ([]knowledge.Document, error) {
+	scope := requestScope(ctx)
 	historyFilter := ` AND is_latest = TRUE`
 	if includeHistory {
 		historyFilter = ""
 	}
-	rows, err := p.pool.Query(ctx, postgresKnowledgeDocumentSelect+` WHERE (owner_id = $1 OR visibility = 'public')`+historyFilter+` ORDER BY updated_at DESC, version DESC LIMIT $2`, principalID, limit)
+	rows, err := p.pool.Query(ctx, postgresKnowledgeDocumentSelect+` WHERE tenant_id = $1 AND (owner_id = $2 OR visibility = 'public')`+historyFilter+` ORDER BY updated_at DESC, version DESC LIMIT $3`, scope.TenantID, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询知识库文档列表失败：%w", err)
 	}
@@ -115,15 +120,17 @@ func (p *Postgres) ListDocuments(ctx context.Context, principalID string, includ
 }
 
 func (p *Postgres) ListDocumentVersions(ctx context.Context, documentID, principalID string) ([]knowledge.Document, error) {
-	var groupID string
-	err := p.pool.QueryRow(ctx, `SELECT version_group_id FROM knowledge_documents WHERE id = $1 AND (owner_id = $2 OR visibility = 'public')`, documentID, principalID).Scan(&groupID)
+	scope := requestScope(ctx)
+	var groupID, ownerID string
+	err := p.pool.QueryRow(ctx, `SELECT version_group_id, owner_id FROM knowledge_documents WHERE id = $1 AND tenant_id = $2 AND (owner_id = $3 OR visibility = 'public')`, documentID, scope.TenantID, principalID).Scan(&groupID, &ownerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, knowledge.ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("查询知识库文档版本组失败：%w", err)
 	}
-	rows, err := p.pool.Query(ctx, postgresKnowledgeDocumentSelect+` WHERE version_group_id = $1 AND (owner_id = $2 OR visibility = 'public') ORDER BY version DESC`, groupID, principalID)
+	// 先从有权查看的文档确定版本组所有者，再固定 owner，避免同名组意外混入其他用户版本。
+	rows, err := p.pool.Query(ctx, postgresKnowledgeDocumentSelect+` WHERE version_group_id = $1 AND tenant_id = $2 AND owner_id = $3 ORDER BY version DESC`, groupID, scope.TenantID, ownerID)
 	if err != nil {
 		return nil, fmt.Errorf("查询知识库文档版本列表失败：%w", err)
 	}
@@ -132,6 +139,7 @@ func (p *Postgres) ListDocumentVersions(ctx context.Context, documentID, princip
 }
 
 func (p *Postgres) DeleteDocument(ctx context.Context, id, principalID string) error {
+	scope := requestScope(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("开始删除知识库文档事务失败：%w", err)
@@ -139,7 +147,7 @@ func (p *Postgres) DeleteDocument(ctx context.Context, id, principalID string) e
 	defer tx.Rollback(ctx)
 	var ownerID, groupID string
 	var latest bool
-	err = tx.QueryRow(ctx, `SELECT owner_id, version_group_id, is_latest FROM knowledge_documents WHERE id = $1 FOR UPDATE`, id).Scan(&ownerID, &groupID, &latest)
+	err = tx.QueryRow(ctx, `SELECT owner_id, version_group_id, is_latest FROM knowledge_documents WHERE id = $1 AND tenant_id = $2 FOR UPDATE`, id, scope.TenantID).Scan(&ownerID, &groupID, &latest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return knowledge.ErrNotFound
 	}
@@ -149,11 +157,11 @@ func (p *Postgres) DeleteDocument(ctx context.Context, id, principalID string) e
 	if ownerID != principalID {
 		return knowledge.ErrAccessDenied
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM knowledge_documents WHERE id = $1`, id); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM knowledge_documents WHERE id = $1 AND tenant_id = $2 AND owner_id = $3`, id, scope.TenantID, principalID); err != nil {
 		return fmt.Errorf("删除知识库文档失败：%w", err)
 	}
 	if latest {
-		if _, err := tx.Exec(ctx, `UPDATE knowledge_documents SET is_latest = TRUE, updated_at = $1 WHERE id = (SELECT id FROM knowledge_documents WHERE version_group_id = $2 ORDER BY version DESC LIMIT 1)`, normalizeTime(time.Now().UTC()), groupID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE knowledge_documents SET is_latest = TRUE, updated_at = $1 WHERE id = (SELECT id FROM knowledge_documents WHERE version_group_id = $2 AND tenant_id = $3 AND owner_id = $4 ORDER BY version DESC LIMIT 1)`, normalizeTime(time.Now().UTC()), groupID, scope.TenantID, principalID); err != nil {
 			return fmt.Errorf("恢复知识库上一版本失败：%w", err)
 		}
 	}
@@ -165,13 +173,14 @@ func (p *Postgres) DeleteDocument(ctx context.Context, id, principalID string) e
 
 // ListChunks 保留完整 Store 契约，在线检索会优先使用 SearchCandidates 下推到数据库。
 func (p *Postgres) ListChunks(ctx context.Context, principalID string, limit int) ([]knowledge.Chunk, error) {
+	scope := requestScope(ctx)
 	rows, err := p.pool.Query(ctx, `
 SELECT c.id, c.document_id, d.name, c.ordinal, c.content, c.start_rune, c.end_rune,
        c.embedding_model, c.embedding, c.term_counts, c.token_count, c.created_at
 FROM knowledge_chunks c
 JOIN knowledge_documents d ON d.id = c.document_id
-WHERE d.is_latest = TRUE AND (d.owner_id = $1 OR d.visibility = 'public')
-ORDER BY c.sequence ASC LIMIT $2`, principalID, limit)
+WHERE d.tenant_id = $1 AND d.is_latest = TRUE AND (d.owner_id = $2 OR d.visibility = 'public')
+ORDER BY c.sequence ASC LIMIT $3`, scope.TenantID, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询知识库分块失败：%w", err)
 	}
@@ -247,6 +256,7 @@ func (p *Postgres) SearchCandidates(ctx context.Context, request knowledge.Candi
 }
 
 func (p *Postgres) searchVectorCandidates(ctx context.Context, request knowledge.CandidateRequest) ([]knowledge.Candidate, error) {
+	scope := requestScope(ctx)
 	rows, err := p.pool.Query(ctx, `
 SELECT c.id, c.document_id, d.name, c.ordinal, c.content, c.start_rune, c.end_rune,
        c.embedding_model, c.token_count, c.created_at,
@@ -254,10 +264,11 @@ SELECT c.id, c.document_id, d.name, c.ordinal, c.content, c.start_rune, c.end_ru
 FROM knowledge_chunks c
 JOIN knowledge_documents d ON d.id = c.document_id
 WHERE c.embedding_model = $2
+  AND d.tenant_id = $3
   AND d.is_latest = TRUE
-  AND (d.owner_id = $3 OR d.visibility = 'public')
+  AND (d.owner_id = $4 OR d.visibility = 'public')
 ORDER BY c.embedding <=> $1
-LIMIT $4`, pgvector.NewVector(toFloat32(request.QueryVector)), request.EmbeddingModel, request.PrincipalID, request.Limit)
+LIMIT $5`, pgvector.NewVector(toFloat32(request.QueryVector)), request.EmbeddingModel, scope.TenantID, request.PrincipalID, request.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("执行 pgvector 候选召回失败：%w", err)
 	}
@@ -266,6 +277,7 @@ LIMIT $4`, pgvector.NewVector(toFloat32(request.QueryVector)), request.Embedding
 }
 
 func (p *Postgres) searchKeywordCandidates(ctx context.Context, terms []string, principalID string, limit int) ([]knowledge.Candidate, error) {
+	scope := requestScope(ctx)
 	if len(terms) == 0 {
 		return []knowledge.Candidate{}, nil
 	}
@@ -280,10 +292,11 @@ FROM knowledge_chunks c
 JOIN knowledge_documents d ON d.id = c.document_id
 CROSS JOIN query
 WHERE c.search_vector @@ query.value
+  AND d.tenant_id = $2
   AND d.is_latest = TRUE
-  AND (d.owner_id = $2 OR d.visibility = 'public')
+  AND (d.owner_id = $3 OR d.visibility = 'public')
 ORDER BY keyword_score DESC
-LIMIT $3`, tsQuery, principalID, limit)
+LIMIT $4`, tsQuery, scope.TenantID, principalID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("执行 PostgreSQL 全文候选召回失败：%w", err)
 	}
@@ -328,14 +341,14 @@ type rowScanner interface {
 }
 
 const postgresKnowledgeDocumentSelect = `
-SELECT id, version_group_id, version, is_latest, name, source_type, mime_type, content_hash,
+SELECT id, tenant_id, version_group_id, version, is_latest, name, source_type, mime_type, content_hash,
        owner_id, visibility, embedding_model, embedding_dimensions, chunk_count, created_at, updated_at
 FROM knowledge_documents`
 
 func scanKnowledgeDocument(row rowScanner) (knowledge.Document, error) {
 	var document knowledge.Document
 	if err := row.Scan(
-		&document.ID, &document.VersionGroupID, &document.Version, &document.IsLatest,
+		&document.ID, &document.TenantID, &document.VersionGroupID, &document.Version, &document.IsLatest,
 		&document.Name, &document.SourceType, &document.MIMEType, &document.ContentHash,
 		&document.OwnerID, &document.Visibility, &document.EmbeddingModel,
 		&document.EmbeddingDimensions, &document.ChunkCount, &document.CreatedAt, &document.UpdatedAt,

@@ -9,6 +9,7 @@ import (
 
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/identity"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/store"
@@ -57,6 +58,12 @@ func TestPostgresConversationAndKnowledgeLifecycle(t *testing.T) {
 	if err != nil || got.MessageCount != 1 {
 		t.Fatalf("get conversation = %+v, %v", got, err)
 	}
+	otherCtx := identity.WithPrincipal(ctx, identity.Principal{
+		ID: "github:other", TenantID: "github-user:other", Provider: "github", Subject: "other", Username: "other",
+	})
+	if _, err := database.GetConversation(otherCtx, conversationID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("其他租户不应读取当前会话，实际错误：%v", err)
+	}
 
 	memoryItem := memory.Memory{
 		ID: id.New("pg_mem"), Kind: memory.KindSemantic,
@@ -85,6 +92,9 @@ func TestPostgresConversationAndKnowledgeLifecycle(t *testing.T) {
 	if !foundMemory {
 		t.Fatalf("memory not found in PostgreSQL list: %+v", memories)
 	}
+	if _, err := database.GetMemory(otherCtx, memoryItem.ID); !errors.Is(err, memory.ErrNotFound) {
+		t.Fatalf("其他租户不应读取当前长期记忆，实际错误：%v", err)
+	}
 
 	embedder, err := knowledge.NewHashEmbedder(384)
 	if err != nil {
@@ -98,6 +108,28 @@ func TestPostgresConversationAndKnowledgeLifecycle(t *testing.T) {
 	ingested, err := service.Ingest(ctx, knowledge.IngestInput{Name: "北极星发布计划.md", Content: content})
 	if err != nil {
 		t.Fatal(err)
+	}
+	otherService, err := knowledge.NewService(database, embedder, knowledge.ChunkOptions{MaxRunes: 300, OverlapRunes: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherDocuments, err := otherService.ListDocuments(otherCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, document := range otherDocuments {
+		if document.ID == ingested.Document.ID {
+			t.Fatal("其他租户不应看到当前租户的私有知识库文档")
+		}
+	}
+	// 内容哈希只能在租户/所有者范围内唯一；不同用户上传同一份资料必须互不冲突。
+	otherIngested, err := otherService.Ingest(otherCtx, knowledge.IngestInput{Name: "其他用户的北极星计划.md", Content: content})
+	if err != nil {
+		t.Fatalf("其他租户上传相同内容失败：%v", err)
+	}
+	t.Cleanup(func() { _ = otherService.DeleteDocument(otherCtx, otherIngested.Document.ID) })
+	if otherIngested.Document.ID == ingested.Document.ID {
+		t.Fatal("不同租户上传相同内容不应复用同一文档 ID")
 	}
 	t.Cleanup(func() { _ = service.DeleteDocument(context.Background(), ingested.Document.ID) })
 	for _, mode := range []knowledge.RetrievalMode{

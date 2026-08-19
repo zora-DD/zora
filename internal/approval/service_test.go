@@ -89,6 +89,47 @@ func TestRiskyApprovalCanResumeWaitingRun(t *testing.T) {
 	}
 }
 
+func TestApprovalDecisionFromAnotherReplicaResumesWaitingRun(t *testing.T) {
+	store := newMemoryStore()
+	waitingReplica, err := NewService(store, Options{Mode: ModeAll, Timeout: time.Second, PollInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decidingReplica, err := NewService(store, Options{Mode: ModeAll, Timeout: time.Second, PollInterval: 5 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := waitingReplica.Request(context.Background(), RequestInput{
+		RunID: "run_cross_replica", ConversationID: "conv_cross_replica", UserMessageID: "msg_cross_replica", Content: "发布到生产环境",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultChannel := make(chan Approval, 1)
+	errorChannel := make(chan error, 1)
+	go func() {
+		result, waitErr := waitingReplica.Wait(context.Background(), item.ID)
+		if waitErr != nil {
+			errorChannel <- waitErr
+			return
+		}
+		resultChannel <- result
+	}()
+	if _, err := decidingReplica.Decide(context.Background(), item.ID, StatusApproved, "由另一个 Pod 确认"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errorChannel:
+		t.Fatal(err)
+	case result := <-resultChannel:
+		if result.Status != StatusApproved || result.DecisionReason != "由另一个 Pod 确认" {
+			t.Fatalf("cross replica decision = %+v", result)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("另一个副本的审批决定没有唤醒等待中的 Run")
+	}
+}
+
 func TestRiskyApprovalSkipsReadOnlyQuestion(t *testing.T) {
 	service, err := NewService(newMemoryStore(), Options{Mode: ModeRisky, Timeout: time.Second})
 	if err != nil {

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -118,6 +119,87 @@ func TestLoadModelProfilesRejectsInlineSecret(t *testing.T) {
 	}
 }
 
+func TestLoadAIConfigFileWithIndependentSecretReferences(t *testing.T) {
+	clearEnvironment(t)
+	dir := t.TempDir()
+	modelKeyPath := filepath.Join(dir, "model-key")
+	embeddingKeyPath := filepath.Join(dir, "embedding-key")
+	configPath := filepath.Join(dir, "ai-config.json")
+	for path, value := range map[string]string{
+		modelKeyPath: "model-secret\n", embeddingKeyPath: "embedding-secret\n",
+	} {
+		if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	configJSON := `{
+		"version": 1,
+		"default_model_id": "primary",
+		"models": [{
+			"id": "primary", "name": "主模型", "provider": "openai",
+			"model": "private-model", "base_url": "https://model.example/v1/",
+			"api_key_env": "PRIVATE_MODEL_KEY"
+		}],
+		"embedding": {
+			"provider": "openai", "model": "private-embedding",
+			"base_url": "https://embedding.example/v1/", "dimensions": 768,
+			"api_key_env": "PRIVATE_EMBEDDING_KEY"
+		}
+	}`
+	if err := os.WriteFile(configPath, []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRIVATE_MODEL_KEY_FILE", modelKeyPath)
+	t.Setenv("PRIVATE_EMBEDDING_KEY_FILE", embeddingKeyPath)
+	t.Setenv("ZORA_AI_CONFIG_FILE", configPath)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DefaultModelID != "primary" || cfg.Model != "private-model" || cfg.APIKey != "model-secret" {
+		t.Fatalf("unexpected model config: %+v", cfg.ModelProfiles)
+	}
+	if cfg.EmbeddingModel != "private-embedding" || cfg.EmbeddingDimensions != 768 ||
+		cfg.EmbeddingBaseURL != "https://embedding.example/v1" || cfg.EmbeddingAPIKey != "embedding-secret" {
+		t.Fatalf("unexpected embedding config: %+v", cfg)
+	}
+}
+
+func TestLoadAIConfigFileRejectsInlineSecretAndLoosePermissions(t *testing.T) {
+	clearEnvironment(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "ai-config.json")
+	unsafeJSON := `{"version":1,"default_model_id":"unsafe","models":[{"id":"unsafe","provider":"openai","model":"x","api_key":"secret"}],"embedding":{"provider":"hash","dimensions":384}}`
+	if err := os.WriteFile(configPath, []byte(unsafeJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZORA_AI_CONFIG_FILE", configPath)
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "禁止在 JSON 中写 api_key") {
+		t.Fatalf("inline secret err=%v", err)
+	}
+
+	if err := os.Chmod(configPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "权限过宽") {
+		t.Fatalf("loose permission err=%v", err)
+	}
+}
+
+func TestLoadAIConfigFileRejectsMixedConfigurationSources(t *testing.T) {
+	clearEnvironment(t)
+	configPath := filepath.Join(t.TempDir(), "ai-config.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"default_model_id":"local","models":[{"id":"local","provider":"mock"}],"embedding":{"provider":"hash","dimensions":384}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ZORA_AI_CONFIG_FILE", configPath)
+	t.Setenv("ZORA_MODEL", "conflicting-model")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "禁止同时设置 ZORA_MODEL") {
+		t.Fatalf("mixed source err=%v", err)
+	}
+}
+
 func TestLoadMicrosoftOfficeExecutorRequiresExplicitCommand(t *testing.T) {
 	clearEnvironment(t)
 	t.Setenv("ZORA_OFFICE_EXECUTOR", "microsoft_graph")
@@ -227,6 +309,50 @@ func TestLoadObservabilityOptIn(t *testing.T) {
 	}
 }
 
+func TestLoadProductionRequiresTLSAndDistributedDependencies(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ZORA_OTEL_ENVIRONMENT", "production")
+	t.Setenv("ZORA_STORE_PROVIDER", "postgres")
+	t.Setenv("ZORA_POSTGRES_DSN", "postgres://zora:secret@rds.internal:5432/zora?sslmode=require")
+	t.Setenv("ZORA_REDIS_URL", "rediss://:secret@tair.internal:6379/0")
+	t.Setenv("ZORA_REPLICA_COUNT", "2")
+	t.Setenv("ZORA_AUTH_ENABLED", "true")
+	t.Setenv("ZORA_GITHUB_OAUTH_CLIENT_ID", "client")
+	t.Setenv("ZORA_GITHUB_OAUTH_CLIENT_SECRET", "secret")
+	t.Setenv("ZORA_GITHUB_OAUTH_REDIRECT_URL", "https://zora.example.com/api/auth/callback")
+	t.Setenv("ZORA_COOKIE_SECURE", "true")
+	t.Setenv("ZORA_TRUSTED_PROXY_CIDRS", "10.20.0.0/24")
+	t.Setenv("ZORA_METRICS_TOKEN", "metrics-secret-at-least-32-characters")
+	if _, err := Load(); err != nil {
+		t.Fatalf("production 配置应通过：%v", err)
+	}
+
+	t.Setenv("ZORA_GITHUB_OAUTH_REDIRECT_URL", "http://zora.example.com/api/auth/callback")
+	if _, err := Load(); err == nil {
+		t.Fatal("production 应拒绝 HTTP OAuth 回调")
+	}
+	t.Setenv("ZORA_GITHUB_OAUTH_REDIRECT_URL", "https://zora.example.com/api/auth/callback")
+	t.Setenv("ZORA_REDIS_URL", "redis://:secret@tair.internal:6379/0")
+	if _, err := Load(); err == nil {
+		t.Fatal("production 应拒绝非 TLS Redis URL")
+	}
+	t.Setenv("ZORA_REDIS_URL", "rediss://:secret@tair.internal:6379/0")
+	t.Setenv("ZORA_TRUSTED_PROXY_CIDRS", "0.0.0.0/0")
+	if _, err := Load(); err == nil {
+		t.Fatal("production 应拒绝信任整个 IPv4 网络")
+	}
+	t.Setenv("ZORA_TRUSTED_PROXY_CIDRS", "10.20.0.0/24")
+	t.Setenv("ZORA_REPLICA_COUNT", "1")
+	if _, err := Load(); err == nil {
+		t.Fatal("production 应拒绝单副本配置")
+	}
+	t.Setenv("ZORA_REPLICA_COUNT", "2")
+	t.Setenv("ZORA_REDIS_URL", "rediss://:@tair.internal:6379/0")
+	if _, err := Load(); err == nil {
+		t.Fatal("production 应拒绝空 Redis 密码")
+	}
+}
+
 func TestLoadMCPRequiresExplicitAllowlistAndIsolatesCoreCredentials(t *testing.T) {
 	clearEnvironment(t)
 	t.Setenv("ZORA_MCP_ENABLED", "true")
@@ -253,13 +379,14 @@ func clearEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		"ZORA_ADDR", "ZORA_DATA_DIR", "ZORA_MODEL_PROVIDER", "ZORA_MODEL", "ZORA_API_KEY", "ZORA_API_KEY_FILE",
-		"ZORA_BASE_URL", "ZORA_MODELS_JSON", "ZORA_DEFAULT_MODEL_ID", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
+		"ZORA_BASE_URL", "ZORA_MODELS_JSON", "ZORA_DEFAULT_MODEL_ID", "ZORA_AI_CONFIG_FILE", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
 		"ZORA_OTEL_ENABLED", "ZORA_PROMETHEUS_ENABLED", "ZORA_OTEL_ENVIRONMENT", "ZORA_OTEL_SAMPLE_RATIO",
 		"OTEL_SERVICE_NAME", "OTEL_EXPORTER_OTLP_ENDPOINT",
 		"ZORA_MULTI_AGENT_ENABLED", "ZORA_MULTI_AGENT_MAX_HANDOFFS", "ZORA_MULTI_AGENT_MAX_PARALLEL",
 		"ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT", "ZORA_MULTI_AGENT_RETRY_COUNT",
 		"ZORA_MULTI_AGENT_APPROVAL_MODE", "ZORA_MULTI_AGENT_APPROVAL_TIMEOUT",
 		"ZORA_STORE_PROVIDER", "ZORA_POSTGRES_DSN", "ZORA_POSTGRES_DSN_FILE", "ZORA_POSTGRES_MAX_CONNS",
+		"ZORA_REDIS_URL", "ZORA_REDIS_URL_FILE", "ZORA_REPLICA_COUNT",
 		"ZORA_EMBEDDING_PROVIDER", "ZORA_EMBEDDING_MODEL", "ZORA_EMBEDDING_API_KEY", "ZORA_EMBEDDING_API_KEY_FILE",
 		"ZORA_EMBEDDING_BASE_URL", "ZORA_EMBEDDING_DIMENSIONS", "ZORA_KNOWLEDGE_CHUNK_SIZE",
 		"ZORA_KNOWLEDGE_CHUNK_OVERLAP", "ZORA_KNOWLEDGE_PRINCIPAL_ID",
@@ -272,6 +399,9 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_RATE_LIMIT_ENABLED", "ZORA_RATE_LIMIT_REQUESTS_PER_SECOND", "ZORA_RATE_LIMIT_BURST",
 		"ZORA_DAILY_REQUEST_QUOTA", "ZORA_DAILY_CHAT_QUOTA", "ZORA_DAILY_UPLOAD_BYTES_QUOTA",
 		"ZORA_CSRF_ENABLED", "ZORA_COOKIE_SECURE", "ZORA_CORS_ALLOWED_ORIGINS", "ZORA_TRUSTED_PROXY_CIDRS",
+		"ZORA_AUTH_ENABLED", "ZORA_GITHUB_OAUTH_CLIENT_ID", "ZORA_GITHUB_OAUTH_CLIENT_SECRET",
+		"ZORA_GITHUB_OAUTH_CLIENT_SECRET_FILE", "ZORA_GITHUB_OAUTH_REDIRECT_URL", "ZORA_AUTH_SESSION_TTL",
+		"ZORA_AUTH_COOKIE_DOMAIN", "ZORA_METRICS_TOKEN", "ZORA_METRICS_TOKEN_FILE",
 		"ZORA_SUMMARY_ENABLED", "ZORA_SUMMARY_TRIGGER_MESSAGES", "ZORA_SUMMARY_KEEP_RECENT", "ZORA_SUMMARY_MAX_RUNES",
 		"ZORA_MCP_ENABLED", "ZORA_MCP_SERVERS_JSON", "ZORA_MCP_CONNECT_TIMEOUT", "ZORA_MCP_CALL_TIMEOUT", "ZORA_MCP_MAX_OUTPUT_RUNES",
 		"ZORA_OFFICE_EXECUTOR", "ZORA_OFFICE_EXECUTOR_COMMAND", "ZORA_OFFICE_EXECUTOR_ARGS_JSON",

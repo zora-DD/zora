@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zora
+  namespace: zora
+  annotations:
+    # ACK ALB Ingress Controller 根据 TLS 配置创建 HTTPS 监听；实际 IngressClass 名称以集群为准。
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "true"
+    # 入口健康检查与 Pod readiness 使用同一依赖语义，数据库或 Redis 故障时停止分流。
+    alb.ingress.kubernetes.io/healthcheck-enabled: "true"
+    alb.ingress.kubernetes.io/healthcheck-path: "/api/ready"
+    alb.ingress.kubernetes.io/healthcheck-protocol: "HTTP"
+    alb.ingress.kubernetes.io/healthcheck-method: "GET"
+    alb.ingress.kubernetes.io/healthcheck-code: "http_2xx"
+    alb.ingress.kubernetes.io/connection-drain-enabled: "true"
+    alb.ingress.kubernetes.io/connection-drain-timeout: "120"
+spec:
+  ingressClassName: zora-alb
+  tls:
+    - hosts: ["zora.example.com"]
+      secretName: zora-tls
+  rules:
+    - host: zora.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: zora
+                port:
+                  number: 8088

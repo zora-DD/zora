@@ -14,11 +14,13 @@ import (
 )
 
 const captureJobColumns = `
-id, run_id, conversation_id, user_message_id, assistant_message_id,
+id, tenant_id, principal_id, run_id, conversation_id, user_message_id, assistant_message_id,
 status, attempt, max_attempts, available_at, lease_owner, lease_until,
 last_error, result, trace_parent, created_at, updated_at, completed_at`
 
 func (p *Postgres) EnqueueCaptureJob(ctx context.Context, assistant domain.Message, job memory.CaptureJob) (domain.Message, memory.CaptureJob, bool, error) {
+	scope := requestScope(ctx)
+	job.TenantID, job.PrincipalID = scope.TenantID, scope.ID
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return domain.Message{}, memory.CaptureJob{}, false, fmt.Errorf("开始提交长期记忆任务事务失败：%w", err)
@@ -29,11 +31,12 @@ func (p *Postgres) EnqueueCaptureJob(ctx context.Context, assistant domain.Messa
 		return domain.Message{}, memory.CaptureJob{}, false, fmt.Errorf("获取长期记忆任务幂等锁失败：%w", err)
 	}
 
-	existing, err := scanCaptureJob(tx.QueryRow(ctx, `SELECT `+captureJobColumns+` FROM memory_capture_jobs WHERE run_id = $1`, job.RunID))
+	existing, err := scanCaptureJob(tx.QueryRow(ctx, `SELECT `+captureJobColumns+` FROM memory_capture_jobs WHERE run_id = $1 AND tenant_id = $2 AND principal_id = $3`, job.RunID, scope.TenantID, scope.ID))
 	if err == nil {
 		message, messageErr := scanMessage(tx.QueryRow(ctx, `
-SELECT id, conversation_id, role, content, tool_name, tool_call_id, sequence, created_at
-FROM messages WHERE id = $1`, existing.AssistantMessageID))
+SELECT m.id, m.conversation_id, m.role, m.content, m.tool_name, m.tool_call_id, m.sequence, m.created_at
+FROM messages m JOIN conversations c ON c.id=m.conversation_id
+WHERE m.id = $1 AND c.tenant_id=$2 AND c.principal_id=$3`, existing.AssistantMessageID, scope.TenantID, scope.ID))
 		if messageErr != nil {
 			return domain.Message{}, memory.CaptureJob{}, false, fmt.Errorf("读取已入队助手消息失败：%w", messageErr)
 		}
@@ -45,24 +48,26 @@ FROM messages WHERE id = $1`, existing.AssistantMessageID))
 
 	if err = tx.QueryRow(ctx, `
 INSERT INTO messages(id, conversation_id, role, content, tool_name, tool_call_id, created_at)
-VALUES($1, $2, $3, $4, $5, $6, $7) RETURNING sequence`,
+SELECT $1, $2, $3, $4, $5, $6, $7
+WHERE EXISTS(SELECT 1 FROM conversations WHERE id=$2 AND tenant_id=$8 AND principal_id=$9)
+RETURNING sequence`,
 		assistant.ID, assistant.ConversationID, assistant.Role, assistant.Content,
-		assistant.ToolName, assistant.ToolCallID, normalizeTime(assistant.CreatedAt),
+		assistant.ToolName, assistant.ToolCallID, normalizeTime(assistant.CreatedAt), scope.TenantID, scope.ID,
 	).Scan(&assistant.Sequence); err != nil {
 		return domain.Message{}, memory.CaptureJob{}, false, fmt.Errorf("保存助手消息失败：%w", err)
 	}
 	job.AssistantMessageID = assistant.ID
-	if _, err = tx.Exec(ctx, `UPDATE conversations SET updated_at = $1 WHERE id = $2`,
-		normalizeTime(assistant.CreatedAt), assistant.ConversationID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE conversations SET updated_at = $1 WHERE id = $2 AND tenant_id=$3 AND principal_id=$4`,
+		normalizeTime(assistant.CreatedAt), assistant.ConversationID, scope.TenantID, scope.ID); err != nil {
 		return domain.Message{}, memory.CaptureJob{}, false, fmt.Errorf("更新对话时间失败：%w", err)
 	}
 	if _, err = tx.Exec(ctx, `
 INSERT INTO memory_capture_jobs(
-    id, run_id, conversation_id, user_message_id, assistant_message_id,
+    id, tenant_id, principal_id, run_id, conversation_id, user_message_id, assistant_message_id,
     status, attempt, max_attempts, available_at, lease_owner, lease_until,
     last_error, result, trace_parent, created_at, updated_at, completed_at
-) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17)`,
-		job.ID, job.RunID, job.ConversationID, job.UserMessageID, job.AssistantMessageID,
+) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18, $19)`,
+		job.ID, scope.TenantID, scope.ID, job.RunID, job.ConversationID, job.UserMessageID, job.AssistantMessageID,
 		job.Status, job.Attempt, job.MaxAttempts, normalizeTime(job.AvailableAt), job.LeaseOwner,
 		normalizeOptionalTime(job.LeaseUntil), job.LastError, `{}`, job.TraceParent,
 		normalizeTime(job.CreatedAt), normalizeTime(job.UpdatedAt), normalizeOptionalTime(job.CompletedAt),
@@ -76,7 +81,8 @@ INSERT INTO memory_capture_jobs(
 }
 
 func (p *Postgres) GetCaptureJob(ctx context.Context, id string) (memory.CaptureJob, error) {
-	job, err := scanCaptureJob(p.pool.QueryRow(ctx, `SELECT `+captureJobColumns+` FROM memory_capture_jobs WHERE id = $1`, id))
+	scope := requestScope(ctx)
+	job, err := scanCaptureJob(p.pool.QueryRow(ctx, `SELECT `+captureJobColumns+` FROM memory_capture_jobs WHERE id = $1 AND tenant_id=$2 AND principal_id=$3`, id, scope.TenantID, scope.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return memory.CaptureJob{}, memory.ErrJobNotFound
 	}
@@ -87,10 +93,11 @@ func (p *Postgres) GetCaptureJob(ctx context.Context, id string) (memory.Capture
 }
 
 func (p *Postgres) ListCaptureJobs(ctx context.Context, filter memory.CaptureJobFilter) ([]memory.CaptureJob, error) {
+	scope := requestScope(ctx)
 	rows, err := p.pool.Query(ctx, `
 SELECT `+captureJobColumns+` FROM memory_capture_jobs
-WHERE ($1 = '' OR status = $1)
-ORDER BY created_at DESC, id DESC LIMIT $2`, filter.Status, filter.Limit)
+WHERE tenant_id=$1 AND principal_id=$2 AND ($3 = '' OR status = $3)
+ORDER BY created_at DESC, id DESC LIMIT $4`, scope.TenantID, scope.ID, filter.Status, filter.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询长期记忆捕获任务列表失败：%w", err)
 	}
@@ -202,7 +209,7 @@ func scanCaptureJob(scanner pgx.Row) (memory.CaptureJob, error) {
 	var job memory.CaptureJob
 	var encodedResult []byte
 	if err := scanner.Scan(
-		&job.ID, &job.RunID, &job.ConversationID, &job.UserMessageID, &job.AssistantMessageID,
+		&job.ID, &job.TenantID, &job.PrincipalID, &job.RunID, &job.ConversationID, &job.UserMessageID, &job.AssistantMessageID,
 		&job.Status, &job.Attempt, &job.MaxAttempts, &job.AvailableAt, &job.LeaseOwner, &job.LeaseUntil,
 		&job.LastError, &encodedResult, &job.TraceParent, &job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 	); err != nil {

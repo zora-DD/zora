@@ -29,6 +29,7 @@ const (
 // Document 是一份完成摄取的知识库文档。
 type Document struct {
 	ID                  string    `json:"id"`
+	TenantID            string    `json:"-"`
 	VersionGroupID      string    `json:"version_group_id"`
 	Version             int       `json:"version"`
 	IsLatest            bool      `json:"is_latest"`

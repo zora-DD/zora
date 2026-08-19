@@ -3,6 +3,8 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -20,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zhiruo/zora/internal/approval"
+	"github.com/zhiruo/zora/internal/authn"
 	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/knowledge"
@@ -50,6 +53,9 @@ type Server struct {
 	logger         *slog.Logger
 	requestTimeout time.Duration
 	security       *security.Manager
+	auth           *authn.Manager
+	metricsToken   string
+	readinessCheck func(context.Context) error
 }
 
 type Option func(*Server)
@@ -82,6 +88,19 @@ func WithSecurity(manager *security.Manager) Option {
 	return func(server *Server) { server.security = manager }
 }
 
+func WithAuth(manager *authn.Manager) Option {
+	return func(server *Server) { server.auth = manager }
+}
+
+func WithMetricsToken(token string) Option {
+	return func(server *Server) { server.metricsToken = strings.TrimSpace(token) }
+}
+
+// WithReadinessCheck 注入数据库与 Redis 等共享依赖检查；liveness 仍只检查进程自身。
+func WithReadinessCheck(check func(context.Context) error) Option {
+	return func(server *Server) { server.readinessCheck = check }
+}
+
 // WithMCPInfo 只向展示层暴露启用状态和已通过门禁的工具数，不泄露命令、参数或环境变量。
 func WithMCPInfo(enabled bool, toolCount int) Option {
 	return func(server *Server) {
@@ -99,7 +118,11 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 		option(server)
 	}
 	mux := http.NewServeMux()
+	if server.auth != nil {
+		server.auth.Register(mux)
+	}
 	mux.HandleFunc("GET /api/health", server.health)
+	mux.HandleFunc("GET /api/ready", server.ready)
 	mux.HandleFunc("GET /api/info", server.info)
 	if server.security != nil {
 		mux.HandleFunc("GET /api/security/csrf", server.issueCSRFToken)
@@ -167,15 +190,35 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	if server.security != nil {
 		applicationHandler = server.security.Middleware(applicationHandler)
 	}
+	// 身份中间件必须位于配额与业务逻辑外层，保证二者只读取服务端验证后的租户身份。
+	if server.auth != nil {
+		applicationHandler = server.auth.Middleware(applicationHandler)
+	}
 	application := server.middleware(applicationHandler)
 	if server.telemetry == nil || server.telemetry.MetricsHandler() == nil {
 		return application, nil
 	}
 	// /metrics 使用独立 Registry，且不进入业务 HTTP 指标，避免 Prometheus 自抓取制造噪声。
 	root := http.NewServeMux()
-	root.Handle("GET /metrics", server.telemetry.MetricsHandler())
+	root.Handle("GET /metrics", server.protectMetrics(server.telemetry.MetricsHandler()))
 	root.Handle("/", application)
 	return root, nil
+}
+
+func (s *Server) protectMetrics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.metricsToken == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if len(provided) != len(s.metricsToken) || subtle.ConstantTimeCompare([]byte(provided), []byte(s.metricsToken)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="zora-metrics"`)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "监控凭据无效"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) issueCSRFToken(w http.ResponseWriter, _ *http.Request) {
@@ -193,6 +236,19 @@ func (s *Server) issueCSRFToken(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "time": time.Now().UTC()})
+}
+
+func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
+	if s.readinessCheck != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := s.readinessCheck(ctx); err != nil {
+			s.logger.Warn("就绪检查失败", "错误", err)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "error": "共享依赖暂时不可用"})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "time": time.Now().UTC()})
 }
 
 func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
@@ -252,7 +308,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.11.0-dev",
+		"name": "Zora", "version": "0.12.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"models": s.chat.ModelProfiles(), "default_model_id": s.chat.DefaultModelID(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
@@ -945,8 +1001,14 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			w = observedWriter
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: https://avatars.githubusercontent.com")
+		if s.security != nil && s.security.SecureRequest(r) {
+			// 仅在确认 HTTPS 后发送 HSTS；本地 HTTP 开发不会被浏览器意外锁定。
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				s.logger.Error("请求处理发生未恢复异常", "异常", recovered, "调用栈", string(debug.Stack()))

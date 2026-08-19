@@ -13,6 +13,7 @@ import (
 )
 
 func (p *Postgres) CreateOperation(ctx context.Context, operation office.Operation, event office.OperationEvent) (office.Operation, bool, error) {
+	scope := requestScope(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return office.Operation{}, false, fmt.Errorf("开始创建办公执行任务事务失败：%w", err)
@@ -24,21 +25,21 @@ INSERT INTO office_operations(
     lease_owner, external_reference, last_error, created_at, updated_at
 )
 SELECT $1, id, kind, $2, $3, '', 0, '', '', '', $4, $5
-FROM office_drafts WHERE id = $6 AND status = 'approved'
+FROM office_drafts WHERE id = $6 AND tenant_id=$7 AND principal_id=$8 AND status = 'approved'
 ON CONFLICT(draft_id) DO NOTHING`, operation.ID, operation.Status, operation.IdempotencyKey,
-		normalizeTime(operation.CreatedAt), normalizeTime(operation.UpdatedAt), operation.DraftID)
+		normalizeTime(operation.CreatedAt), normalizeTime(operation.UpdatedAt), operation.DraftID, scope.TenantID, scope.ID)
 	if err != nil {
 		return office.Operation{}, false, fmt.Errorf("创建办公执行任务失败：%w", err)
 	}
 	if result.RowsAffected() == 0 {
-		existing, getErr := scanOfficeOperation(tx.QueryRow(ctx, officeOperationSelect+` WHERE draft_id = $1`, operation.DraftID))
+		existing, getErr := scanOfficeOperation(tx.QueryRow(ctx, officeOperationSelect+` WHERE draft_id = $1 AND EXISTS(SELECT 1 FROM office_drafts d WHERE d.id=office_operations.draft_id AND d.tenant_id=$2 AND d.principal_id=$3)`, operation.DraftID, scope.TenantID, scope.ID))
 		if getErr == nil {
 			return existing, false, nil
 		}
 		if !errors.Is(getErr, pgx.ErrNoRows) {
 			return office.Operation{}, false, fmt.Errorf("查询幂等办公执行任务失败：%w", getErr)
 		}
-		draft, draftErr := scanOfficeDraft(tx.QueryRow(ctx, officeDraftSelect+` WHERE id = $1`, operation.DraftID))
+		draft, draftErr := scanOfficeDraft(tx.QueryRow(ctx, officeDraftSelect+` WHERE id = $1 AND tenant_id=$2 AND principal_id=$3`, operation.DraftID, scope.TenantID, scope.ID))
 		if errors.Is(draftErr, pgx.ErrNoRows) {
 			return office.Operation{}, false, store.ErrNotFound
 		}
@@ -51,7 +52,7 @@ ON CONFLICT(draft_id) DO NOTHING`, operation.ID, operation.Status, operation.Ide
 	if err := insertPostgresOperationEvent(ctx, tx, event); err != nil {
 		return office.Operation{}, false, err
 	}
-	saved, err := scanOfficeOperation(tx.QueryRow(ctx, officeOperationSelect+` WHERE id = $1`, operation.ID))
+	saved, err := scanOfficeOperation(tx.QueryRow(ctx, officeOperationSelect+` WHERE id = $1 AND EXISTS(SELECT 1 FROM office_drafts d WHERE d.id=office_operations.draft_id AND d.tenant_id=$2 AND d.principal_id=$3)`, operation.ID, scope.TenantID, scope.ID))
 	if err != nil {
 		return office.Operation{}, false, fmt.Errorf("读取新建办公执行任务失败：%w", err)
 	}
@@ -62,7 +63,8 @@ ON CONFLICT(draft_id) DO NOTHING`, operation.ID, operation.Status, operation.Ide
 }
 
 func (p *Postgres) GetOperation(ctx context.Context, id string) (office.Operation, error) {
-	item, err := scanOfficeOperation(p.pool.QueryRow(ctx, officeOperationSelect+` WHERE id = $1`, id))
+	scope := requestScope(ctx)
+	item, err := scanOfficeOperation(p.pool.QueryRow(ctx, officeOperationSelect+` WHERE id = $1 AND EXISTS(SELECT 1 FROM office_drafts d WHERE d.id=office_operations.draft_id AND d.tenant_id=$2 AND d.principal_id=$3)`, id, scope.TenantID, scope.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return office.Operation{}, store.ErrNotFound
 	}
@@ -73,7 +75,8 @@ func (p *Postgres) GetOperation(ctx context.Context, id string) (office.Operatio
 }
 
 func (p *Postgres) GetOperationByDraft(ctx context.Context, draftID string) (office.Operation, error) {
-	item, err := scanOfficeOperation(p.pool.QueryRow(ctx, officeOperationSelect+` WHERE draft_id = $1`, draftID))
+	scope := requestScope(ctx)
+	item, err := scanOfficeOperation(p.pool.QueryRow(ctx, officeOperationSelect+` WHERE draft_id = $1 AND EXISTS(SELECT 1 FROM office_drafts d WHERE d.id=office_operations.draft_id AND d.tenant_id=$2 AND d.principal_id=$3)`, draftID, scope.TenantID, scope.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return office.Operation{}, store.ErrNotFound
 	}
@@ -84,9 +87,10 @@ func (p *Postgres) GetOperationByDraft(ctx context.Context, draftID string) (off
 }
 
 func (p *Postgres) ListOperations(ctx context.Context, filter office.OperationFilter) ([]office.Operation, error) {
-	query := officeOperationSelect + ` WHERE 1=1`
-	args := make([]any, 0, 3)
-	position := 1
+	scope := requestScope(ctx)
+	query := officeOperationSelect + ` WHERE EXISTS(SELECT 1 FROM office_drafts d WHERE d.id=office_operations.draft_id AND d.tenant_id=$1 AND d.principal_id=$2)`
+	args := []any{scope.TenantID, scope.ID}
+	position := 3
 	if filter.DraftID != "" {
 		query += fmt.Sprintf(" AND draft_id = $%d", position)
 		args = append(args, filter.DraftID)
@@ -108,12 +112,13 @@ func (p *Postgres) ListOperations(ctx context.Context, filter office.OperationFi
 }
 
 func (p *Postgres) ClaimOperation(ctx context.Context, id, executorName, leaseOwner string, now, leaseUntil time.Time, operationEvent office.OperationEvent, draftEvent office.DraftEvent) (office.Operation, office.Draft, error) {
+	scope := requestScope(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return office.Operation{}, office.Draft{}, fmt.Errorf("开始领取办公执行任务事务失败：%w", err)
 	}
 	defer tx.Rollback(ctx)
-	current, err := scanOfficeOperation(tx.QueryRow(ctx, officeOperationSelect+` WHERE id = $1 FOR UPDATE`, id))
+	current, err := scanOfficeOperation(tx.QueryRow(ctx, officeOperationSelect+` WHERE id = $1 AND EXISTS(SELECT 1 FROM office_drafts d WHERE d.id=office_operations.draft_id AND d.tenant_id=$2 AND d.principal_id=$3) FOR UPDATE`, id, scope.TenantID, scope.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return office.Operation{}, office.Draft{}, store.ErrNotFound
 	}
@@ -127,7 +132,7 @@ func (p *Postgres) ClaimOperation(ctx context.Context, id, executorName, leaseOw
 	if current.Status == office.OperationFailed {
 		expectedDraftStatus = office.StatusFailed
 	}
-	draft, err := scanOfficeDraft(tx.QueryRow(ctx, officeDraftSelect+` WHERE id = $1 FOR UPDATE`, current.DraftID))
+	draft, err := scanOfficeDraft(tx.QueryRow(ctx, officeDraftSelect+` WHERE id = $1 AND tenant_id=$2 AND principal_id=$3 FOR UPDATE`, current.DraftID, scope.TenantID, scope.ID))
 	if err != nil {
 		return office.Operation{}, office.Draft{}, fmt.Errorf("查询执行任务对应草稿失败：%w", err)
 	}
@@ -267,9 +272,14 @@ RETURNING id, kind, status, conversation_id, source_run_id, title, payload::text
 }
 
 func (p *Postgres) ListOperationEvents(ctx context.Context, operationID string) ([]office.OperationEvent, error) {
+	scope := requestScope(ctx)
 	rows, err := p.pool.Query(ctx, `
-SELECT id, operation_id, from_status, to_status, attempt, actor, reason, created_at
-FROM office_operation_events WHERE operation_id = $1 ORDER BY created_at, id`, operationID)
+SELECT e.id, e.operation_id, e.from_status, e.to_status, e.attempt, e.actor, e.reason, e.created_at
+FROM office_operation_events e
+JOIN office_operations o ON o.id=e.operation_id
+JOIN office_drafts d ON d.id=o.draft_id
+WHERE e.operation_id = $1 AND d.tenant_id=$2 AND d.principal_id=$3
+ORDER BY e.created_at, e.id`, operationID, scope.TenantID, scope.ID)
 	if err != nil {
 		return nil, fmt.Errorf("查询办公执行任务审计事件失败：%w", err)
 	}

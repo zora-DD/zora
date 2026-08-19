@@ -4,24 +4,20 @@
 
 ## 1. 边界
 
-Zora 将系统划分为十六个边界：
+Zora 的主要边界如下：
 
-1. `httpapi`：HTTP、JSON、SSE 和静态界面，不包含 Agent 规则。
-2. `chat`：用例编排、事务顺序、并发保护和执行审计。
-3. `agentruntime`：Eino ADK 适配，输出与传输协议无关的事件。
-4. `agenttools`：工具 Schema、输入校验和执行代码。
-5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
-6. `memory`：Semantic/Episodic Memory、候选提取、Consolidation、Capture Outbox/Worker、生命周期校验和用户控制。
-7. `summary`：会话增量摘要、最近消息窗口、Model/Rule Summarizer 和持久化契约。
-8. `memoryeval`：长期记忆 Control/Treatment、召回/事实/污染指标和质量门禁。
-9. `agentseval`：多 Agent 路由准确率、意外专家调用、答案完成和质量门禁。
-10. `store`：对话、知识库、长期记忆、Capture Job 与摘要的持久化边界，由 SQLite 或 PostgreSQL 实现。
-11. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
-12. `mcpbridge`：官方 MCP Client、stdio 生命周期、工具发现/白名单和 Eino 适配。
-13. `mcpfiles`：独立文件连接器的授权目录、路径校验和只读工具实现。
-14. `mcpmicrosoft`：独立 Microsoft Graph 连接器的 Token 边界、邮件/日历只读查询和外部内容安全标记。
-15. `office`：邮件/日程草稿模型、结构化校验、可信 Run 来源、重试幂等、人工确认状态机和内部预览工具。
-16. `observability`：从 AgentRun 与 append-only RunEvent 派生 TTFT、真实 Usage、工具/交接耗时等统一运行指标。
+- `httpapi`：HTTP、JSON、SSE、认证中间件和静态界面，不包含 Agent 规则。
+- `authn` / `identity`：GitHub OAuth、PKCE、Redis 服务端 Session，以及可信 principal/tenant 上下文。
+- `security` / `secrets`：本地或 Redis 限流、CSRF/CORS、可信代理、配额与 Secret 文件读取。
+- `chat`：用例编排、事务顺序、跨副本并发保护和执行审计。
+- `agentruntime` / `agenttools`：Eino ADK 适配、模型与工具事件、工具 Schema 和输入校验。
+- `knowledge` / `semantic`：文档异步摄取、Embedding、混合检索、引用，以及消息/记忆独立向量索引。
+- `memory` / `summary` / `background`：长期记忆、增量摘要、Outbox、租约 Worker 和通用后台任务。
+- `approval` / `office`：人工审批、邮件/日程草稿、幂等 Operation 和外部写边界。
+- `observability`：OTel Trace、Prometheus 指标，以及从 AgentRun/RunEvent 派生的运行指标。
+- `rageval` / `memoryeval` / `agentseval`：RAG、长期记忆和多 Agent 的固定数据集质量门禁。
+- `mcpbridge` / `mcpfiles` / `mcpmicrosoft`：MCP 生命周期、白名单和隔离的文件/Microsoft 连接器。
+- `store`：按 tenant/principal 隔离的持久化边界，由 SQLite 或 PostgreSQL 实现。
 
 依赖方向始终从传输层指向应用层和抽象层，Eino 类型不会进入 HTTP API 的公开数据模型。
 
@@ -37,13 +33,15 @@ V0.1 直接使用 `ChatModelAgent + Runner`，以获得：
 
 项目保留自己的 `agentruntime.Event`，避免上层被某个 Eino 版本的数据结构锁死。Eino 当前固定在稳定版本，升级必须先通过现有集成测试。
 
-启动时可以从 `ZORA_MODELS_JSON` 为每个模型配置装配独立 Runtime，Chat 以安全 `model_id` 做请求级路由；未配置时仍保留单 Runtime。API 只公开模型展示元数据，密钥由各配置的 `api_key_env` 从服务端环境读取。自动记忆提取和摘要使用默认模型，避免后台增强链路随页面选择漂移并产生不可预测成本。
+启动时优先从仓库外的 `ZORA_AI_CONFIG_FILE` 加载模型与 Embedding 元数据，为每个模型配置装配独立 Runtime；未配置文件时保留旧环境变量兼容入口。Chat 以安全 `model_id` 做请求级路由，API 只公开模型展示元数据，密钥由 `api_key_env` 对应的 `_FILE` Secret 文件读取。自动记忆提取和摘要使用默认模型，避免后台增强链路随页面选择漂移并产生不可预测成本。配置更新通过重启/滚动重启原子切换，Embedding 变化必须配合索引重建。
 
 ## 3. 数据模型
 
 ### Conversation / Message
 
 只保存用户可见历史。工具中间消息放在 Run Event 中，防止主对话无限膨胀；下一轮模型获得最终回答而不是完整内部轨迹。
+
+生产 PostgreSQL 表按可信 `tenant_id + principal_id` 过滤。当前租户模型是“一个 GitHub 数字用户 ID 对应一个个人租户”；浏览器不能通过 Header 或请求体覆盖身份。SQLite 仅用于本地零依赖单用户开发，不用于多用户生产。
 
 ### AgentRun
 
@@ -94,7 +92,7 @@ OfficeOperation 是 approved 草稿对应的唯一持久化执行任务，保存
 - Operation 使用数据库唯一约束和租约防止重复创建/领取；任务、草稿和双审计原子迁移，启动时回收过期执行租约。
 - Memory Capture 使用消息 + Job 事务 Outbox、Run 唯一幂等键和数据库租约；Worker 停止时取消当前任务并将失败持久化为可重试或终态。
 
-PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业务对话锁仍是进程内 Mutex，多实例部署前还应升级为数据库 advisory lock 或带租约的分布式锁。
+PostgreSQL Store 对 schema migration 使用事务级 advisory lock；业务对话锁使用独占数据库连接上的 session advisory lock，同一会话在不同 Pod 间也只能同时执行一个 Run，连接或进程退出时锁由 PostgreSQL 自动释放。SQLite 本地模式仍使用进程内 Mutex。
 
 ## 5. 安全基线
 
@@ -102,9 +100,11 @@ PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业�
 - 计算器使用递归下降解析器，不执行表达式代码，也不调用 Shell。
 - 请求体限制为 1 MiB，消息限制为 20,000 字符。
 - Web UI 对模型输出做 HTML 转义。
-- 默认 Content Security Policy 只允许同源资源。
-- 核心 API Key 与 PostgreSQL DSN 可从环境变量或权限为 `0400/0600` 的 Secret 文件读取；两种来源不能同时配置。
-- `/api` 默认按可信客户端 IP 执行令牌桶限流，并以 SQLite/PostgreSQL 的 `api_usage_daily` 原子扣减请求、Agent Run 和上传字节日配额。
+- 默认 Content Security Policy 只允许同源资源，仅额外允许 GitHub 头像域名。
+- 模型、Embedding、PostgreSQL、Redis、GitHub OAuth 和 Metrics Secret 可从环境变量或权限为 `0400/0600` 的 Secret 文件读取；同一项的两种来源不能同时配置。
+- `/api` 默认按可信客户端 IP 执行令牌桶限流：单机开发使用内存桶，多副本生产使用 Redis TIME + Lua 原子桶；每日请求、Agent Run 和上传字节配额由 SQLite/PostgreSQL `api_usage_daily` 原子扣减。
+- 生产登录使用 GitHub OAuth authorization code + PKCE；一次性 state 和随机服务端 Session 存在 Redis，浏览器只保存 `HttpOnly; Secure; SameSite=Lax` Cookie。
+- `/api/health` 只检查进程存活，`/api/ready` 检查 PostgreSQL 与 Redis；`/metrics` 必须携带独立 Bearer Token。
 - 浏览器写请求使用 `HttpOnly + SameSite=Strict` Cookie 与 `X-CSRF-Token` 双提交校验；CORS 仅允许同源或显式精确白名单。
 - 默认忽略客户端提供的 Forwarded Header，只有 `ZORA_TRUSTED_PROXY_CIDRS` 内的直连代理可以声明原始 IP 和协议。
 - 外部写能力不注册为 Agent Tool；只有显式启用的审批后 OfficeExecutor 可以执行固定 Microsoft Graph 写协议。
@@ -219,7 +219,7 @@ agent_handoff_started(target, request)
 
 每个根 Run 都会创建独立执行状态：最多交接次数、最大并行度、专业 Agent 独立超时和有限重试。Eino ToolNode 会并行执行同一轮的多个独立 AgentTool；Document → Writer 这类依赖链仍串行。Context 取消会停止排队和执行中的子任务，未完成的 `agent_task_runs` 补写 failed/cancelled 终态。
 
-高影响请求可由 `off/risky/all` 策略触发 `approval_requests`。Chat 发出 `approval_required` 后等待 Web 通过独立 HTTP API 提交决定；approved 恢复同一 SSE，rejected/expired 结束根 Run。当前等待通道在进程内，审批记录本身在 SQLite/PostgreSQL 持久化。
+高影响请求可由 `off/risky/all` 策略触发 `approval_requests`。Chat 发出 `approval_required` 后等待 Web 通过独立 HTTP API 提交决定；approved 恢复同一 SSE，rejected/expired 结束根 Run。审批记录以 PostgreSQL 为事实源，当前副本使用本地通知降低延迟，并轮询持久化状态兜底，因此确认请求落到其他 Pod 时也能恢复原 SSE。
 
 Web 将交接事件显示为带 `child_run_id` 的专业 Agent Trace，并显示审批卡片。`make eval-agents` 在隔离 SQLite 中完整经过 Chat、Eino AgentTool 和 RunEvent，当前 7 题得到路由准确率 1、意外专家调用率 0、答案完成率 1；单 Agent Control 质量 0.785714，多 Agent Treatment 质量 1，质量增益 0.214286，调用次数代理比 2。真实模型仍需采集 Token Usage 并扩充业务样本。
 
@@ -282,4 +282,18 @@ AgentRun + RunEvent
       └── Web 运行监控
 ```
 
-Runtime 只负责把 Eino 事件归一化为稳定的模型调用事实，Chat 负责记录第一段用户可见输出和执行事件，Store 负责原始数据，Observability 只做纯聚合。普通工具与 Agent 交接都使用 ToolCall ID 关联开始与完成；未成对事件保留为未完成计数。当前最近 Run 列表最多聚合 100 条，适合单机调试；生产规模再引入异步投影、分位指标和 OpenTelemetry，不替换原始审计链。
+Runtime 只负责把 Eino 事件归一化为稳定的模型调用事实，Chat 负责记录第一段用户可见输出和执行事件，Store 负责原始数据，Observability 负责纯聚合和导出。普通工具与 Agent 交接都使用 ToolCall ID 关联开始与完成；未成对事件保留为未完成计数。当前已经用 OTel Span 串联 HTTP、Run、模型、Embedding、Tool 和后台任务，并暴露 Prometheus 指标；最近 Run 列表仍最多查询时聚合 100 条，流量增长后可增加异步指标投影，但不替换原始审计链。
+
+## 11. V0.12 多用户、多副本上线架构
+
+```text
+GitHub OAuth → Redis state/session → tenant/principal
+                                      ↓
+ALB HTTPS → ACK Service → Zora Pod × 2+ → RDS PostgreSQL + pgvector
+                              ├────────→ Tair Redis
+                              └────────→ OTel / Prometheus / 日志
+```
+
+所有需要跨请求共享的状态都已移出进程：Redis 保存登录 Session 和全局限流桶，PostgreSQL 保存业务事实、每日配额、任务租约与会话 advisory lock。后台 Worker 通过 `FOR UPDATE SKIP LOCKED` 竞争任务；Deployment 使用 readiness、PDB、HPA、滚动升级和拓扑分散约束。
+
+生产配置会强制要求 GitHub 登录、PostgreSQL、TLS Redis、数据库 TLS、Secure Cookie、CSRF、分布式限流和受保护 Metrics。阿里云模板位于 `deploy/aliyun/k8s/`，完整购买、配置、负向验证、备份恢复和 Secret 轮换步骤见 [阿里云生产部署 Runbook](aliyun-deployment.md)。在真实域名、证书、云资源和双 GitHub 账号 staging 验收完成前，项目状态只能称为“代码与部署准备完成”，不能称为“已经上线”。

@@ -15,11 +15,12 @@ import (
 var _ approval.Store = (*Postgres)(nil)
 
 func (p *Postgres) CreateApproval(ctx context.Context, item approval.Approval) error {
+	scope := requestScope(ctx)
 	_, err := p.pool.Exec(ctx, `
 INSERT INTO approval_requests(
-    id, run_id, conversation_id, user_message_id, status, trigger_reason, requested_at
-) VALUES($1, $2, $3, $4, $5, $6, $7)`,
-		item.ID, item.RunID, item.ConversationID, item.UserMessageID,
+    id, tenant_id, principal_id, run_id, conversation_id, user_message_id, status, trigger_reason, requested_at
+) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		item.ID, scope.TenantID, scope.ID, item.RunID, item.ConversationID, item.UserMessageID,
 		item.Status, item.TriggerReason, normalizeTime(item.RequestedAt))
 	if err != nil {
 		return fmt.Errorf("创建人工审批记录失败：%w", err)
@@ -28,10 +29,11 @@ INSERT INTO approval_requests(
 }
 
 func (p *Postgres) GetApproval(ctx context.Context, id string) (approval.Approval, error) {
+	scope := requestScope(ctx)
 	row := p.pool.QueryRow(ctx, `
 SELECT id, run_id, conversation_id, user_message_id, status, trigger_reason,
        decision_reason, requested_at, decided_at
-FROM approval_requests WHERE id = $1`, id)
+FROM approval_requests WHERE id = $1 AND tenant_id=$2 AND principal_id=$3`, id, scope.TenantID, scope.ID)
 	item, err := scanApproval(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return approval.Approval{}, store.ErrNotFound
@@ -43,16 +45,17 @@ FROM approval_requests WHERE id = $1`, id)
 }
 
 func (p *Postgres) ListApprovals(ctx context.Context, status string, limit int) ([]approval.Approval, error) {
+	scope := requestScope(ctx)
 	query := `
 SELECT id, run_id, conversation_id, user_message_id, status, trigger_reason,
        decision_reason, requested_at, decided_at
-FROM approval_requests`
-	args := make([]any, 0, 2)
+FROM approval_requests WHERE tenant_id=$1 AND principal_id=$2`
+	args := []any{scope.TenantID, scope.ID}
 	if status != "" {
-		query += " WHERE status = $1 ORDER BY requested_at DESC LIMIT $2"
+		query += " AND status = $3 ORDER BY requested_at DESC LIMIT $4"
 		args = append(args, status, limit)
 	} else {
-		query += " ORDER BY requested_at DESC LIMIT $1"
+		query += " ORDER BY requested_at DESC LIMIT $3"
 		args = append(args, limit)
 	}
 	rows, err := p.pool.Query(ctx, query, args...)
@@ -75,13 +78,14 @@ FROM approval_requests`
 }
 
 func (p *Postgres) ResolveApproval(ctx context.Context, id, status, decisionReason string, decidedAt time.Time) (approval.Approval, error) {
+	scope := requestScope(ctx)
 	row := p.pool.QueryRow(ctx, `
 UPDATE approval_requests
 SET status = $1, decision_reason = $2, decided_at = $3
-WHERE id = $4 AND status = 'pending'
+WHERE id = $4 AND tenant_id=$5 AND principal_id=$6 AND status = 'pending'
 RETURNING id, run_id, conversation_id, user_message_id, status, trigger_reason,
           decision_reason, requested_at, decided_at`,
-		status, decisionReason, normalizeTime(decidedAt), id)
+		status, decisionReason, normalizeTime(decidedAt), id, scope.TenantID, scope.ID)
 	item, err := scanApproval(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if _, getErr := p.GetApproval(ctx, id); getErr != nil {

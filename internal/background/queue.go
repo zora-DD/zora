@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/identity"
 )
 
 type Queue struct {
@@ -63,6 +64,8 @@ func (q *Queue) newJob(kind, dedupeKey, runID, conversationID string, payload js
 }
 
 func (q *Queue) enqueue(ctx context.Context, job Job) (Job, bool, error) {
+	scope := identity.ScopeOrLocal(ctx)
+	job.TenantID, job.PrincipalID = scope.TenantID, scope.ID
 	saved, created, err := q.store.EnqueueBackgroundJob(ctx, job)
 	if err != nil {
 		return Job{}, false, err

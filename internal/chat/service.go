@@ -68,8 +68,13 @@ type Service struct {
 	summaryJobMaxAttempts int
 	approval              *approval.Service
 	telemetry             *observability.Telemetry
+	conversationLocker    conversationLocker
 	locksMu               sync.Mutex
 	locks                 map[string]*sync.Mutex
+}
+
+type conversationLocker interface {
+	LockConversation(ctx context.Context, key string) (unlock func(), err error)
 }
 
 type memoryCapturer interface {
@@ -152,6 +157,10 @@ func WithApprovalGate(gate *approval.Service) Option {
 
 func WithTelemetry(telemetry *observability.Telemetry) Option {
 	return func(service *Service) { service.telemetry = telemetry }
+}
+
+func WithConversationLocker(locker conversationLocker) Option {
+	return func(service *Service) { service.conversationLocker = locker }
 }
 
 func WithRuntimeProfiles(defaultModel string, profiles []RuntimeProfile) Option {
@@ -323,7 +332,10 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 
 	// 同一会话串行执行，避免两个请求读取相同历史后交错写入回答。
 	// 不同会话使用不同的锁，仍然可以并发运行。
-	unlock := s.lockConversation(conversationID)
+	unlock, err := s.acquireConversationLock(ctx, conversationID)
+	if err != nil {
+		return fmt.Errorf("获取会话执行锁失败：%w", err)
+	}
 	defer unlock()
 
 	conversation, err := s.store.GetConversation(ctx, conversationID)
@@ -814,6 +826,13 @@ func (s *Service) lockConversation(id string) func() {
 	s.locksMu.Unlock()
 	lock.Lock()
 	return lock.Unlock
+}
+
+func (s *Service) acquireConversationLock(ctx context.Context, id string) (func(), error) {
+	if s.conversationLocker != nil {
+		return s.conversationLocker.LockConversation(ctx, id)
+	}
+	return s.lockConversation(id), nil
 }
 
 func toEinoMessages(messages []domain.Message) []*schema.Message {

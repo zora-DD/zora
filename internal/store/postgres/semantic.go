@@ -12,6 +12,7 @@ import (
 )
 
 func (p *Postgres) UpsertMessageEmbeddings(ctx context.Context, items []semantic.MessageEmbedding) error {
+	scope := requestScope(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("开始写入消息向量索引事务失败：%w", err)
@@ -23,12 +24,13 @@ func (p *Postgres) UpsertMessageEmbeddings(ctx context.Context, items []semantic
 		}
 		_, err = tx.Exec(ctx, `
 INSERT INTO message_embeddings(message_id, conversation_id, role, embedding_model, embedding_dimensions, index_version, embedding, updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+SELECT $1,$2,$3,$4,$5,$6,$7,$8
+WHERE EXISTS(SELECT 1 FROM conversations WHERE id=$2 AND tenant_id=$9 AND principal_id=$10)
 ON CONFLICT(message_id) DO UPDATE SET conversation_id=EXCLUDED.conversation_id, role=EXCLUDED.role,
 embedding_model=EXCLUDED.embedding_model, embedding_dimensions=EXCLUDED.embedding_dimensions,
 index_version=EXCLUDED.index_version, embedding=EXCLUDED.embedding, updated_at=EXCLUDED.updated_at`,
 			item.MessageID, item.ConversationID, item.Role, item.EmbeddingModel, item.EmbeddingDimensions,
-			item.IndexVersion, pgvector.NewVector(toFloat32(item.Embedding)), normalizeTime(item.UpdatedAt))
+			item.IndexVersion, pgvector.NewVector(toFloat32(item.Embedding)), normalizeTime(item.UpdatedAt), scope.TenantID, scope.ID)
 		if err != nil {
 			return fmt.Errorf("写入消息向量索引失败：%w", err)
 		}
@@ -40,6 +42,7 @@ index_version=EXCLUDED.index_version, embedding=EXCLUDED.embedding, updated_at=E
 }
 
 func (p *Postgres) UpsertMemoryEmbeddings(ctx context.Context, items []semantic.MemoryEmbedding) error {
+	scope := requestScope(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("开始写入长期记忆向量索引事务失败：%w", err)
@@ -51,11 +54,12 @@ func (p *Postgres) UpsertMemoryEmbeddings(ctx context.Context, items []semantic.
 		}
 		_, err = tx.Exec(ctx, `
 INSERT INTO memory_embeddings(memory_id, kind, embedding_model, embedding_dimensions, index_version, embedding, updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7)
+SELECT $1,$2,$3,$4,$5,$6,$7
+WHERE EXISTS(SELECT 1 FROM memories WHERE id=$1 AND tenant_id=$8 AND principal_id=$9)
 ON CONFLICT(memory_id) DO UPDATE SET kind=EXCLUDED.kind, embedding_model=EXCLUDED.embedding_model,
 embedding_dimensions=EXCLUDED.embedding_dimensions, index_version=EXCLUDED.index_version,
 embedding=EXCLUDED.embedding, updated_at=EXCLUDED.updated_at`, item.MemoryID, item.Kind, item.EmbeddingModel,
-			item.EmbeddingDimensions, item.IndexVersion, pgvector.NewVector(toFloat32(item.Embedding)), normalizeTime(item.UpdatedAt))
+			item.EmbeddingDimensions, item.IndexVersion, pgvector.NewVector(toFloat32(item.Embedding)), normalizeTime(item.UpdatedAt), scope.TenantID, scope.ID)
 		if err != nil {
 			return fmt.Errorf("写入长期记忆向量索引失败：%w", err)
 		}
@@ -67,6 +71,7 @@ embedding=EXCLUDED.embedding, updated_at=EXCLUDED.updated_at`, item.MemoryID, it
 }
 
 func (p *Postgres) SearchMessageEmbeddings(ctx context.Context, request semantic.MessageSearchRequest) ([]semantic.MessageHit, error) {
+	scope := requestScope(ctx)
 	if len(request.QueryVector) != p.embeddingDimensions {
 		return nil, semantic.ErrEmbeddingMismatch
 	}
@@ -74,10 +79,12 @@ func (p *Postgres) SearchMessageEmbeddings(ctx context.Context, request semantic
 SELECT m.id,m.conversation_id,m.role,m.content,m.tool_name,m.tool_call_id,m.sequence,m.created_at,
        1-(e.embedding <=> $1) AS score
 FROM message_embeddings e JOIN messages m ON m.id=e.message_id
+JOIN conversations c ON c.id=m.conversation_id
 WHERE e.embedding_model=$2 AND e.embedding_dimensions=$3 AND e.index_version=$4
   AND ($5='' OR e.conversation_id<>$5) AND ($6='' OR e.role=$6)
-ORDER BY e.embedding <=> $1 LIMIT $7`, pgvector.NewVector(toFloat32(request.QueryVector)), request.EmbeddingModel,
-		request.EmbeddingDimensions, request.IndexVersion, request.ExcludeConversation, request.Role, request.Limit)
+  AND c.tenant_id=$7 AND c.principal_id=$8
+ORDER BY e.embedding <=> $1 LIMIT $9`, pgvector.NewVector(toFloat32(request.QueryVector)), request.EmbeddingModel,
+		request.EmbeddingDimensions, request.IndexVersion, request.ExcludeConversation, request.Role, scope.TenantID, scope.ID, request.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询消息向量索引失败：%w", err)
 	}
@@ -96,6 +103,7 @@ ORDER BY e.embedding <=> $1 LIMIT $7`, pgvector.NewVector(toFloat32(request.Quer
 }
 
 func (p *Postgres) SearchMemoryEmbeddings(ctx context.Context, request semantic.MemorySearchRequest) ([]semantic.MemoryHit, error) {
+	scope := requestScope(ctx)
 	if len(request.QueryVector) != p.embeddingDimensions {
 		return nil, semantic.ErrEmbeddingMismatch
 	}
@@ -104,8 +112,9 @@ SELECT e.memory_id, 1-(e.embedding <=> $1) AS score
 FROM memory_embeddings e JOIN memories m ON m.id=e.memory_id
 WHERE e.embedding_model=$2 AND e.embedding_dimensions=$3 AND e.index_version=$4
   AND (m.expires_at IS NULL OR m.expires_at>NOW())
-ORDER BY e.embedding <=> $1 LIMIT $5`, pgvector.NewVector(toFloat32(request.QueryVector)), request.EmbeddingModel,
-		request.EmbeddingDimensions, request.IndexVersion, request.Limit)
+  AND m.tenant_id=$5 AND m.principal_id=$6
+ORDER BY e.embedding <=> $1 LIMIT $7`, pgvector.NewVector(toFloat32(request.QueryVector)), request.EmbeddingModel,
+		request.EmbeddingDimensions, request.IndexVersion, scope.TenantID, scope.ID, request.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询长期记忆向量索引失败：%w", err)
 	}
@@ -139,8 +148,11 @@ ORDER BY e.embedding <=> $1 LIMIT $5`, pgvector.NewVector(toFloat32(request.Quer
 }
 
 func (p *Postgres) ListMessagesForEmbedding(ctx context.Context, afterSequence int64, limit int) ([]domain.Message, error) {
-	rows, err := p.pool.Query(ctx, `SELECT id,conversation_id,role,content,tool_name,tool_call_id,sequence,created_at
-FROM messages WHERE sequence>$1 AND role IN ('user','assistant') ORDER BY sequence LIMIT $2`, afterSequence, limit)
+	scope := requestScope(ctx)
+	rows, err := p.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.role,m.content,m.tool_name,m.tool_call_id,m.sequence,m.created_at
+FROM messages m JOIN conversations c ON c.id=m.conversation_id
+WHERE m.sequence>$1 AND m.role IN ('user','assistant') AND c.tenant_id=$2 AND c.principal_id=$3
+ORDER BY m.sequence LIMIT $4`, afterSequence, scope.TenantID, scope.ID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("读取待向量化消息失败：%w", err)
 	}
@@ -157,8 +169,10 @@ FROM messages WHERE sequence>$1 AND role IN ('user','assistant') ORDER BY sequen
 }
 
 func (p *Postgres) ListMemoriesForEmbedding(ctx context.Context, afterID string, limit int) ([]memory.Memory, error) {
+	scope := requestScope(ctx)
 	rows, err := p.pool.Query(ctx, `SELECT id,kind,memory_key,content,importance,user_edited,source_type,source_conversation_id,
-source_message_id,created_at,updated_at,expires_at FROM memories WHERE id>$1 ORDER BY id LIMIT $2`, afterID, limit)
+source_message_id,created_at,updated_at,expires_at FROM memories
+WHERE id>$1 AND tenant_id=$2 AND principal_id=$3 ORDER BY id LIMIT $4`, afterID, scope.TenantID, scope.ID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("读取待向量化长期记忆失败：%w", err)
 	}

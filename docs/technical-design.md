@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.11 部署准备阶段
+> 适用版本：V0.12 多用户、多副本上线准备阶段
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -178,7 +178,14 @@ flowchart TD
 | `ZORA_CSRF_ENABLED` | `true` | 否 | 是否校验浏览器写请求双提交 Token |
 | `ZORA_COOKIE_SECURE` | `false` | HTTPS 生产必须 true | CSRF Cookie 是否仅经 HTTPS 发送 |
 | `ZORA_CORS_ALLOWED_ORIGINS` | 空 | 否 | 逗号分隔的跨源精确 Origin 白名单 |
-| `ZORA_TRUSTED_PROXY_CIDRS` | 空 | 反向代理部署建议 | 可声明原始客户端 IP/协议的代理网段 |
+| `ZORA_TRUSTED_PROXY_CIDRS` | 空 | 生产必填 | 可声明原始客户端 IP/协议的代理网段；production 拒绝空值与 `/0` |
+| `ZORA_REDIS_URL` / `_FILE` | 空 | 登录或多副本必填 | Redis/Tair TLS URL，用于 OAuth state、Session 与分布式限流 |
+| `ZORA_REPLICA_COUNT` | `1` | production 至少 2 | 大于 1 时强制校验 PostgreSQL + Redis |
+| `ZORA_AUTH_ENABLED` | `false` | 生产必填 | GitHub OAuth 多用户登录开关 |
+| `ZORA_GITHUB_OAUTH_*` | 空 | 登录必填 | Client ID、Secret/Secret 文件与精确 Callback URL |
+| `ZORA_AUTH_SESSION_TTL` | `24h` | 否 | Redis 登录会话滑动过期时间 |
+| `ZORA_METRICS_TOKEN` / `_FILE` | 空 | 生产必填 | `/metrics` Bearer Token；production 至少 32 字符 |
+| `ZORA_AI_CONFIG_FILE` | 空 | 推荐 | 外置 AI JSON 配置；文件权限必须为 0400/0600，禁止内联 Key，修改后重启生效 |
 | `ZORA_MODEL_PROVIDER` | `mock` | 否 | `mock` 或 `openai` |
 | `ZORA_MODEL` | `qwen-plus` | openai 模式需要 | 模型名称 |
 | `ZORA_API_KEY` / `_FILE` | 空 | openai 模式必填 | 模型服务密钥；生产推荐 Secret 文件 |
@@ -202,7 +209,7 @@ flowchart TD
 | `ZORA_EMBEDDING_DIMENSIONS` | hash 384 / openai 1024 | 否 | 向量维度 |
 | `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 否 | Unicode 字符分块上限，最少 100 |
 | `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 否 | 重叠字符数，必须小于分块上限的一半 |
-| `ZORA_KNOWLEDGE_PRINCIPAL_ID` | `local-user` | 否 | 单用户部署中由服务端信任的知识库主体，客户端不能覆盖 |
+| `ZORA_KNOWLEDGE_PRINCIPAL_ID` | `local-user` | 否 | 未开启登录时的本地主体；登录模式由可信请求身份覆盖 |
 | `ZORA_MESSAGE_RECALL_ENABLED` | `true` | 否 | 是否召回其他会话中的相关用户原话 |
 | `ZORA_MESSAGE_RECALL_LIMIT` | `3` | 否 | 单轮最多注入的历史消息数量 |
 | `ZORA_MESSAGE_RECALL_MIN_SCORE` | `0.55` | 否 | 消息向量相似度门槛，范围 0–1 |
@@ -427,7 +434,7 @@ AgentTool 外层由 `controlledAgentTool` 统一治理。`Runtime.Execute` 为�
      └─ timeout/cancel：Approval=expired，AgentRun=cancelled
 ```
 
-审批决定使用独立 HTTP 请求，不受同一 Conversation 的 Send 锁阻塞。数据库用 `WHERE status='pending'` 保证一次性决策；重复决定返回中文错误。审批记录可跨重启查询，但当前进程内等待通道不能跨重启恢复，这是 V0.5 异步任务化前的明确限制。
+审批决定使用独立 HTTP 请求，不受同一 Conversation 的 Send 锁阻塞。数据库用 `WHERE status='pending'` 保证一次性决策；重复决定返回中文错误。等待方同时监听本地低延迟通知并轮询 PostgreSQL 状态，因此确认请求可以落到任意 Pod。审批记录可跨重启查询，但执行中的 SSE 不会在 Pod 崩溃后自动续跑；这类 Run 会按取消/失败终态处理，完整断点恢复仍需把 Agent 执行本身任务化。
 
 ## 7. 工具设计
 
@@ -784,7 +791,7 @@ sequenceDiagram
 
 Conversation 或 Agent Run 删除时，草稿通过 `ON DELETE SET NULL` 保留，避免审计对象随聊天清理而消失。只有 `draft` 状态允许删除；进入确认链后必须通过显式状态迁移处理。`source_run_id + content_hash` 唯一约束为同一 Run 内的工具重试提供幂等性。
 
-人工确认使用 compare-and-swap：SQL 只有在当前状态等于预期状态时才更新。提交确认要求 `draft`，决定要求 `pending_confirmation`；重复或并发请求返回 409。状态更新与 `office_draft_events` 插入在同一事务提交，事件记录 from/to、actor、原因和时间，避免状态与审计半完成。当前没有身份系统，actor 固定为 `user`；生产接入后必须替换为真实主体 ID。
+人工确认使用 compare-and-swap：SQL 只有在当前状态等于预期状态时才更新。提交确认要求 `draft`，决定要求 `pending_confirmation`；重复或并发请求返回 409。状态更新与 `office_draft_events` 插入在同一事务提交，事件记录 from/to、actor、原因和时间，避免状态与审计半完成。生产请求的 actor 取自 GitHub 登录态注入的 `principal_id`，不能由请求正文伪造；本地无认证模式才回退为 `user`。
 
 准备执行先按 `draft_id` 查询已有任务；不存在时为 approved 草稿生成 `SHA-256(draft_id + content_hash)`，数据库同时对 draft_id 与 idempotency_key 建唯一约束。并发准备只有一个创建成功，其余返回同一任务。执行器未配置时返回 503，Operation 保持 pending、attempt=0。
 
@@ -796,11 +803,11 @@ Executor 在 Service 组装时必须通过 `IdempotencySafe()` 门禁。进程�
 
 ### 9.1 会话级并发
 
-`chat.Service` 使用 `map[conversationID]*sync.Mutex`：
+`chat.Service` 使用可替换的会话锁：
 
-- 同一对话的 Send 串行，保证上下文和回答顺序；
-- 不同对话可以并发；
-- 该锁仅在单进程有效。
+- SQLite 本地模式使用 `map[conversationID]*sync.Mutex`，同一对话串行、不同对话并发；
+- PostgreSQL 模式使用带 tenant 作用域的 Session Advisory Lock，同一会话即使请求落到不同 Pod 也只能运行一个 Agent Run；
+- 专用数据库连接在 Run 结束时显式解锁；Pod 异常退出后连接关闭，PostgreSQL 自动释放锁。
 
 ### 9.2 Context 传递
 
@@ -1241,7 +1248,7 @@ POST /api/office/operations/{operationID}/execute
 - 计算器不使用 eval；
 - JSON 严格解码和大小限制；
 - 模型输出 HTML 转义；
-- CSP、`nosniff`、Referrer Policy；
+- CSP、`frame-ancestors 'none'`、HSTS（仅可信 HTTPS）、`nosniff`、Referrer Policy 与最小 Permissions Policy；
 - 最大 Agent 迭代和请求超时；
 - 删除 Conversation 时明确由用户确认。
 - 删除知识文档时明确由用户确认，上传限制文件类型、大小和 UTF-8。
@@ -1255,13 +1262,16 @@ POST /api/office/operations/{operationID}/execute
 - 草稿归属的 Conversation/Run ID 由 Chat 注入 Context，模型参数不能覆盖；收件地址、时间窗、时区和内容长度在 Service 层二次校验。
 - 同一 Run 的同内容草稿由数据库唯一约束幂等去重；Web 和回答都明确标记“仅预览、尚未发送/创建”。
 - 人工确认状态迁移使用数据库 CAS 并与审计事件同事务；批准响应和页面仍标记“未执行”，当前没有任何 Graph 写调用。
-- API 入口对 `/api` 使用按可信客户端 IP 的进程内令牌桶；请求、Agent Run 和知识上传字节配额通过 `api_usage_daily` 按 UTC 日持久化并原子扣减。
+- API 入口按可信客户端 IP 限流：本地模式使用进程内令牌桶，配置 Redis 时使用原子 Lua 令牌桶；请求、Agent Run 和知识上传字节配额通过 `api_usage_daily` 按 UTC 日持久化并原子扣减。
+- GitHub OAuth 使用 state 一次性消费与 PKCE；Redis 只保存随机服务端 Session，GitHub 数字 ID 映射出的 tenant/principal 注入 Context，客户端 Header 不能覆盖。
+- `GET /api/auth/status` 只公开是否启用认证；Web 据此区分本地开发模式与 GitHub 登录门禁，不向未登录用户泄露 Client ID、回调地址或账户数据。
+- PostgreSQL 查询对会话、消息、Run、知识库、记忆、任务、审批和草稿应用 tenant/principal 条件；同会话跨副本执行由 session advisory lock 串行化。
 - 浏览器写请求必须提供双提交 CSRF Token；CORS 只接受同源或精确白名单，可信代理 CIDR 之外的 `X-Forwarded-*` 一律忽略。
 - 模型 Key、Embedding Key 和 PostgreSQL DSN 支持直接环境变量或 `_FILE`，启动时拒绝双重来源、非普通文件、空文件、超大文件及 Unix group/other 可读权限。
 
 ### 上线前仍须补充
 
-- 身份认证、Tenant 隔离和资源 ACL；
+- 在真实 ALB/HTTPS 环境做双 GitHub 账号 Tenant 隔离负向验收；
 - 托管式 Vault/KMS、自动轮换与审计（当前已支持部署平台 Secret 文件挂载）；
 - 敏感信息脱敏；
 - 工具权限和审批策略；
@@ -1351,10 +1361,10 @@ Dockerfile 使用 Go 构建阶段产出 Zora、文件 MCP 和 Microsoft MCP 三�
 - 挂载持久化数据卷；
 - 通过权限收敛的 `_FILE` Secret 注入 API Key、Embedding Key 和 PostgreSQL DSN；
 - HTTPS 环境启用 Secure Cookie，精确配置 CORS Origin 与可信代理 CIDR；
-- 单实例应用限流不替代网关/WAF；多副本时在入口增加全局限流；
+- Redis 分布式应用限流不替代网关/WAF；入口仍需粗粒度防护；
 - 反向代理必须关闭 SSE 缓冲；
-- 健康检查使用 `/api/health`；
-- 多副本部署前必须迁移 PostgreSQL 和分布式会话锁。
+- liveness 使用 `/api/health`，readiness 使用会检查 PostgreSQL/Redis 的 `/api/ready`；
+- 多副本使用 Redis Session/限流、PostgreSQL advisory lock 和租约 Worker；上线前必须做 Pod 删除与滚动升级演练。
 
 ## 17. 后续目标设计
 
@@ -1374,7 +1384,7 @@ flowchart LR
     Cite --> Agent["Agent 回答"]
 ```
 
-当前已实现 owner 命名空间内容哈希、文档版本链、private/public ACL、PDF 文本层、递归字符切块、chunk 来源范围、Embedding 抽象、混合召回、引用、固定检索/答案评测，以及 PostgreSQL + pgvector HNSW/FTS 候选下推。后续增强是登录态与 tenant 映射、OCR、异步摄取、可选 Rerank，以及更有区分度的真实语义评测样本。
+当前已实现 tenant/owner 命名空间内容哈希、文档版本链、private/public ACL、PDF 文本层、递归字符切块、chunk 来源范围、Embedding 抽象、异步摄取、混合召回、引用、固定检索/答案评测，以及 PostgreSQL + pgvector HNSW/FTS 候选下推。后续增强是组织级共享 ACL/RBAC、OCR、可选 Rerank，以及更有区分度的真实语义评测样本。
 
 ### 17.2 V0.3 Memory
 
@@ -1497,7 +1507,7 @@ RunEvent 与 OTel 的职责不同：前者是不可采样的产品审计事实�
 
 V0.8 将回答后的长期记忆提取从请求内同步调用改为数据库 Outbox。`CaptureQueue.Enqueue` 调用 Store 的事务方法，同时插入 assistant Message 和 `memory_capture_jobs`；任一步失败会整体回滚。Job 只记录消息 ID、Run ID、状态、租约和结果计数，Worker 处理时才读取正文，避免 Outbox 再复制一份用户数据。
 
-Worker 串行消费当前进程任务，使用 `pending → executing → completed/failed` 状态机、租约所有者和 attempt 做并发控制。临时失败回到 pending 并指数退避；SQLite 通过单连接事务领取，PostgreSQL 使用 `FOR UPDATE SKIP LOCKED`。过期 executing 可被重新领取，最后一次尝试中断会恢复为 failed，避免永久卡住。SSE `done.memory_job`、REST Job API、RunEvent、`memory.capture` Span 和三组 Prometheus 指标共同提供产品状态与基础设施时序。详细设计和验收见[第三阶段文档](phase-3-memory-outbox.md)。
+每个 Worker 在单进程内串行消费任务，多个副本之间用数据库领取语义并行分工，使用 `pending → executing → completed/failed` 状态机、租约所有者和 attempt 做并发控制。临时失败回到 pending 并指数退避；SQLite 通过单连接事务领取，PostgreSQL 使用 `FOR UPDATE SKIP LOCKED`。过期 executing 可被重新领取，最后一次尝试中断会恢复为 failed，避免永久卡住。SSE `done.memory_job`、REST Job API、RunEvent、`memory.capture` Span 和三组 Prometheus 指标共同提供产品状态与基础设施时序。详细设计和验收见[第三阶段文档](phase-3-memory-outbox.md)。
 
 ## 18. 维护约定
 

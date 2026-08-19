@@ -12,6 +12,7 @@ import (
 	"github.com/cloudwego/eino/components/tool"
 
 	"github.com/zhiruo/zora/internal/agentruntime"
+	"github.com/zhiruo/zora/internal/identity"
 	"github.com/zhiruo/zora/internal/store"
 )
 
@@ -115,6 +116,7 @@ func TestDraftConfirmationStateMachineIsAuditableAndOneShot(t *testing.T) {
 	}
 	service.now = func() time.Time { return time.Date(2026, 8, 17, 9, 0, 0, 0, time.UTC) }
 	ctx := agentruntime.WithExecutionIdentity(context.Background(), "conv-1", "run-confirm")
+	ctx = identity.WithPrincipal(ctx, identity.Principal{ID: "github:12345", TenantID: "github-user:12345"})
 	draft, _, err := service.CreateEmailDraft(ctx, EmailDraft{
 		To: []string{"dev@example.com"}, Subject: "发布通知", Body: "项目将在周五发布。",
 	})
@@ -143,7 +145,7 @@ func TestDraftConfirmationStateMachineIsAuditableAndOneShot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(events) != 2 || events[0].FromStatus != StatusDraft || events[0].ToStatus != StatusPendingConfirmation ||
-		events[1].ToStatus != StatusApproved || events[1].Actor != "user" {
+		events[1].ToStatus != StatusApproved || events[1].Actor != "github:12345" {
 		t.Fatalf("unexpected draft events: %+v", events)
 	}
 }

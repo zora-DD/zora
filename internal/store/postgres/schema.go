@@ -9,10 +9,16 @@ CREATE TABLE IF NOT EXISTS zora_schema_versions (
 
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL DEFAULT 'local',
+	principal_id TEXT NOT NULL DEFAULT 'local-user',
     title TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT 'local-user';
+CREATE INDEX IF NOT EXISTS idx_conversations_owner_updated
+    ON conversations(tenant_id, principal_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS messages (
     sequence BIGSERIAL PRIMARY KEY,
@@ -60,6 +66,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_task_runs_parent_started
 
 CREATE TABLE IF NOT EXISTS approval_requests (
     id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL DEFAULT 'local',
+	principal_id TEXT NOT NULL DEFAULT 'local-user',
     run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     user_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -69,11 +77,15 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     requested_at TIMESTAMPTZ NOT NULL,
     decided_at TIMESTAMPTZ
 );
+ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE approval_requests ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT 'local-user';
 CREATE INDEX IF NOT EXISTS idx_approval_requests_status_requested
     ON approval_requests(status, requested_at DESC);
 
 CREATE TABLE IF NOT EXISTS office_drafts (
     id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL DEFAULT 'local',
+	principal_id TEXT NOT NULL DEFAULT 'local-user',
     kind TEXT NOT NULL CHECK (kind IN ('email', 'calendar')),
     status TEXT NOT NULL CHECK (status IN ('draft', 'pending_confirmation', 'approved', 'executing', 'completed', 'rejected', 'failed', 'cancelled')),
     conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
@@ -85,6 +97,8 @@ CREATE TABLE IF NOT EXISTS office_drafts (
     updated_at TIMESTAMPTZ NOT NULL,
     UNIQUE(source_run_id, content_hash)
 );
+ALTER TABLE office_drafts ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE office_drafts ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT 'local-user';
 CREATE INDEX IF NOT EXISTS idx_office_drafts_status_updated
     ON office_drafts(status, updated_at DESC);
 
@@ -156,6 +170,8 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
 
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL DEFAULT 'local',
+	principal_id TEXT NOT NULL DEFAULT 'local-user',
     kind TEXT NOT NULL CHECK (kind IN ('semantic', 'episodic')),
     memory_key TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL,
@@ -170,16 +186,35 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_edited BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE memories ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT 'local-user';
 UPDATE memories SET user_edited = TRUE WHERE source_type = 'manual';
 CREATE INDEX IF NOT EXISTS idx_memories_kind_updated
-    ON memories(kind, updated_at DESC);
+    ON memories(tenant_id, principal_id, kind, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_owner_kind_updated_v2
+    ON memories(tenant_id, principal_id, kind, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_kind_key
     ON memories(kind, memory_key);
+-- 历史版本没有数据库唯一约束；迁移时保留每个槽位最新/人工修正记录，旧重复项降级为无槽位记忆。
+WITH duplicate_slots AS (
+    SELECT id, ROW_NUMBER() OVER (
+        PARTITION BY tenant_id, principal_id, kind, memory_key
+        ORDER BY user_edited DESC, updated_at DESC, id DESC
+    ) AS position
+    FROM memories
+    WHERE memory_key <> ''
+)
+UPDATE memories SET memory_key = ''
+WHERE id IN (SELECT id FROM duplicate_slots WHERE position > 1);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_owner_slot_unique
+    ON memories(tenant_id, principal_id, kind, memory_key) WHERE memory_key <> '';
 CREATE INDEX IF NOT EXISTS idx_memories_expiry
     ON memories(expires_at);
 
 CREATE TABLE IF NOT EXISTS memory_capture_jobs (
     id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL DEFAULT 'local',
+	principal_id TEXT NOT NULL DEFAULT 'local-user',
     run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs(id) ON DELETE CASCADE,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     user_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -197,11 +232,15 @@ CREATE TABLE IF NOT EXISTS memory_capture_jobs (
     updated_at TIMESTAMPTZ NOT NULL,
     completed_at TIMESTAMPTZ
 );
+ALTER TABLE memory_capture_jobs ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE memory_capture_jobs ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT 'local-user';
 CREATE INDEX IF NOT EXISTS idx_memory_capture_jobs_status_available
     ON memory_capture_jobs(status, available_at, created_at);
 
 CREATE TABLE IF NOT EXISTS background_jobs (
     id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL DEFAULT 'local',
+	principal_id TEXT NOT NULL DEFAULT 'local-user',
     kind TEXT NOT NULL CHECK (kind IN ('knowledge_ingestion', 'conversation_summary')),
     dedupe_key TEXT NOT NULL,
     run_id TEXT REFERENCES agent_runs(id) ON DELETE CASCADE,
@@ -221,6 +260,11 @@ CREATE TABLE IF NOT EXISTS background_jobs (
     completed_at TIMESTAMPTZ,
     UNIQUE(kind, dedupe_key)
 );
+ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS principal_id TEXT NOT NULL DEFAULT 'local-user';
+ALTER TABLE background_jobs DROP CONSTRAINT IF EXISTS background_jobs_kind_dedupe_key_key;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_background_jobs_tenant_dedupe
+    ON background_jobs(tenant_id, principal_id, kind, dedupe_key);
 CREATE INDEX IF NOT EXISTS idx_background_jobs_kind_status_available
     ON background_jobs(kind, status, available_at, created_at);
 
@@ -265,13 +309,14 @@ CREATE INDEX IF NOT EXISTS idx_memory_embeddings_hnsw
 
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL DEFAULT 'local',
     version_group_id TEXT NOT NULL,
     version INTEGER NOT NULL CHECK (version > 0),
     is_latest BOOLEAN NOT NULL,
     name TEXT NOT NULL,
     source_type TEXT NOT NULL,
     mime_type TEXT NOT NULL,
-    content_hash TEXT NOT NULL UNIQUE,
+    content_hash TEXT NOT NULL,
     owner_id TEXT NOT NULL,
     visibility TEXT NOT NULL CHECK (visibility IN ('private', 'public')),
     embedding_model TEXT NOT NULL,
@@ -281,17 +326,26 @@ CREATE TABLE IF NOT EXISTS knowledge_documents (
     updated_at TIMESTAMPTZ NOT NULL
 );
 ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS version_group_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'local';
 ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0);
 ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS is_latest BOOLEAN NOT NULL DEFAULT TRUE;
 ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT 'local-user';
 ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'public'));
 UPDATE knowledge_documents SET version_group_id = id WHERE version_group_id = '';
+-- 旧版本把文档哈希设成全局唯一，会让不同租户上传同一份资料时互相冲突。
+ALTER TABLE knowledge_documents DROP CONSTRAINT IF EXISTS knowledge_documents_content_hash_key;
 CREATE INDEX IF NOT EXISTS idx_knowledge_documents_created
     ON knowledge_documents(created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_documents_group_version
-    ON knowledge_documents(version_group_id, version);
+-- 旧索引把版本组视为全局命名空间；多租户下必须把 owner 一并纳入唯一键。
+DROP INDEX IF EXISTS idx_knowledge_documents_group_version;
+CREATE UNIQUE INDEX idx_knowledge_documents_group_version
+    ON knowledge_documents(tenant_id, owner_id, version_group_id, version);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_knowledge_documents_owner_hash_unique
+    ON knowledge_documents(tenant_id, owner_id, content_hash);
 CREATE INDEX IF NOT EXISTS idx_knowledge_documents_acl_latest
-    ON knowledge_documents(owner_id, visibility, is_latest);
+    ON knowledge_documents(tenant_id, owner_id, visibility, is_latest);
+CREATE INDEX IF NOT EXISTS idx_knowledge_documents_tenant_acl_latest_v2
+    ON knowledge_documents(tenant_id, owner_id, visibility, is_latest);
 
 CREATE TABLE IF NOT EXISTS knowledge_chunks (
     sequence BIGSERIAL PRIMARY KEY,
@@ -330,4 +384,6 @@ INSERT INTO zora_schema_versions(version) VALUES (10) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (11) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (12) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (13) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (14) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (15) ON CONFLICT DO NOTHING;
 `

@@ -13,16 +13,19 @@ import (
 	"time"
 
 	"github.com/cloudwego/eino/components/tool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/agenttools"
 	"github.com/zhiruo/zora/internal/approval"
+	"github.com/zhiruo/zora/internal/authn"
 	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/httpapi"
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/identity"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/mcpbridge"
 	"github.com/zhiruo/zora/internal/memory"
@@ -47,6 +50,7 @@ type applicationStore interface {
 	approval.Store
 	office.Store
 	summary.Store
+	Ping(context.Context) error
 }
 
 func main() {
@@ -75,7 +79,7 @@ func run(logger *slog.Logger) error {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancelStartup()
 	telemetry, err := observability.NewTelemetry(startupCtx, observability.TelemetryConfig{
-		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.11.0-dev",
+		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.12.0-dev",
 		Environment: cfg.OTelEnvironment, TracingEnabled: cfg.OTelEnabled,
 		OTLPEndpoint: cfg.OTelEndpoint, TraceSampleRatio: cfg.OTelSampleRatio,
 		PrometheusEnabled: cfg.PrometheusEnabled,
@@ -96,6 +100,30 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer database.Close()
+	redisClient, err := buildRedis(startupCtx, cfg.RedisURL)
+	if err != nil {
+		return err
+	}
+	if redisClient != nil {
+		defer redisClient.Close()
+	}
+	authManager, err := authn.New(authn.Config{
+		Enabled: cfg.AuthEnabled, ClientID: cfg.GitHubOAuthClientID,
+		ClientSecret: cfg.GitHubOAuthClientSecret, RedirectURL: cfg.GitHubOAuthRedirectURL,
+		SessionTTL: cfg.AuthSessionTTL, CookieSecure: cfg.CookieSecure,
+		CookieDomain: cfg.AuthCookieDomain,
+	}, authn.NewRedisSessionStore(redisClient), logger, identity.LocalPrincipal(cfg.KnowledgePrincipalID))
+	if err != nil {
+		return fmt.Errorf("初始化 GitHub 登录失败：%w", err)
+	}
+	securityOptions := make([]security.Option, 0, 1)
+	if redisClient != nil && cfg.RateLimitEnabled {
+		limiter, limiterErr := security.NewRedisRateLimiter(redisClient, cfg.RateLimitRequestsPerSecond, cfg.RateLimitBurst, "")
+		if limiterErr != nil {
+			return fmt.Errorf("初始化 Redis 分布式限流失败：%w", limiterErr)
+		}
+		securityOptions = append(securityOptions, security.WithRateLimiter(limiter))
+	}
 	securityManager, err := security.New(security.Config{
 		RateLimitEnabled: cfg.RateLimitEnabled, RequestsPerSecond: cfg.RateLimitRequestsPerSecond,
 		Burst: cfg.RateLimitBurst, DailyRequestQuota: cfg.DailyRequestQuota,
@@ -103,7 +131,7 @@ func run(logger *slog.Logger) error {
 		CSRFEnabled: cfg.CSRFEnabled, CookieSecure: cfg.CookieSecure,
 		AllowedOrigins: cfg.CORSAllowedOrigins, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 		PrincipalID: cfg.KnowledgePrincipalID,
-	}, database)
+	}, database, securityOptions...)
 	if err != nil {
 		return fmt.Errorf("初始化 API 安全边界失败：%w", err)
 	}
@@ -310,6 +338,11 @@ func run(logger *slog.Logger) error {
 		chat.WithRuntimeProfiles(cfg.DefaultModelID, runtimeProfiles),
 		chat.WithTelemetry(telemetry),
 	}
+	if locker, ok := database.(interface {
+		LockConversation(context.Context, string) (func(), error)
+	}); ok {
+		chatOptions = append(chatOptions, chat.WithConversationLocker(locker))
+	}
 	if memoryQueue != nil {
 		chatOptions = append(chatOptions, chat.WithMemoryCaptureQueue(memoryQueue, cfg.MemoryWorkerMaxAttempts))
 	}
@@ -468,6 +501,19 @@ func run(logger *slog.Logger) error {
 	httpOptions = append(httpOptions, httpapi.WithSemanticService(semanticService))
 	httpOptions = append(httpOptions, httpapi.WithBackgroundQueue(backgroundQueue))
 	httpOptions = append(httpOptions, httpapi.WithSecurity(securityManager))
+	httpOptions = append(httpOptions, httpapi.WithAuth(authManager))
+	httpOptions = append(httpOptions, httpapi.WithMetricsToken(cfg.MetricsToken))
+	httpOptions = append(httpOptions, httpapi.WithReadinessCheck(func(ctx context.Context) error {
+		if err := database.Ping(ctx); err != nil {
+			return fmt.Errorf("数据库不可用：%w", err)
+		}
+		if redisClient != nil {
+			if err := redisClient.Ping(ctx).Err(); err != nil {
+				return fmt.Errorf("Redis/Tair 不可用：%w", err)
+			}
+		}
+		return nil
+	}))
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout, httpOptions...)
 	if err != nil {
 		return err
@@ -477,7 +523,9 @@ func run(logger *slog.Logger) error {
 		Addr:              cfg.Addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	serveErrors := make(chan error, 1)
 	// HTTP 服务放入 goroutine，主 goroutine 同时监听系统信号和异常退出。
@@ -491,7 +539,8 @@ func run(logger *slog.Logger) error {
 			"会话摘要", cfg.SummaryEnabled, "多Agent", cfg.MultiAgentEnabled,
 			"MCP已启用", cfg.MCPEnabled, "MCP工具数", mcpToolCount,
 			"办公执行器", cfg.OfficeExecutor,
-			"OTel Trace", cfg.OTelEnabled, "Prometheus", cfg.PrometheusEnabled)
+			"OTel Trace", cfg.OTelEnabled, "Prometheus", cfg.PrometheusEnabled,
+			"GitHub登录", cfg.AuthEnabled, "副本数", cfg.ReplicaCount)
 		serveErrors <- server.ListenAndServe()
 	}()
 
@@ -506,10 +555,33 @@ func run(logger *slog.Logger) error {
 		}
 	}
 
-	// 给正在执行的 SSE 请求留出退出窗口，超时后由 net/http 强制结束。
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 滚动升级时尽量让正在执行的 Agent/SSE 在请求预算内完成；上限与 Kubernetes 120 秒终止窗口配合。
+	shutdownTimeout := cfg.RequestTimeout + 10*time.Second
+	if shutdownTimeout < 30*time.Second {
+		shutdownTimeout = 30 * time.Second
+	}
+	if shutdownTimeout > 110*time.Second {
+		shutdownTimeout = 110 * time.Second
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	return server.Shutdown(shutdownCtx)
+}
+
+func buildRedis(ctx context.Context, rawURL string) (*redis.Client, error) {
+	if rawURL == "" {
+		return nil, nil
+	}
+	options, err := redis.ParseURL(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("解析 Redis 连接地址失败：%w", err)
+	}
+	client := redis.NewClient(options)
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("连接 Redis/Tair 失败：%w", err)
+	}
+	return client, nil
 }
 
 func buildStore(ctx context.Context, cfg config.Config) (applicationStore, error) {

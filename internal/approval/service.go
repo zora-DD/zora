@@ -49,14 +49,16 @@ type Store interface {
 }
 
 type Options struct {
-	Mode    string
-	Timeout time.Duration
+	Mode         string
+	Timeout      time.Duration
+	PollInterval time.Duration
 }
 
 type Service struct {
 	store   Store
 	mode    string
 	timeout time.Duration
+	poll    time.Duration
 	mu      sync.Mutex
 	waiters map[string]chan Approval
 }
@@ -71,7 +73,10 @@ func NewService(store Store, options Options) (*Service, error) {
 	if options.Timeout <= 0 {
 		return nil, fmt.Errorf("审批等待时间必须大于 0")
 	}
-	return &Service{store: store, mode: options.Mode, timeout: options.Timeout, waiters: make(map[string]chan Approval)}, nil
+	if options.PollInterval <= 0 {
+		options.PollInterval = 250 * time.Millisecond
+	}
+	return &Service{store: store, mode: options.Mode, timeout: options.Timeout, poll: options.PollInterval, waiters: make(map[string]chan Approval)}, nil
 }
 
 func (s *Service) Enabled() bool { return s != nil && s.mode != ModeOff }
@@ -99,27 +104,42 @@ func (s *Service) Request(ctx context.Context, input RequestInput) (*Approval, e
 }
 
 func (s *Service) Wait(ctx context.Context, approvalID string) (Approval, error) {
+	// 先查一次持久化状态，覆盖“其他副本在 Wait 开始前已经完成审批”的竞态。
+	current, err := s.store.GetApproval(ctx, approvalID)
+	if err != nil {
+		return Approval{}, err
+	}
+	if current.Status != StatusPending {
+		return current, nil
+	}
 	s.mu.Lock()
 	waiter := s.waiters[approvalID]
 	s.mu.Unlock()
-	if waiter == nil {
-		return Approval{}, fmt.Errorf("审批 %s 没有正在等待的 Agent Run", approvalID)
-	}
 	defer s.removeWaiter(approvalID)
 	timer := time.NewTimer(s.timeout)
 	defer timer.Stop()
-	select {
-	case item := <-waiter:
-		return item, nil
-	case <-timer.C:
-		item, err := s.resolveWithoutCancel(ctx, approvalID, StatusExpired, "等待人工审批超时")
-		if err != nil {
-			return Approval{}, err
+	poller := time.NewTicker(s.poll)
+	defer poller.Stop()
+	for {
+		select {
+		case item := <-waiter:
+			return item, nil
+		case <-poller.C:
+			// PostgreSQL 是审批状态事实源；轮询让任意副本处理的 Decide 都能唤醒原 SSE。
+			current, getErr := s.store.GetApproval(ctx, approvalID)
+			if getErr == nil && current.Status != StatusPending {
+				return current, nil
+			}
+		case <-timer.C:
+			item, resolveErr := s.resolveWithoutCancel(ctx, approvalID, StatusExpired, "等待人工审批超时")
+			if resolveErr != nil {
+				return Approval{}, resolveErr
+			}
+			return item, nil
+		case <-ctx.Done():
+			_, _ = s.resolveWithoutCancel(ctx, approvalID, StatusExpired, "请求已取消，审批自动失效")
+			return Approval{}, ctx.Err()
 		}
-		return item, nil
-	case <-ctx.Done():
-		_, _ = s.resolveWithoutCancel(ctx, approvalID, StatusExpired, "请求已取消，审批自动失效")
-		return Approval{}, ctx.Err()
 	}
 }
 

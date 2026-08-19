@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -49,6 +51,8 @@ type Config struct {
 	StoreProvider               string         // sqlite 或 postgres；默认 sqlite 保持零依赖体验。
 	PostgresDSN                 string         // PostgreSQL 连接串，只允许通过环境变量注入。
 	PostgresMaxConns            int            // PostgreSQL 连接池最大连接数。
+	RedisURL                    string         // Redis/Tair 连接地址，用于多副本会话和分布式限流。
+	ReplicaCount                int            // 计划运行的应用副本数；大于 1 时强制检查分布式依赖。
 	Provider                    string         // mock 或 openai；openai 兼容通义千问等接口。
 	Model                       string         // 发送给模型服务的模型名称。
 	APIKey                      string         // 仅从环境变量读取，禁止写入仓库。
@@ -110,6 +114,13 @@ type Config struct {
 	CookieSecure                  bool          // 生产 HTTPS 环境应开启，禁止 Cookie 经明文 HTTP 传输。
 	CORSAllowedOrigins            []string      // 跨源访问的精确 Origin 白名单，不支持通配符。
 	TrustedProxyCIDRs             []string      // 仅这些反向代理可提供 X-Forwarded-For。
+	AuthEnabled                   bool          // 是否启用 GitHub OAuth 登录；生产环境必须开启。
+	GitHubOAuthClientID           string        // GitHub OAuth App Client ID。
+	GitHubOAuthClientSecret       string        // 只从环境变量或 Secret 文件读取。
+	GitHubOAuthRedirectURL        string        // 必须与 GitHub OAuth App 回调地址完全一致。
+	AuthSessionTTL                time.Duration // Redis 服务端登录会话的滑动过期时间。
+	AuthCookieDomain              string        // 可选 Cookie Domain；通常留空使用当前主机。
+	MetricsToken                  string        // /metrics Bearer Token；生产环境必须配置。
 
 	SummaryEnabled         bool // 是否启用长对话增量摘要与上下文压缩。
 	SummaryTriggerMessages int  // 尚未摘要的消息达到该数量后触发增量摘要。
@@ -200,6 +211,10 @@ func Load() (Config, error) {
 	postgresMaxConns, err := positiveInt("ZORA_POSTGRES_MAX_CONNS", "10")
 	if err != nil || postgresMaxConns > 100 {
 		return Config{}, fmt.Errorf("ZORA_POSTGRES_MAX_CONNS 必须在 1 到 100 之间")
+	}
+	replicaCount, err := positiveInt("ZORA_REPLICA_COUNT", "1")
+	if err != nil || replicaCount > 1000 {
+		return Config{}, fmt.Errorf("ZORA_REPLICA_COUNT 必须在 1 到 1000 之间")
 	}
 	messageRecallEnabled, err := strconv.ParseBool(env("ZORA_MESSAGE_RECALL_ENABLED", "true"))
 	if err != nil {
@@ -308,6 +323,14 @@ func Load() (Config, error) {
 	}
 	corsAllowedOrigins := splitCSV(os.Getenv("ZORA_CORS_ALLOWED_ORIGINS"))
 	trustedProxyCIDRs := splitCSV(os.Getenv("ZORA_TRUSTED_PROXY_CIDRS"))
+	authEnabled, err := strconv.ParseBool(env("ZORA_AUTH_ENABLED", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_AUTH_ENABLED 必须是 true 或 false")
+	}
+	authSessionTTL, err := time.ParseDuration(env("ZORA_AUTH_SESSION_TTL", "24h"))
+	if err != nil || authSessionTTL < 5*time.Minute || authSessionTTL > 30*24*time.Hour {
+		return Config{}, fmt.Errorf("ZORA_AUTH_SESSION_TTL 必须在 5 分钟到 30 天之间")
+	}
 	summaryEnabled, err := strconv.ParseBool(env("ZORA_SUMMARY_ENABLED", "true"))
 	if err != nil {
 		return Config{}, fmt.Errorf("ZORA_SUMMARY_ENABLED 必须是 true 或 false")
@@ -370,6 +393,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	redisURL, err := secrets.Resolve("ZORA_REDIS_URL", "ZORA_REDIS_URL_FILE")
+	if err != nil {
+		return Config{}, err
+	}
+	githubClientSecret, err := secrets.Resolve("ZORA_GITHUB_OAUTH_CLIENT_SECRET", "ZORA_GITHUB_OAUTH_CLIENT_SECRET_FILE")
+	if err != nil {
+		return Config{}, err
+	}
+	metricsToken, err := secrets.Resolve("ZORA_METRICS_TOKEN", "ZORA_METRICS_TOKEN_FILE")
+	if err != nil {
+		return Config{}, err
+	}
 	apiKey, err := secrets.Resolve("ZORA_API_KEY", "ZORA_API_KEY_FILE")
 	if err != nil {
 		return Config{}, err
@@ -385,6 +420,8 @@ func Load() (Config, error) {
 		StoreProvider:               strings.ToLower(env("ZORA_STORE_PROVIDER", "sqlite")),
 		PostgresDSN:                 postgresDSN,
 		PostgresMaxConns:            postgresMaxConns,
+		RedisURL:                    redisURL,
+		ReplicaCount:                replicaCount,
 		Provider:                    strings.ToLower(env("ZORA_MODEL_PROVIDER", "mock")),
 		Model:                       env("ZORA_MODEL", "qwen-plus"),
 		APIKey:                      apiKey,
@@ -443,6 +480,13 @@ func Load() (Config, error) {
 		CookieSecure:                  cookieSecure,
 		CORSAllowedOrigins:            corsAllowedOrigins,
 		TrustedProxyCIDRs:             trustedProxyCIDRs,
+		AuthEnabled:                   authEnabled,
+		GitHubOAuthClientID:           strings.TrimSpace(os.Getenv("ZORA_GITHUB_OAUTH_CLIENT_ID")),
+		GitHubOAuthClientSecret:       githubClientSecret,
+		GitHubOAuthRedirectURL:        strings.TrimSpace(os.Getenv("ZORA_GITHUB_OAUTH_REDIRECT_URL")),
+		AuthSessionTTL:                authSessionTTL,
+		AuthCookieDomain:              strings.TrimSpace(os.Getenv("ZORA_AUTH_COOKIE_DOMAIN")),
+		MetricsToken:                  metricsToken,
 
 		SummaryEnabled:         summaryEnabled,
 		SummaryTriggerMessages: summaryTriggerMessages,
@@ -470,8 +514,85 @@ func Load() (Config, error) {
 	default:
 		return Config{}, fmt.Errorf("不支持的 ZORA_STORE_PROVIDER：%q，仅支持 sqlite 或 postgres", cfg.StoreProvider)
 	}
+	if cfg.AuthEnabled {
+		if cfg.StoreProvider != "postgres" {
+			return Config{}, fmt.Errorf("启用多用户登录时必须使用 PostgreSQL，SQLite 仅支持本地单用户模式")
+		}
+		if cfg.RedisURL == "" {
+			return Config{}, fmt.Errorf("启用 GitHub 登录时必须配置 ZORA_REDIS_URL")
+		}
+		if cfg.GitHubOAuthClientID == "" || cfg.GitHubOAuthClientSecret == "" || cfg.GitHubOAuthRedirectURL == "" {
+			return Config{}, fmt.Errorf("启用 GitHub 登录时必须配置 GitHub OAuth Client ID、Client Secret 和回调地址")
+		}
+		redirect, parseErr := url.ParseRequestURI(cfg.GitHubOAuthRedirectURL)
+		if parseErr != nil || redirect.Scheme == "" || redirect.Host == "" {
+			return Config{}, fmt.Errorf("ZORA_GITHUB_OAUTH_REDIRECT_URL 必须是包含协议和主机的绝对地址")
+		}
+		if redirect.User != nil || redirect.Path != "/api/auth/callback" || redirect.RawQuery != "" || redirect.Fragment != "" {
+			return Config{}, fmt.Errorf("ZORA_GITHUB_OAUTH_REDIRECT_URL 必须精确指向 /api/auth/callback，且不能包含用户信息、查询参数或片段")
+		}
+	}
+	if cfg.ReplicaCount > 1 {
+		if cfg.StoreProvider != "postgres" {
+			return Config{}, fmt.Errorf("多副本部署必须使用 PostgreSQL，SQLite 不能跨实例共享状态")
+		}
+		if cfg.RedisURL == "" {
+			return Config{}, fmt.Errorf("多副本部署必须配置 ZORA_REDIS_URL，用于共享登录会话和限流状态")
+		}
+	}
+	if strings.EqualFold(cfg.OTelEnvironment, "production") {
+		if !cfg.AuthEnabled || !cfg.CookieSecure || !cfg.CSRFEnabled || !cfg.RateLimitEnabled {
+			return Config{}, fmt.Errorf("production 环境必须启用 GitHub 登录、Secure Cookie、CSRF 和 API 限流")
+		}
+		if cfg.StoreProvider != "postgres" || cfg.RedisURL == "" || cfg.MetricsToken == "" {
+			return Config{}, fmt.Errorf("production 环境必须配置 PostgreSQL、Redis 和 ZORA_METRICS_TOKEN")
+		}
+		if cfg.ReplicaCount < 2 {
+			return Config{}, fmt.Errorf("production 环境必须把 ZORA_REPLICA_COUNT 配置为至少 2")
+		}
+		if len(cfg.TrustedProxyCIDRs) == 0 {
+			return Config{}, fmt.Errorf("production 环境必须配置 ZORA_TRUSTED_PROXY_CIDRS，只信任实际 ALB 后端来源网段")
+		}
+		for _, raw := range cfg.TrustedProxyCIDRs {
+			_, network, cidrErr := net.ParseCIDR(raw)
+			if cidrErr != nil {
+				return Config{}, fmt.Errorf("production 环境的可信代理 CIDR %q 无效：%w", raw, cidrErr)
+			}
+			prefix, _ := network.Mask.Size()
+			if prefix == 0 {
+				return Config{}, fmt.Errorf("production 环境禁止把 %q 设为可信代理网段，请仅填写实际 ALB 后端来源 CIDR", raw)
+			}
+		}
+		if len(cfg.MetricsToken) < 32 {
+			return Config{}, fmt.Errorf("production 环境的 ZORA_METRICS_TOKEN 至少需要 32 个字符")
+		}
+		if cfg.DailyRequestQuota <= 0 || cfg.DailyChatQuota <= 0 || cfg.DailyUploadBytesQuota <= 0 {
+			return Config{}, fmt.Errorf("production 环境必须为请求、Agent Run 和知识库上传配置正数日配额")
+		}
+		redirect, _ := url.Parse(cfg.GitHubOAuthRedirectURL)
+		if redirect == nil || redirect.Scheme != "https" {
+			return Config{}, fmt.Errorf("production 环境的 GitHub OAuth 回调地址必须使用 HTTPS")
+		}
+		redisEndpoint, redisErr := url.Parse(cfg.RedisURL)
+		hasRedisPassword := false
+		if redisEndpoint != nil && redisEndpoint.User != nil {
+			password, passwordPresent := redisEndpoint.User.Password()
+			hasRedisPassword = passwordPresent && strings.TrimSpace(password) != ""
+		}
+		if redisErr != nil || redisEndpoint.Scheme != "rediss" || redisEndpoint.Host == "" || !hasRedisPassword {
+			return Config{}, fmt.Errorf("production 环境的 Redis/Tair 连接必须使用包含主机和密码的 rediss TLS URL")
+		}
+		postgresDSNLower := strings.ToLower(cfg.PostgresDSN)
+		if !strings.Contains(postgresDSNLower, "sslmode=require") && !strings.Contains(postgresDSNLower, "sslmode=verify-ca") && !strings.Contains(postgresDSNLower, "sslmode=verify-full") {
+			return Config{}, fmt.Errorf("production 环境的 PostgreSQL DSN 必须显式启用 sslmode=require、verify-ca 或 verify-full")
+		}
+	}
 
-	if err := configureModels(&cfg, os.Getenv("ZORA_MODELS_JSON"), os.Getenv("ZORA_DEFAULT_MODEL_ID")); err != nil {
+	if aiConfigPath := strings.TrimSpace(os.Getenv("ZORA_AI_CONFIG_FILE")); aiConfigPath != "" {
+		if err := applyAIConfigFile(&cfg, aiConfigPath); err != nil {
+			return Config{}, err
+		}
+	} else if err := configureModels(&cfg, os.Getenv("ZORA_MODELS_JSON"), os.Getenv("ZORA_DEFAULT_MODEL_ID")); err != nil {
 		return Config{}, err
 	}
 

@@ -132,6 +132,8 @@ type CaptureResult struct {
 // Outbox 只保存消息 ID，不复制用户与助手正文，Worker 处理时再读取原始消息。
 type CaptureJob struct {
 	ID                 string         `json:"id"`
+	TenantID           string         `json:"-"`
+	PrincipalID        string         `json:"-"`
 	RunID              string         `json:"run_id"`
 	ConversationID     string         `json:"conversation_id"`
 	UserMessageID      string         `json:"user_message_id"`

@@ -12,6 +12,7 @@ import (
 
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/identity"
 )
 
 const maxCaptureJobErrorRunes = 1_000
@@ -150,6 +151,9 @@ func (w *CaptureWorker) processNext(ctx context.Context) (bool, error) {
 	}
 
 	jobCtx, cancel := context.WithTimeout(ctx, w.options.TaskTimeout)
+	jobCtx = identity.WithPrincipal(jobCtx, identity.Principal{
+		ID: job.PrincipalID, TenantID: job.TenantID, Provider: "job", Subject: job.PrincipalID, Username: job.PrincipalID,
+	})
 	defer cancel()
 	finishInstrumentation := func(string, error) {}
 	if w.options.Instrumentation != nil {
@@ -241,6 +245,9 @@ func (w *CaptureWorker) observe(job CaptureJob, result *CaptureResult, jobErr er
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	ctx = identity.WithPrincipal(ctx, identity.Principal{
+		ID: job.PrincipalID, TenantID: job.TenantID, Provider: "job", Subject: job.PrincipalID, Username: job.PrincipalID,
+	})
 	w.options.Observer(ctx, job, result, jobErr)
 }
 

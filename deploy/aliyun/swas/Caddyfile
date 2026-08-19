@@ -1,0 +1,31 @@
+{
+	# Caddy 会通过 ACME 自动申请和续期 HTTPS 证书。
+	email {$ZORA_ACME_EMAIL}
+	admin off
+}
+
+{$ZORA_DOMAIN} {
+	encode zstd gzip
+
+	# 限制入口请求体，略高于 Zora 当前 6 MiB 文档上传上限，为 multipart 元数据预留空间。
+	request_body {
+		max_size 8MB
+	}
+
+	reverse_proxy zora:8088 {
+		# SSE 输出要求及时向浏览器刷新，避免回答积压到最后一次性显示。
+		flush_interval -1
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

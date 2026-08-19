@@ -8,6 +8,7 @@ import (
 
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/identity"
 )
 
 const defaultCaptureJobListLimit = 100
@@ -56,6 +57,8 @@ func (q *CaptureQueue) Enqueue(ctx context.Context, input CaptureEnqueueInput) (
 		Status: JobPending, MaxAttempts: input.MaxAttempts, AvailableAt: now,
 		TraceParent: strings.TrimSpace(input.TraceParent), CreatedAt: now, UpdatedAt: now,
 	}
+	scope := identity.ScopeOrLocal(ctx)
+	job.TenantID, job.PrincipalID = scope.TenantID, scope.ID
 	message, saved, created, err := q.store.EnqueueCaptureJob(ctx, input.Assistant, job)
 	if err != nil {
 		return domain.Message{}, CaptureJob{}, false, err

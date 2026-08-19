@@ -1,0 +1,43 @@
+# AlbConfig 是集群级入口资源。应用前替换两个 vSwitch，并先用 kubectl diff 检查，避免覆盖已有监听。
+apiVersion: alibabacloud.com/v1
+kind: AlbConfig
+metadata:
+  name: zora-alb
+spec:
+  config:
+    name: zora-production
+    addressType: Internet
+    addressAllocatedMode: Fixed
+    edition: Standard
+    zoneMappings:
+      - vSwitchId: vsw-CHANGE_ME_ZONE_A
+      - vSwitchId: vsw-CHANGE_ME_ZONE_B
+  listeners:
+    - port: 80
+      protocol: HTTP
+      idleTimeout: 120
+      requestTimeout: 120
+      xForwardedForConfig:
+        # 入口生成 XFF 并拒绝把客户端伪造的源 IP 链当作可信来源；应用仍只信任配置网段。
+        XForwardedForEnabled: true
+        XForwardedForClientSourceIpsEnabled: false
+        XForwardedForProtoEnabled: true
+    - port: 443
+      protocol: HTTPS
+      idleTimeout: 120
+      requestTimeout: 120
+      xForwardedForConfig:
+        XForwardedForEnabled: true
+        XForwardedForClientSourceIpsEnabled: false
+        XForwardedForProtoEnabled: true
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: zora-alb
+spec:
+  controller: ingress.k8s.alibabacloud/alb
+  parameters:
+    apiGroup: alibabacloud.com
+    kind: AlbConfig
+    name: zora-alb

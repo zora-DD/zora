@@ -1,0 +1,17 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: zora
+  namespace: zora
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: zora
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      authorization:
+        credentials:
+          name: zora-secrets
+          key: metrics-token

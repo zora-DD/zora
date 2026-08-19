@@ -1,9 +1,10 @@
 .git
 .gitignore
-.env
+.env*
+**/.secrets
+**/.runtime
 bin
 data
 coverage.out
 README.md
 docs
-

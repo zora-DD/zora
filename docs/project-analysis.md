@@ -673,7 +673,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 4. **多 Agent 有治理**：权限、预算、并发、超时、父子 Run 和对照评测；
 5. **副作用安全**：Draft、确认、Operation、幂等、租约和远端检查点。
 6. **异步可靠性**：助手消息与 Memory Job 原子入队、租约领取、退避重试和崩溃恢复。
-7. **部署安全边界**：可信 IP 限流、持久化日配额、CSRF/CORS 与文件 Secret。
+7. **部署安全边界**：GitHub OAuth、租户隔离、Redis Session/限流、持久化日配额、CSRF/CORS 与文件 Secret。
 
 这些能力能体现 Go 后端、安全工程与 Agent 工程能力的结合。
 
@@ -681,13 +681,13 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 
 
-### 11.1 P0：对外部署前必须解决
+### 11.1 P0：云侧上线前必须验收
 
 
 | 缺陷                      | 风险                        | 建议方案                                       |
 | ----------------------- | ------------------------- | ------------------------------------------ |
-| 没有认证与租户体系               | 任意访问者可读取对话、记忆、文档和草稿       | OIDC/JWT、中间件注入 principal、全表 tenant_id、RBAC |
-| 尚无 JWT/OIDC 与按模型成本预算       | 当前配额按单用户主体、IP 和资源计数，不能代表真实租户计费 | 认证主体、tenant_id、按模型 Token/费用预算与 RBAC             |
+| GitHub 多用户尚未在公网双账号验收 | 代码隔离通过不代表 ALB/Session/数据库配置完全正确 | staging 使用两个 GitHub 账号交叉读取负向测试 |
+| 当前一名 GitHub 用户对应一个租户 | 不支持组织成员共享资料、角色和管理员权限 | tenant membership、邀请、RBAC；必要时增加 PostgreSQL RLS |
 | Secret 尚未接入托管轮换平台          | 已有严格 `_FILE` 注入，但轮换和访问审计依赖部署平台 | Vault/KMS/Secret Manager、自动轮换和审计                     |
 | Microsoft 写链路未真实租户验收    | 代码测试通过不代表 Graph 权限与幂等真实有效 | 测试租户端到端、失败注入、重复执行验收                        |
 
@@ -699,7 +699,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 | 缺陷                 | 当前影响               | 建议方案                                  |
 | ------------------ | ------------------ | ------------------------------------- |
-| 会话锁只在单进程内          | 多实例可能并发处理同一会话      | PostgreSQL advisory lock 或 Redis 分布式锁 |
+| 会话锁会占用一个 PostgreSQL 连接 | 长 Agent Run 并发高时可能挤压连接池 | 限制单用户并发、容量压测，必要时迁移到带 fencing token 的独立锁 |
 | 通用任务平台尚无优先级/死信面板 | 文档摄取和摘要已共享 Worker，但 Memory/Office 仍保留专用状态机 | 统一运维视图、优先级、死信告警与任务取消协议              |
 | 迁移方式偏内嵌            | Schema 演进与回滚能力有限   | golang-migrate/Atlas，版本化 SQL 和回滚策略    |
 | RunEvent 无归档策略     | 长期数据量持续增长          | 分区、TTL、冷热分层和聚合表                       |
@@ -745,7 +745,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 1. 基于现有 64 题真实 Embedding 结果分析失败 Case，调整混合检索；
 2. 为已经接通的 OTel/Prometheus 增加 Collector、Dashboard、SLO 与告警；
-3. 完成 JWT + principal + tenant_id 的最小多用户闭环；
+3. 在阿里云 staging 完成 GitHub 双账号、Pod 删除、RDS 恢复和 Secret 轮换闭环；
 4. 写一篇真实故障复盘：例如流式闪烁、模型误选工具或引用不忠实；
 5. 为 Memory 多实例同 Key 合并增加数据库唯一约束与冲突重试，并补后台任务积压告警。
 
@@ -817,7 +817,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 ### 2:45–3:00：取舍与下一步
 
-> 项目默认 Mock 加 SQLite，保证无 Key 可运行，同时提供 PostgreSQL、真实模型和真实 Embedding 路径。Memory Capture、文档摄取和摘要都已异步化；不足是缺少完整认证、跨实例会话锁、任务积压告警、生产 Collector 和真实 Microsoft 租户验收。下一步我会优先做检索失败归因和多用户闭环，而不是继续堆角色数量。
+> 项目默认 Mock 加 SQLite，保证无 Key 可运行，同时提供 PostgreSQL、真实模型和真实 Embedding 路径。Memory Capture、文档摄取和摘要都已异步化；上线准备阶段又补齐 GitHub OAuth、Redis Session/限流、tenant/principal 隔离和 PostgreSQL 跨副本会话锁。当前不足主要是云上双账号与 Pod 故障验收、PostgreSQL RLS、生产 Collector/告警送达和真实 Microsoft 租户验收。下一步我会优先完成 staging 故障复盘和检索失败归因，而不是继续堆角色数量。
 
 
 

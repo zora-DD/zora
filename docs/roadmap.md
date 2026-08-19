@@ -155,7 +155,22 @@
 
 验收条件：三类向量不能混表召回；HTTP 不等待真实 Embedding 摄取和摘要完成；重启后任务与日配额状态不丢；伪造代理 Header、非法 Origin、缺失 CSRF 和超额请求必须被明确拒绝；Secret 不得写入配置 JSON、日志或 API 响应。
 
-V0.11 后停止继续扩展非必要功能，进入部署、真实环境负向验证和故障复盘。未完成事项仅保留多用户认证/租户隔离、多副本全局限流、托管 Secret 自动轮换、独立消息/记忆召回评测，以及 Microsoft 365 外部资源验收。
+## V0.12 多用户、多副本上线准备 — 代码完成，云侧待验收
+
+- [x] GitHub OAuth authorization code + state + PKCE S256
+- [x] Redis 服务端 Session 与多副本 OAuth state 一次性消费
+- [x] GitHub 稳定数字 ID 映射 principal/tenant，PostgreSQL 业务查询隔离
+- [x] Redis Lua 分布式 IP 令牌桶与 PostgreSQL 持久化日配额
+- [x] PostgreSQL advisory conversation lock 与租约 Worker 多副本竞争
+- [x] 人工审批使用 PostgreSQL 终态轮询，支持决定请求跨 Pod 唤醒等待中的 Run
+- [x] PostgreSQL/Redis dependency readiness、PDB、HPA 与滚动更新模板
+- [x] `/metrics` Bearer Token、Prometheus 告警规则和 staging 负向脚本
+- [x] 阿里云 ACK/RDS/Tair/ALB/ACR 部署 Runbook 与 Secret 模板
+- [ ] 购买域名和阿里云资源，完成 HTTPS/GitHub Callback
+- [ ] 使用两个真实 GitHub 账号做租户隔离验收
+- [ ] 完成 RDS 恢复、Secret 轮换、Pod 删除、429/配额重置与告警送达演练
+
+V0.12 后停止继续扩展非必要功能，进入实际部署、真实环境负向验证和故障复盘。未完成事项仅保留云侧验收、托管 Secret/KMS 集成、组织共享租户/RBAC、独立消息/记忆召回评测，以及 Microsoft 365 外部资源验收。
 
 ## 后续技术待办
 

@@ -13,6 +13,7 @@ import (
 )
 
 func (p *Postgres) CreateMemory(ctx context.Context, item memory.Memory) error {
+	scope := requestScope(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("开始创建长期记忆事务失败：%w", err)
@@ -20,10 +21,10 @@ func (p *Postgres) CreateMemory(ctx context.Context, item memory.Memory) error {
 	defer tx.Rollback(ctx)
 	_, err = tx.Exec(ctx, `
 INSERT INTO memories(
-    id, kind, memory_key, content, importance, user_edited, source_type,
+    id, tenant_id, principal_id, kind, memory_key, content, importance, user_edited, source_type,
     source_conversation_id, source_message_id, created_at, updated_at, expires_at
-) VALUES($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), NULLIF($9, ''), $10, $11, $12)`,
-		item.ID, item.Kind, item.MemoryKey, item.Content, item.Importance, item.UserEdited, item.SourceType,
+) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), NULLIF($11, ''), $12, $13, $14)`,
+		item.ID, scope.TenantID, scope.ID, item.Kind, item.MemoryKey, item.Content, item.Importance, item.UserEdited, item.SourceType,
 		item.SourceConversationID, item.SourceMessageID,
 		normalizeTime(item.CreatedAt), normalizeTime(item.UpdatedAt), normalizeOptionalTime(item.ExpiresAt),
 	)
@@ -40,10 +41,11 @@ INSERT INTO memories(
 }
 
 func (p *Postgres) GetMemory(ctx context.Context, id string) (memory.Memory, error) {
+	scope := requestScope(ctx)
 	item, err := scanMemory(p.pool.QueryRow(ctx, `
 SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
        source_message_id, created_at, updated_at, expires_at
-FROM memories WHERE id = $1`, id))
+FROM memories WHERE id = $1 AND tenant_id = $2 AND principal_id = $3`, id, scope.TenantID, scope.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return memory.Memory{}, memory.ErrNotFound
 	}
@@ -54,11 +56,12 @@ FROM memories WHERE id = $1`, id))
 }
 
 func (p *Postgres) GetMemoryByKey(ctx context.Context, kind, memoryKey string) (memory.Memory, error) {
+	scope := requestScope(ctx)
 	item, err := scanMemory(p.pool.QueryRow(ctx, `
 SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
        source_message_id, created_at, updated_at, expires_at
-FROM memories WHERE kind = $1 AND memory_key = $2
-ORDER BY updated_at DESC LIMIT 1`, kind, memoryKey))
+FROM memories WHERE kind = $1 AND memory_key = $2 AND tenant_id = $3 AND principal_id = $4
+ORDER BY updated_at DESC LIMIT 1`, kind, memoryKey, scope.TenantID, scope.ID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return memory.Memory{}, memory.ErrNotFound
 	}
@@ -69,14 +72,16 @@ ORDER BY updated_at DESC LIMIT 1`, kind, memoryKey))
 }
 
 func (p *Postgres) ListMemories(ctx context.Context, filter memory.ListFilter) ([]memory.Memory, error) {
+	scope := requestScope(ctx)
 	rows, err := p.pool.Query(ctx, `
 SELECT id, kind, memory_key, content, importance, user_edited, source_type, source_conversation_id,
        source_message_id, created_at, updated_at, expires_at
 FROM memories
-WHERE ($1 = '' OR kind = $1)
-  AND ($2 OR expires_at IS NULL OR expires_at > NOW())
+WHERE tenant_id = $1 AND principal_id = $2
+  AND ($3 = '' OR kind = $3)
+  AND ($4 OR expires_at IS NULL OR expires_at > NOW())
 ORDER BY importance DESC, updated_at DESC
-LIMIT $3`, filter.Kind, filter.IncludeExpired, filter.Limit)
+LIMIT $5`, scope.TenantID, scope.ID, filter.Kind, filter.IncludeExpired, filter.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("查询长期记忆列表失败：%w", err)
 	}
@@ -97,6 +102,7 @@ LIMIT $3`, filter.Kind, filter.IncludeExpired, filter.Limit)
 }
 
 func (p *Postgres) UpdateMemory(ctx context.Context, item memory.Memory) error {
+	scope := requestScope(ctx)
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("开始更新长期记忆事务失败：%w", err)
@@ -107,9 +113,9 @@ UPDATE memories
 SET kind = $1, memory_key = $2, content = $3, importance = $4, user_edited = $5,
     source_type = $6, source_conversation_id = NULLIF($7, ''), source_message_id = NULLIF($8, ''),
     updated_at = $9, expires_at = $10
-WHERE id = $11`, item.Kind, item.MemoryKey, item.Content, item.Importance, item.UserEdited,
+WHERE id = $11 AND tenant_id = $12 AND principal_id = $13`, item.Kind, item.MemoryKey, item.Content, item.Importance, item.UserEdited,
 		item.SourceType, item.SourceConversationID, item.SourceMessageID,
-		normalizeTime(item.UpdatedAt), normalizeOptionalTime(item.ExpiresAt), item.ID)
+		normalizeTime(item.UpdatedAt), normalizeOptionalTime(item.ExpiresAt), item.ID, scope.TenantID, scope.ID)
 	if err != nil {
 		return fmt.Errorf("更新长期记忆失败：%w", err)
 	}
@@ -148,7 +154,8 @@ ON CONFLICT(memory_id) DO UPDATE SET
 }
 
 func (p *Postgres) DeleteMemory(ctx context.Context, id string) error {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM memories WHERE id = $1`, id)
+	scope := requestScope(ctx)
+	tag, err := p.pool.Exec(ctx, `DELETE FROM memories WHERE id = $1 AND tenant_id = $2 AND principal_id = $3`, id, scope.TenantID, scope.ID)
 	if err != nil {
 		return fmt.Errorf("删除长期记忆失败：%w", err)
 	}
