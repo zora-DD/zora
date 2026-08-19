@@ -200,6 +200,36 @@ CREATE TABLE IF NOT EXISTS memory_capture_jobs (
 CREATE INDEX IF NOT EXISTS idx_memory_capture_jobs_status_available
     ON memory_capture_jobs(status, available_at, created_at);
 
+-- 三类向量实体使用物理隔离表；模型、维度和版本共同定义可查询的索引空间。
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    embedding_model TEXT NOT NULL,
+    embedding_dimensions INTEGER NOT NULL,
+    index_version INTEGER NOT NULL CHECK (index_version > 0),
+    embedding vector(%d) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_scope
+    ON message_embeddings(embedding_model, embedding_dimensions, index_version, role, conversation_id);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_hnsw
+    ON message_embeddings USING hnsw (embedding vector_cosine_ops);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('semantic', 'episodic')),
+    embedding_model TEXT NOT NULL,
+    embedding_dimensions INTEGER NOT NULL,
+    index_version INTEGER NOT NULL CHECK (index_version > 0),
+    embedding vector(%d) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_scope
+    ON memory_embeddings(embedding_model, embedding_dimensions, index_version, kind);
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_hnsw
+    ON memory_embeddings USING hnsw (embedding vector_cosine_ops);
+
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
     version_group_id TEXT NOT NULL,
@@ -264,4 +294,5 @@ INSERT INTO zora_schema_versions(version) VALUES (7) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (8) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (9) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (10) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (11) ON CONFLICT DO NOTHING;
 `

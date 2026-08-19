@@ -20,6 +20,17 @@ type captureRunnerStub struct {
 	failuresLeft atomic.Int32
 }
 
+type messageIndexerStub struct {
+	calls    atomic.Int32
+	messages atomic.Int32
+}
+
+func (s *messageIndexerStub) IndexMessages(_ context.Context, messages []domain.Message) error {
+	s.calls.Add(1)
+	s.messages.Add(int32(len(messages)))
+	return nil
+}
+
 func (r *captureRunnerStub) Capture(_ context.Context, _ memory.CaptureInput) (memory.CaptureResult, error) {
 	r.calls.Add(1)
 	if r.failuresLeft.Add(-1) >= 0 {
@@ -69,12 +80,14 @@ func TestCaptureWorkerRetriesAndCompletesDurableJob(t *testing.T) {
 	}
 	runner := &captureRunnerStub{}
 	runner.failuresLeft.Store(1)
+	indexer := &messageIndexerStub{}
 	observed := make(chan memory.CaptureJob, 4)
 	worker, err := memory.NewCaptureWorker(queue, runner, slog.New(slog.NewTextHandler(io.Discard, nil)), memory.CaptureWorkerOptions{
-		PollInterval:  5 * time.Millisecond,
-		TaskTimeout:   time.Second,
-		LeaseDuration: 2 * time.Second,
-		RetryBase:     10 * time.Millisecond,
+		PollInterval:   5 * time.Millisecond,
+		TaskTimeout:    time.Second,
+		LeaseDuration:  2 * time.Second,
+		RetryBase:      10 * time.Millisecond,
+		MessageIndexer: indexer,
 		Observer: func(_ context.Context, job memory.CaptureJob, _ *memory.CaptureResult, _ error) {
 			observed <- job
 		},
@@ -101,11 +114,14 @@ func TestCaptureWorkerRetriesAndCompletesDurableJob(t *testing.T) {
 				continue
 			}
 			stored, err := queue.Get(ctx, job.ID)
-			if err != nil || stored.Attempt != 2 || stored.Result == nil || stored.Result.Created != 1 {
+			if err != nil || stored.Attempt != 2 || stored.Result == nil || stored.Result.Created != 1 || stored.Result.MessagesIndexed != 2 {
 				t.Fatalf("stored job = %+v, %v", stored, err)
 			}
 			if runner.calls.Load() != 2 {
 				t.Fatalf("capture calls = %d, want 2", runner.calls.Load())
+			}
+			if indexer.calls.Load() != 2 || indexer.messages.Load() != 4 {
+				t.Fatalf("message index calls=%d messages=%d", indexer.calls.Load(), indexer.messages.Load())
 			}
 			return
 		case <-deadline:

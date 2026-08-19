@@ -99,9 +99,9 @@ flowchart TD
 
 #### 面试简答
 
-当前项目只有知识库文档分块会持久化向量，普通对话消息和长期记忆目前都不保存向量。因此系统不是通过一个 `vector_type` 字段区分两种向量，而是通过数据模型和表边界直接隔离：文档向量在 `knowledge_chunks`，消息在 `messages`，长期记忆在 `memories`。
+现在有三套物理隔离的索引：知识库分块在 `knowledge_chunks`，普通消息在 `message_embeddings`，长期记忆在 `memory_embeddings`。原始业务表 `messages` 和 `memories` 仍是真实数据源，向量表只是可以重建的派生索引。三套索引都显式记录 Embedding 模型、维度；消息和记忆还记录 `index_version`，因此不会把生命周期和召回目标不同的数据混在一个无类型集合里。
 
-写向量发生在新文档摄取时；读取文档向量发生在 Agent 调用 `knowledge_search` 或 REST 搜索接口时。检索问题也会临时生成 Query Embedding，但只用于当前请求的相似度计算，不写入数据库。纯关键词检索甚至不会调用 Embedding API。
+文档向量在摄取时写入；每轮对话成功后，持久化 Capture Worker 批量写入用户与助手消息向量；长期记忆在手工创建、修改或自动合并时与业务记录同事务写入向量。读取时，RAG 查询文档索引，跨会话历史只查询其他会话的用户消息，Memory 则用“词项或向量相关性 + 重要性 + 时效性”召回。查询向量只在当前请求中使用，不落库。
 
 #### 向量写入时机
 
@@ -111,15 +111,16 @@ flowchart TD
 | 上传内容完全相同的文档 | 否 | 命中 `content_hash` 去重，直接返回已有文档 |
 | 上传同名但内容不同的文档 | 是 | 创建新版本，新 Chunk 使用当前 Embedding 重新生成 |
 | 服务启动 | 否 | 当前不会在启动时自动重建全部索引 |
-| 普通用户/助手消息落库 | 否 | 只写 `messages`，没有 embedding 列 |
-| 自动提取或手工维护长期记忆 | 否 | 当前只写结构化 `memories` 文本和元数据 |
+| 普通用户/助手消息落库 | 异步写 | 回答与 Capture Job 原子提交，Worker 批量更新 `message_embeddings` |
+| 自动提取或手工维护长期记忆 | 是 | `memories` 与 `memory_embeddings` 同事务创建或更新 |
 | RAG 离线评测 | 是，但仅写临时库 | 每次在隔离临时数据库中重新摄取固定语料，评测结束后删除 |
+| 历史数据重建 | 是 | `POST /api/semantic/reindex` 从原始消息和记忆幂等重建派生索引 |
 
 更换 Embedding 模型或维度后，旧向量不能与新向量直接比较。文档记录 `embedding_model` 和 `embedding_dimensions`，Chunk 记录 `embedding_model`，并由实际向量长度或 PostgreSQL `vector(n)` 列约束维度。发现不一致时系统返回 `ErrEmbeddingMismatch`，要求重建或重新上传，而不是静默混用两个向量空间。
 
 #### 向量读取时机
 
-读取入口有两个：
+文档向量读取入口有两个：
 
 1. 用户直接调用 `POST /api/knowledge/search`；
 2. Agent 判断问题涉及上传文档，调用 `knowledge_search` 工具。
@@ -144,20 +145,20 @@ flowchart LR
 - **SQLite**：读取通过 ACL 和 `is_latest` 过滤后的 Chunk 及其向量，在 Go 内计算余弦相似度。
 - **PostgreSQL**：把 Query Embedding 作为 SQL 参数传给 pgvector，数据库利用 HNSW 返回向量候选；关键词候选由 FTS/GIN 返回，再由 Service 使用 RRF 融合。
 
+消息和记忆读取发生在 Chat 调用模型之前：消息检索排除当前会话并只回灌用户原话，避免把旧助手回答当成新事实；记忆检索用向量补充原有词项相关性。两类正文都编码为“不可信背景数据”的独立 System Message，RunEvent 只记录 ID 和分数，不复制正文。
+
 #### 文档、对话和记忆的数据边界
 
 | 数据 | 表 | 当前是否包含向量 | 用途 |
 |---|---|---:|---|
 | 知识库文档元数据 | `knowledge_documents` | 否，只记录模型名和维度 | 版本、ACL、去重和索引兼容性 |
 | 文档分块 | `knowledge_chunks` | 是 | RAG 向量/关键词召回与引用 |
-| 普通对话 | `messages` | 否 | 短期对话历史和上下文 |
+| 普通对话 | `messages` + `message_embeddings` | 是，派生表独立存储 | 当前会话原文、跨会话用户历史语义召回 |
 | 会话摘要 | `conversation_summaries` | 否 | 长上下文压缩 |
-| 长期记忆 | `memories` | 否 | 当前使用词项相关性、重要性和时效性召回 |
+| 长期记忆 | `memories` + `memory_embeddings` | 是，派生表独立存储 | 词项/向量、重要性和时效性联合召回 |
 | 查询向量 | 不落表 | 临时变量 | 当前一次 Vector/Hybrid 检索 |
 
-所以，这个问题的准确答案是：**当前有明确的数据隔离，但不存在“文档向量与对话向量如何区分”的运行时问题，因为对话向量尚未持久化。**
-
-如果后续把长期记忆也升级成向量召回，不建议把它直接混入 `knowledge_chunks`。更合理的做法是增加独立的 `memory_embeddings` 表或统一向量表中的强制命名空间字段，例如 `tenant_id + corpus_type + owner_id + source_id`，并在检索入口、生命周期、权限和评测上分别治理。文档知识和用户记忆的更新频率、权限、过期规则与召回目标不同，物理混存会增加误召回和越权风险。
+因此区分不是靠调用方临时传一个容易漏掉的 `vector_type`，而是靠**不同表、外键、Store 方法和检索入口**共同保证。切换模型、维度或索引版本时，查询只命中完全匹配的向量空间；历史数据可从原始实体重建。
 
 #### 关键代码位置
 
@@ -167,5 +168,8 @@ flowchart LR
 | [`internal/knowledge/tool.go`](../internal/knowledge/tool.go) | 将默认 Hybrid 检索注册成 `knowledge_search` Agent 工具 |
 | [`internal/store/sqlite/sqlite.go`](../internal/store/sqlite/sqlite.go) 的 `ListChunks` | 读取可见最新版 Chunk，在应用层精确扫描 |
 | [`internal/store/postgres/knowledge.go`](../internal/store/postgres/knowledge.go) 的 `SearchCandidates` | pgvector 和 FTS 候选召回 |
-| [`internal/store/sqlite/sqlite.go`](../internal/store/sqlite/sqlite.go) 的 Schema | 对比 `messages`、`memories` 与 `knowledge_chunks` 的数据边界 |
-| [`internal/memory/retriever.go`](../internal/memory/retriever.go) | 当前长期记忆的非向量召回实现 |
+| [`internal/semantic/service.go`](../internal/semantic/service.go) | 消息/记忆向量化、语义查询与历史重建 |
+| [`internal/store/sqlite/semantic.go`](../internal/store/sqlite/semantic.go) | SQLite 两套索引的精确扫描实现 |
+| [`internal/store/postgres/semantic.go`](../internal/store/postgres/semantic.go) | PostgreSQL 两套 pgvector 查询实现 |
+| [`internal/memory/retriever.go`](../internal/memory/retriever.go) | 词项/向量相关性、重要性和时效性联合召回 |
+| [`internal/memory/capture_worker.go`](../internal/memory/capture_worker.go) | 回答后批量写入消息向量 |

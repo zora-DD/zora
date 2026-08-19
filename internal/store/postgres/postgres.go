@@ -14,6 +14,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -35,6 +36,7 @@ var (
 	_ knowledge.CandidateStore = (*Postgres)(nil)
 	_ memory.Store             = (*Postgres)(nil)
 	_ memory.CaptureJobStore   = (*Postgres)(nil)
+	_ semantic.Store           = (*Postgres)(nil)
 	_ office.Store             = (*Postgres)(nil)
 	_ summary.Store            = (*Postgres)(nil)
 )
@@ -103,22 +105,23 @@ func (p *Postgres) migrate(ctx context.Context) error {
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(908276451)`); err != nil {
 		return fmt.Errorf("获取 PostgreSQL 迁移锁失败：%w", err)
 	}
-	schema := fmt.Sprintf(postgresSchema, p.embeddingDimensions)
+	schema := fmt.Sprintf(postgresSchema, p.embeddingDimensions, p.embeddingDimensions, p.embeddingDimensions)
 	if _, err := tx.Exec(ctx, schema); err != nil {
 		return fmt.Errorf("执行 PostgreSQL 表结构迁移失败：%w", err)
 	}
 	var vectorType string
-	if err := tx.QueryRow(ctx, `
+	expected := fmt.Sprintf("vector(%d)", p.embeddingDimensions)
+	for _, table := range []string{"knowledge_chunks", "message_embeddings", "memory_embeddings"} {
+		if err := tx.QueryRow(ctx, `
 SELECT format_type(attribute.atttypid, attribute.atttypmod)
 FROM pg_attribute attribute
 JOIN pg_class relation ON relation.oid = attribute.attrelid
-WHERE relation.relname = 'knowledge_chunks' AND attribute.attname = 'embedding'
-`).Scan(&vectorType); err != nil {
-		return fmt.Errorf("检查 PostgreSQL 向量维度失败：%w", err)
-	}
-	expected := fmt.Sprintf("vector(%d)", p.embeddingDimensions)
-	if vectorType != expected {
-		return fmt.Errorf("PostgreSQL 现有向量列类型为 %s，但当前配置需要 %s；请迁移或重建知识库索引", vectorType, expected)
+		WHERE relation.relname = $1 AND attribute.attname = 'embedding'`, table).Scan(&vectorType); err != nil {
+			return fmt.Errorf("检查 PostgreSQL %s 向量维度失败：%w", table, err)
+		}
+		if vectorType != expected {
+			return fmt.Errorf("PostgreSQL %s 现有向量列类型为 %s，但当前配置需要 %s；请迁移或重建对应索引", table, vectorType, expected)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("提交 PostgreSQL 迁移事务失败：%w", err)

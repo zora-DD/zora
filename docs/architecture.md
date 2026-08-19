@@ -175,18 +175,18 @@ GET /api/conversations/{conversationID}/summary
 
 SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_edited、source、created/updated/expires_at。默认查询排除过期项；Web 管理面板显式展示全部记录，确保用户仍能清理已过期记忆。
 
-长期记忆当前按两条失败隔离链路运行，而不是把所有聊天记录向量化：
+长期记忆与消息向量使用不同物理表，并按两条失败隔离链路运行：
 
 ```text
 对话结束 → 消息 + Job 原子入队 → Worker 租约领取 → 候选提取 → 校验 → Key 合并 → 持久化
-新请求   → 最低主题相关性 → 相关性 65% + 重要性 20% + 时效性 15% → Top-K → 安全 System 上下文
+新请求   → 词项/向量相关性 → 相关性 65% + 重要性 20% + 时效性 15% → Top-K → 安全 System 上下文
 ```
 
 自动提取的 Memory 关联来源用户消息，并按 Kind + Memory Key 跳过重复或更新冲突；用户手动修正会阻止后续自动覆盖。召回默认排除过期/无关记忆，正文按不可信 JSON 数据注入，最多 6,000 字符；RunEvent 只记录 ID 和可解释分数。
 
 长对话按当前会话实际未摘要消息数量触发，保留最近窗口，把较早消息增量写入 `conversation_summaries`。摘要读取/生成失败只记录审计并继续回答。
 
-`make eval-memory` 在隔离数据库中让每个问题分别走关闭/开启召回的完整 Chat 链路，并从 RunEvent 核验实际注入 ID。默认基线覆盖三个正向问题和两个负例，门禁预期召回、错误召回、事实覆盖增益和答案污染；当前全部通过。后续先扩充真实模型样本，再用同一门禁决定是否增加 Memory 向量检索。
+消息、长期记忆和知识库分别写入 `message_embeddings`、`memory_embeddings` 与 `knowledge_chunks`。前两者额外保存索引版本；模型或维度不匹配的记录不会参与查询。跨会话消息召回排除当前会话且只注入用户原话，助手消息虽然建索引但默认不回灌模型。`POST /api/semantic/reindex` 可从原始业务表幂等重建派生索引。
 
 ## 8. V0.4 多 Agent 架构
 

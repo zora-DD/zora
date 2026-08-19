@@ -71,14 +71,17 @@ type Config struct {
 	MultiAgentApprovalMode      string         // off、risky 或 all；控制人工审批触发范围。
 	MultiAgentApprovalTimeout   time.Duration  // 等待人工审批的最长时间。
 
-	EmbeddingProvider    string // hash 用于本地开发，openai 用于真实语义向量。
-	EmbeddingModel       string // Embedding 模型名，如 text-embedding-v4。
-	EmbeddingAPIKey      string // 可单独配置；未配置时复用 ZORA_API_KEY。
-	EmbeddingBaseURL     string // OpenAI-compatible Embedding API 的 v1 根地址。
-	EmbeddingDimensions  int    // 入库与查询必须使用相同的向量维度。
-	KnowledgeChunkSize   int    // 按 Unicode 字符计算的分块上限。
-	KnowledgeOverlap     int    // 相邻分块的重叠字符数，避免语义在边界断开。
-	KnowledgePrincipalID string // 当前部署经过认证的知识库主体；单用户模式使用固定值。
+	EmbeddingProvider     string  // hash 用于本地开发，openai 用于真实语义向量。
+	EmbeddingModel        string  // Embedding 模型名，如 text-embedding-v4。
+	EmbeddingAPIKey       string  // 可单独配置；未配置时复用 ZORA_API_KEY。
+	EmbeddingBaseURL      string  // OpenAI-compatible Embedding API 的 v1 根地址。
+	EmbeddingDimensions   int     // 入库与查询必须使用相同的向量维度。
+	KnowledgeChunkSize    int     // 按 Unicode 字符计算的分块上限。
+	KnowledgeOverlap      int     // 相邻分块的重叠字符数，避免语义在边界断开。
+	KnowledgePrincipalID  string  // 当前部署经过认证的知识库主体；单用户模式使用固定值。
+	MessageRecallEnabled  bool    // 是否召回其他会话中的相关用户原话。
+	MessageRecallLimit    int     // 单轮最多注入的历史消息数量。
+	MessageRecallMinScore float64 // 消息向量相似度门槛。
 
 	MemoryAutoCapture         bool          // 是否在回答完成后自动提取长期记忆候选。
 	MemoryMaxCandidates       int           // 单轮最多接纳的候选数，限制额外成本和错误放大。
@@ -180,6 +183,18 @@ func Load() (Config, error) {
 	postgresMaxConns, err := positiveInt("ZORA_POSTGRES_MAX_CONNS", "10")
 	if err != nil || postgresMaxConns > 100 {
 		return Config{}, fmt.Errorf("ZORA_POSTGRES_MAX_CONNS 必须在 1 到 100 之间")
+	}
+	messageRecallEnabled, err := strconv.ParseBool(env("ZORA_MESSAGE_RECALL_ENABLED", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_MESSAGE_RECALL_ENABLED 必须是 true 或 false")
+	}
+	messageRecallLimit, err := positiveInt("ZORA_MESSAGE_RECALL_LIMIT", "3")
+	if err != nil || messageRecallLimit > 20 {
+		return Config{}, fmt.Errorf("ZORA_MESSAGE_RECALL_LIMIT 必须在 1 到 20 之间")
+	}
+	messageRecallMinScore, err := strconv.ParseFloat(env("ZORA_MESSAGE_RECALL_MIN_SCORE", "0.55"), 64)
+	if err != nil || math.IsNaN(messageRecallMinScore) || math.IsInf(messageRecallMinScore, 0) || messageRecallMinScore < 0 || messageRecallMinScore > 1 {
+		return Config{}, fmt.Errorf("ZORA_MESSAGE_RECALL_MIN_SCORE 必须在 0 到 1 之间")
 	}
 	memoryAutoCapture, err := strconv.ParseBool(env("ZORA_MEMORY_AUTO_CAPTURE", "true"))
 	if err != nil {
@@ -308,14 +323,17 @@ func Load() (Config, error) {
 		MultiAgentApprovalMode:      multiAgentApprovalMode,
 		MultiAgentApprovalTimeout:   multiAgentApprovalTimeout,
 
-		EmbeddingProvider:    embeddingProvider,
-		EmbeddingModel:       env("ZORA_EMBEDDING_MODEL", "text-embedding-v4"),
-		EmbeddingAPIKey:      strings.TrimSpace(os.Getenv("ZORA_EMBEDDING_API_KEY")),
-		EmbeddingBaseURL:     strings.TrimRight(strings.TrimSpace(os.Getenv("ZORA_EMBEDDING_BASE_URL")), "/"),
-		EmbeddingDimensions:  embeddingDimensions,
-		KnowledgeChunkSize:   chunkSize,
-		KnowledgeOverlap:     chunkOverlap,
-		KnowledgePrincipalID: env("ZORA_KNOWLEDGE_PRINCIPAL_ID", "local-user"),
+		EmbeddingProvider:     embeddingProvider,
+		EmbeddingModel:        env("ZORA_EMBEDDING_MODEL", "text-embedding-v4"),
+		EmbeddingAPIKey:       strings.TrimSpace(os.Getenv("ZORA_EMBEDDING_API_KEY")),
+		EmbeddingBaseURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("ZORA_EMBEDDING_BASE_URL")), "/"),
+		EmbeddingDimensions:   embeddingDimensions,
+		KnowledgeChunkSize:    chunkSize,
+		KnowledgeOverlap:      chunkOverlap,
+		KnowledgePrincipalID:  env("ZORA_KNOWLEDGE_PRINCIPAL_ID", "local-user"),
+		MessageRecallEnabled:  messageRecallEnabled,
+		MessageRecallLimit:    messageRecallLimit,
+		MessageRecallMinScore: messageRecallMinScore,
 
 		MemoryAutoCapture:         memoryAutoCapture,
 		MemoryMaxCandidates:       memoryMaxCandidates,

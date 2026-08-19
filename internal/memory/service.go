@@ -27,6 +27,17 @@ type Service struct {
 	captureMu      sync.Mutex
 	recallLimit    int
 	recallMinScore float64
+	vectorIndex    VectorIndex
+}
+
+func WithVectorIndex(index VectorIndex) Option {
+	return func(service *Service) error {
+		if index == nil {
+			return fmt.Errorf("长期记忆向量索引不能为空")
+		}
+		service.vectorIndex = index
+		return nil
+	}
 }
 
 type Option func(*Service) error
@@ -85,6 +96,10 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Memory, error)
 	if err := validateEditable(item, now, true); err != nil {
 		return Memory{}, err
 	}
+	var err error
+	if item, err = s.vectorizeOne(ctx, item); err != nil {
+		return Memory{}, err
+	}
 	if err := s.store.CreateMemory(ctx, item); err != nil {
 		return Memory{}, err
 	}
@@ -126,6 +141,9 @@ func (s *Service) Replace(ctx context.Context, memoryID string, input ReplaceInp
 	if err := validateEditable(current, current.UpdatedAt, false); err != nil {
 		return Memory{}, err
 	}
+	if current, err = s.vectorizeOne(ctx, current); err != nil {
+		return Memory{}, err
+	}
 	if err := s.store.UpdateMemory(ctx, current); err != nil {
 		return Memory{}, err
 	}
@@ -156,6 +174,12 @@ func (s *Service) Capture(ctx context.Context, input CaptureInput) (CaptureResul
 	s.captureMu.Lock()
 	defer s.captureMu.Unlock()
 	now := s.now()
+	type change struct {
+		item   Memory
+		create bool
+	}
+	changes := make([]change, 0, len(candidates))
+	pendingBySlot := make(map[string]int, len(candidates))
 	for _, candidate := range candidates {
 		candidate.Kind = strings.TrimSpace(candidate.Kind)
 		candidate.MemoryKey = normalizeMemoryKey(candidate.MemoryKey)
@@ -163,6 +187,23 @@ func (s *Service) Capture(ctx context.Context, input CaptureInput) (CaptureResul
 		candidate.ExpiresAt = normalizeOptionalTime(candidate.ExpiresAt)
 		if err := validateCandidate(candidate, now); err != nil {
 			result.Skipped++
+			continue
+		}
+		slot := candidate.Kind + "\x00" + candidate.MemoryKey
+		if changeIndex, exists := pendingBySlot[slot]; exists {
+			// 同一轮模型可能重复输出同一事实槽位；先在内存中合并，避免创建重复记录。
+			current := changes[changeIndex].item
+			if current.Content == candidate.Content && current.Importance >= candidate.Importance && sameOptionalTime(current.ExpiresAt, candidate.ExpiresAt) {
+				result.Skipped++
+				continue
+			}
+			current.Content = candidate.Content
+			current.Importance = max(current.Importance, candidate.Importance)
+			current.SourceConversationID = input.ConversationID
+			current.SourceMessageID = input.UserMessageID
+			current.UpdatedAt = now
+			current.ExpiresAt = candidate.ExpiresAt
+			changes[changeIndex].item = current
 			continue
 		}
 		current, lookupErr := s.store.GetMemoryByKey(ctx, candidate.Kind, candidate.MemoryKey)
@@ -182,10 +223,8 @@ func (s *Service) Capture(ctx context.Context, input CaptureInput) (CaptureResul
 			current.SourceMessageID = input.UserMessageID
 			current.UpdatedAt = now
 			current.ExpiresAt = candidate.ExpiresAt
-			if err := s.store.UpdateMemory(ctx, current); err != nil {
-				return result, fmt.Errorf("合并长期记忆失败：%w", err)
-			}
-			result.Updated++
+			pendingBySlot[slot] = len(changes)
+			changes = append(changes, change{item: current})
 			continue
 		}
 		if !errors.Is(lookupErr, ErrNotFound) {
@@ -198,12 +237,51 @@ func (s *Service) Capture(ctx context.Context, input CaptureInput) (CaptureResul
 			SourceConversationID: input.ConversationID, SourceMessageID: input.UserMessageID,
 			CreatedAt: now, UpdatedAt: now, ExpiresAt: candidate.ExpiresAt,
 		}
-		if err := s.store.CreateMemory(ctx, item); err != nil {
-			return result, fmt.Errorf("保存自动长期记忆失败：%w", err)
+		pendingBySlot[slot] = len(changes)
+		changes = append(changes, change{item: item, create: true})
+	}
+	if len(changes) == 0 {
+		return result, nil
+	}
+	items := make([]Memory, len(changes))
+	for index := range changes {
+		items[index] = changes[index].item
+	}
+	if s.vectorIndex != nil {
+		var err error
+		items, err = s.vectorIndex.VectorizeMemories(ctx, items)
+		if err != nil {
+			return result, err
 		}
-		result.Created++
+	}
+	for index, planned := range changes {
+		if planned.create {
+			if err := s.store.CreateMemory(ctx, items[index]); err != nil {
+				return result, fmt.Errorf("保存自动长期记忆失败：%w", err)
+			}
+			result.Created++
+			continue
+		}
+		if err := s.store.UpdateMemory(ctx, items[index]); err != nil {
+			return result, fmt.Errorf("合并长期记忆失败：%w", err)
+		}
+		result.Updated++
 	}
 	return result, nil
+}
+
+func (s *Service) vectorizeOne(ctx context.Context, item Memory) (Memory, error) {
+	if s.vectorIndex == nil {
+		return item, nil
+	}
+	items, err := s.vectorIndex.VectorizeMemories(ctx, []Memory{item})
+	if err != nil {
+		return Memory{}, err
+	}
+	if len(items) != 1 {
+		return Memory{}, fmt.Errorf("长期记忆向量索引返回数量不匹配")
+	}
+	return items[0], nil
 }
 
 func (s *Service) Delete(ctx context.Context, id string) error {

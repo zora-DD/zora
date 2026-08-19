@@ -37,12 +37,22 @@ func (s *Service) Recall(ctx context.Context, query string) ([]RecallResult, err
 	if len(queryTerms) == 0 {
 		return []RecallResult{}, nil
 	}
+	vectorScores := make(map[string]float64)
+	if s.vectorIndex != nil {
+		// 向量索引是增强通道；失败时保留词项基线，避免外部 Embedding 抖动阻断正常对话。
+		if vectorResults, vectorErr := s.vectorIndex.SearchMemoryVectors(ctx, query, max(s.recallLimit*4, 20)); vectorErr == nil {
+			for _, item := range vectorResults {
+				vectorScores[item.MemoryID] = max(0, min(1, item.Score))
+			}
+		}
+	}
 	memoryIntent := containsAnyText(strings.ToLower(query), "记得", "记住", "偏好", "我的信息", "了解我", "关于我")
 	now := s.now()
 	results := make([]RecallResult, 0, min(len(items), s.recallLimit))
 	for _, item := range items {
 		contentTerms := recallTerms(item.Content + " " + item.MemoryKey)
-		relevance := cosineTermOverlap(queryTerms, contentTerms)
+		lexicalRelevance := cosineTermOverlap(queryTerms, contentTerms)
+		relevance := max(lexicalRelevance, vectorScores[item.ID])
 		if relevance == 0 && memoryIntent {
 			// 用户显式询问自身信息时允许浏览高价值记忆，但仍保持很低的相关性先验。
 			relevance = 0.08

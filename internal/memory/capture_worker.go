@@ -25,6 +25,10 @@ type CaptureJobInstrumentation interface {
 	BeginMemoryCaptureJob(ctx context.Context, job CaptureJob) (context.Context, func(status string, err error))
 }
 
+type MessageIndexer interface {
+	IndexMessages(ctx context.Context, messages []domain.Message) error
+}
+
 // CaptureJobObserver 把 Worker 终态回写到原 Agent Run 的追加式审计日志。
 type CaptureJobObserver func(ctx context.Context, job CaptureJob, result *CaptureResult, jobErr error)
 
@@ -35,6 +39,7 @@ type CaptureWorkerOptions struct {
 	RetryBase       time.Duration
 	Observer        CaptureJobObserver
 	Instrumentation CaptureJobInstrumentation
+	MessageIndexer  MessageIndexer
 }
 
 // CaptureWorker 以数据库租约领取任务。单个进程串行执行以避免同一事实槽位并发合并；
@@ -201,10 +206,19 @@ func (w *CaptureWorker) capture(ctx context.Context, job CaptureJob) (CaptureRes
 		userMessage.Role != domain.RoleUser || assistantMessage.Role != domain.RoleAssistant {
 		return CaptureResult{}, fmt.Errorf("长期记忆任务关联的消息类型或会话不一致")
 	}
-	return w.runner.Capture(ctx, CaptureInput{
+	if w.options.MessageIndexer != nil {
+		if err := w.options.MessageIndexer.IndexMessages(ctx, []domain.Message{userMessage, assistantMessage}); err != nil {
+			return CaptureResult{}, fmt.Errorf("更新消息向量索引失败：%w", err)
+		}
+	}
+	result, err := w.runner.Capture(ctx, CaptureInput{
 		ConversationID: job.ConversationID, UserMessageID: userMessage.ID,
 		UserContent: userMessage.Content, AssistantContent: assistantMessage.Content,
 	})
+	if err == nil && w.options.MessageIndexer != nil {
+		result.MessagesIndexed = 2
+	}
+	return result, err
 }
 
 func (w *CaptureWorker) retryDelay(attempt int) time.Duration {

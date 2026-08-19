@@ -17,6 +17,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -200,6 +201,30 @@ CREATE TABLE IF NOT EXISTS memory_capture_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_capture_jobs_status_available
     ON memory_capture_jobs(status, available_at, created_at);
+-- 消息和长期记忆使用独立索引表，避免不同生命周期与召回策略互相污染。
+CREATE TABLE IF NOT EXISTS message_embeddings (
+    message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    embedding_model TEXT NOT NULL,
+    embedding_dimensions INTEGER NOT NULL,
+    index_version INTEGER NOT NULL CHECK (index_version > 0),
+    embedding TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_embeddings_scope
+    ON message_embeddings(embedding_model, embedding_dimensions, index_version, role, conversation_id);
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('semantic', 'episodic')),
+    embedding_model TEXT NOT NULL,
+    embedding_dimensions INTEGER NOT NULL,
+    index_version INTEGER NOT NULL CHECK (index_version > 0),
+    embedding TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_scope
+    ON memory_embeddings(embedding_model, embedding_dimensions, index_version, kind);
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
     version_group_id TEXT NOT NULL,
@@ -247,6 +272,7 @@ var (
 	_ knowledge.Store        = (*SQLite)(nil)
 	_ memory.Store           = (*SQLite)(nil)
 	_ memory.CaptureJobStore = (*SQLite)(nil)
+	_ semantic.Store         = (*SQLite)(nil)
 	_ office.Store           = (*SQLite)(nil)
 	_ summary.Store          = (*SQLite)(nil)
 )

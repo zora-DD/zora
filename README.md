@@ -4,7 +4,7 @@ Zora 是一个使用 Go 与 Eino 实现的可观察 Agent 工作台：支持流�
 
 这个项目的重点不是复刻一个聊天页面，而是实践 Agent 产品从“模型能回答”走向“系统可控制、可追踪、可评估、可扩展”的核心工程问题。
 
-> 当前版本：V0.8。Agent、RAG、Memory、Multi-Agent、MCP、运行审计、OTel/Prometheus 和长期记忆事务 Outbox Worker 已完成；Microsoft Graph 写执行器已实现但尚未使用真实 Microsoft 365 租户在线验收。
+> 当前版本：V0.9。除 Agent、RAG、Memory、Multi-Agent、MCP、运行审计和 OTel/Prometheus 外，消息、长期记忆与知识库已经具有物理隔离的向量索引；Microsoft Graph 写执行器已实现但尚未使用真实 Microsoft 365 租户在线验收。
 
 ## 为什么做 Zora
 
@@ -26,8 +26,8 @@ Zora 围绕这些问题实现了一套可以本地运行、阅读和继续扩展
 | Agent Core | Eino ReAct、流式输出、ToolCall、取消、超时、会话级并发控制 |
 | 多模型 | OpenAI-compatible Provider、Mock、环境变量注册多个模型、Web 按请求切换 |
 | 知识库 | TXT/Markdown/PDF 摄取、版本、ACL、分块、Embedding、向量与关键词混合检索、引用 |
-| 长期记忆 | Semantic/Episodic、自动提取、同 Key 合并、人工修正保护、相关性召回、过期时间、Outbox 异步捕获与失败重试 |
-| 上下文管理 | 会话增量摘要、最近消息窗口、记忆与摘要安全注入 |
+| 长期记忆 | Semantic/Episodic、自动提取、同 Key 合并、人工修正保护、词项/向量联合召回、过期时间、Outbox 异步捕获与失败重试 |
+| 上下文管理 | 跨会话消息语义召回、会话增量摘要、最近消息窗口、记忆/消息/摘要安全注入 |
 | 多 Agent | Supervisor、Research/Document/Writer、串并行交接、预算、超时、重试、父子 Run |
 | 人工审批 | 高影响意图识别、持久化审批、SSE 等待与恢复、拒绝和超时终态 |
 | MCP | 官方 Go SDK、stdio Server、工具白名单、只读声明校验、环境变量最小透传 |
@@ -53,6 +53,7 @@ flowchart LR
     Chat --> Outbox["Memory Capture Outbox"]
     Outbox --> Worker["Lease Worker"]
     Worker --> Memory["Memory Service"]
+    Worker --> Semantic["Message / Memory Semantic Index"]
     Chat --> Summary["Summary"]
     Chat --> Store["SQLite / PostgreSQL"]
     Memory --> Store
@@ -352,6 +353,7 @@ make build-mcp-connectors
 | 审批 | `/api/approvals`、`/api/approvals/{id}/decision` |
 | 知识库 | `/api/knowledge/documents`、`/api/knowledge/search` |
 | 长期记忆 | `/api/memories`、`/api/memories/recall` |
+| 语义索引 | `/api/semantic/messages/search`、`/api/semantic/reindex` |
 | 记忆捕获任务 | `/api/memory-capture/jobs`、`/api/memory-capture/jobs/{id}` |
 | 会话摘要 | `/api/conversations/{id}/summary` |
 | 办公草稿 | `/api/office/drafts`、`/api/office/drafts/{id}/decision` |
@@ -462,7 +464,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 - Hash Embedding 仅用于本地链路测试，不能代表生产语义检索；
 - SQLite 检索采用进程内精确扫描，不适合大规模知识库；
 - 文档摄取为同步流程，PDF 不包含 OCR；
-- 记忆召回仍以轻量词项相关性为主，未使用向量和重排模型；
+- 消息和长期记忆已使用独立向量索引，但尚未建立专门的离线召回数据集与重排模型；
 - 多 Agent 收益只在固定小样本中验证，真实业务必须重新评测；
 - Microsoft Graph 真实写链路等待测试租户验收；
 - OTel 当前直接导出到单个 OTLP Endpoint，尚未提供生产 Collector 管道、Grafana 仪表盘和告警规则；

@@ -15,9 +15,72 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
+
+func TestMessageAndMemoryUseIndependentVectorIndexes(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "semantic-indexes.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	for _, conversationID := range []string{"conv_semantic_a", "conv_semantic_b"} {
+		if err := database.CreateConversation(ctx, domain.Conversation{ID: conversationID, Title: conversationID, CreatedAt: now, UpdatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	message, err := database.AddMessage(ctx, domain.Message{ID: "msg_semantic", ConversationID: "conv_semantic_a", Role: domain.RoleUser, Content: "我主要使用 Go 开发后端", CreatedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	embedder, err := knowledge.NewHashEmbedder(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := semantic.NewService(database, embedder, semantic.Options{MessageRecallLimit: 3, MessageRecallMinScore: 0.1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.IndexMessages(ctx, []domain.Message{message}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := service.RecallMessages(ctx, "Go 后端", "conv_semantic_b")
+	if err != nil || len(hits) != 1 || hits[0].Message.ID != message.ID {
+		t.Fatalf("message hits = %+v, %v", hits, err)
+	}
+
+	items, err := service.VectorizeMemories(ctx, []memory.Memory{{
+		ID: "mem_semantic", Kind: memory.KindSemantic, MemoryKey: "profile:language",
+		Content: "用户主要使用 Go", Importance: 0.9, SourceType: memory.SourceManual,
+		CreatedAt: now, UpdatedAt: now,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateMemory(ctx, items[0]); err != nil {
+		t.Fatal(err)
+	}
+	memoryHits, err := service.SearchMemoryVectors(ctx, "Go", 3)
+	if err != nil || len(memoryHits) != 1 || memoryHits[0].MemoryID != "mem_semantic" {
+		t.Fatalf("memory hits = %+v, %v", memoryHits, err)
+	}
+
+	var messageIndexes, memoryIndexes int
+	if err := database.db.QueryRow(`SELECT COUNT(*) FROM message_embeddings`).Scan(&messageIndexes); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.db.QueryRow(`SELECT COUNT(*) FROM memory_embeddings`).Scan(&memoryIndexes); err != nil {
+		t.Fatal(err)
+	}
+	if messageIndexes != 1 || memoryIndexes != 1 {
+		t.Fatalf("message indexes=%d memory indexes=%d", messageIndexes, memoryIndexes)
+	}
+}
 
 func TestOpenMigratesKnowledgeVersionAndACLColumns(t *testing.T) {
 	t.Parallel()

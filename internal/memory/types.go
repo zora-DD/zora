@@ -43,6 +43,23 @@ type Memory struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	UpdatedAt            time.Time  `json:"updated_at"`
 	ExpiresAt            *time.Time `json:"expires_at,omitempty"`
+	// 以下字段属于可重建的派生索引，不作为业务数据返回给客户端。
+	EmbeddingModel      string    `json:"-"`
+	EmbeddingDimensions int       `json:"-"`
+	IndexVersion        int       `json:"-"`
+	Embedding           []float64 `json:"-"`
+}
+
+// VectorSearchResult 是 Memory 对语义索引依赖的最小返回契约。
+type VectorSearchResult struct {
+	MemoryID string
+	Score    float64
+}
+
+// VectorIndex 由 semantic.Service 实现。Memory 包只声明能力，避免反向依赖具体索引实现。
+type VectorIndex interface {
+	VectorizeMemories(ctx context.Context, items []Memory) ([]Memory, error)
+	SearchMemoryVectors(ctx context.Context, query string, limit int) ([]VectorSearchResult, error)
 }
 
 type ListFilter struct {
@@ -103,11 +120,12 @@ type CaptureInput struct {
 
 // CaptureResult 可直接进入 Run 审计和 SSE，避免把候选内容暴露到执行轨迹中。
 type CaptureResult struct {
-	Enabled    bool `json:"enabled"`
-	Candidates int  `json:"candidates"`
-	Created    int  `json:"created"`
-	Updated    int  `json:"updated"`
-	Skipped    int  `json:"skipped"`
+	Enabled         bool `json:"enabled"`
+	MessagesIndexed int  `json:"messages_indexed,omitempty"`
+	Candidates      int  `json:"candidates"`
+	Created         int  `json:"created"`
+	Updated         int  `json:"updated"`
+	Skipped         int  `json:"skipped"`
 }
 
 // CaptureJob 是一轮对话的长期记忆异步捕获任务。

@@ -241,6 +241,8 @@ RRF 不要求校准不同分数范围，简单稳定，适合作为 MVP 融合�
 - [`internal/memory/extractor.go`](../internal/memory/extractor.go)：规则/模型候选提取；
 - [`internal/memory/service.go`](../internal/memory/service.go)：Capture、同 Key 合并和人工编辑保护；
 - [`internal/memory/retriever.go`](../internal/memory/retriever.go)：召回评分；
+- [`internal/semantic/service.go`](../internal/semantic/service.go)：消息/Memory 独立向量空间和重建；
+- [`internal/store/postgres/semantic.go`](../internal/store/postgres/semantic.go)：两张独立 pgvector/HNSW 索引；
 - [`internal/chat/service.go`](../internal/chat/service.go)：回答前注入、成功后提取。
 
 ### 业务场景
@@ -249,15 +251,15 @@ RRF 不要求校准不同分数范围，简单稳定，适合作为 MVP 融合�
 
 ### 问题分析
 
-直接把全部聊天向量化会保存噪声和敏感信息；相同事实会产生重复或冲突；模型自动写入可能覆盖用户显式修改。
+直接把全部聊天和 Memory 混入一个集合会模糊数据含义、扩大噪声召回；相同事实还会产生重复或冲突，模型自动写入也可能覆盖用户显式修改。
 
 ### 技术实现
 
-Memory 具有 kind、稳定 `memory_key`、importance、source、expiry 和 `user_edited`。回答成功后才提取候选；同 Key 新值执行 Consolidation；人工修改项禁止自动覆盖。召回按主题相关性、重要性和时效性联合评分，并设置最低相关性门槛。注入 Prompt 时明确标记为数据，不能改变系统规则。
+Memory 具有 kind、稳定 `memory_key`、importance、source、expiry 和 `user_edited`。回答成功后才提取候选；同 Key 新值执行 Consolidation；人工修改项禁止自动覆盖。`memory_embeddings` 与 `message_embeddings` 物理隔离，Memory 的业务记录和向量同事务提交；召回取词项/向量相关性的较高值，再融合重要性和时效性。消息语义召回只注入其他会话的用户原话，Memory 与消息都以不可信 JSON 数据进入 Prompt。
 
 ### 为什么这样实现
 
-长期记忆是经过治理的用户事实，不是无限历史。独立模型让记忆可以解释、编辑、删除和过期，符合产品控制权和隐私要求。
+长期记忆是经过治理的用户事实，不是无限历史。独立业务模型与独立向量索引让它可以解释、编辑、删除、过期和重建，又不会与文档证据或原始消息混查。
 
 ## 10. 增量摘要与最近原文窗口
 

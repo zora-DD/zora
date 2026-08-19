@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -11,7 +12,12 @@ import (
 )
 
 func (s *SQLite) CreateMemory(ctx context.Context, item memory.Memory) error {
-	_, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始创建长期记忆事务失败：%w", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO memories(
     id, kind, memory_key, content, importance, user_edited, source_type,
     source_conversation_id, source_message_id, created_at, updated_at, expires_at
@@ -22,6 +28,12 @@ INSERT INTO memories(
 	)
 	if err != nil {
 		return fmt.Errorf("创建长期记忆失败：%w", err)
+	}
+	if err := upsertSQLiteMemoryEmbedding(ctx, tx, item); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交创建长期记忆事务失败：%w", err)
 	}
 	return nil
 }
@@ -84,7 +96,12 @@ LIMIT ?`, filter.Kind, filter.Kind, boolInt(filter.IncludeExpired), formatTimeNo
 }
 
 func (s *SQLite) UpdateMemory(ctx context.Context, item memory.Memory) error {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始更新长期记忆事务失败：%w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
 UPDATE memories
 SET kind = ?, memory_key = ?, content = ?, importance = ?, user_edited = ?,
     source_type = ?, source_conversation_id = NULLIF(?, ''), source_message_id = NULLIF(?, ''),
@@ -101,6 +118,38 @@ WHERE id = ?`, item.Kind, item.MemoryKey, item.Content, item.Importance, boolInt
 	}
 	if count == 0 {
 		return memory.ErrNotFound
+	}
+	if err := upsertSQLiteMemoryEmbedding(ctx, tx, item); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交更新长期记忆事务失败：%w", err)
+	}
+	return nil
+}
+
+func upsertSQLiteMemoryEmbedding(ctx context.Context, tx *sql.Tx, item memory.Memory) error {
+	if len(item.Embedding) == 0 {
+		return nil
+	}
+	if item.EmbeddingDimensions != len(item.Embedding) || item.EmbeddingModel == "" || item.IndexVersion < 1 {
+		return fmt.Errorf("长期记忆向量元数据无效")
+	}
+	encoded, err := json.Marshal(item.Embedding)
+	if err != nil {
+		return fmt.Errorf("编码长期记忆向量失败：%w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO memory_embeddings(memory_id, kind, embedding_model, embedding_dimensions, index_version, embedding, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(memory_id) DO UPDATE SET
+    kind = excluded.kind, embedding_model = excluded.embedding_model,
+    embedding_dimensions = excluded.embedding_dimensions, index_version = excluded.index_version,
+    embedding = excluded.embedding, updated_at = excluded.updated_at`,
+		item.ID, item.Kind, item.EmbeddingModel, item.EmbeddingDimensions, item.IndexVersion,
+		string(encoded), formatTime(item.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("写入长期记忆向量索引失败：%w", err)
 	}
 	return nil
 }

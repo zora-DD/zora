@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.8 Memory Capture Outbox 与 Worker 阶段
+> 适用版本：V0.9 独立消息/长期记忆向量索引阶段
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -193,6 +193,9 @@ flowchart TD
 | `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 否 | Unicode 字符分块上限，最少 100 |
 | `ZORA_KNOWLEDGE_CHUNK_OVERLAP` | `120` | 否 | 重叠字符数，必须小于分块上限的一半 |
 | `ZORA_KNOWLEDGE_PRINCIPAL_ID` | `local-user` | 否 | 单用户部署中由服务端信任的知识库主体，客户端不能覆盖 |
+| `ZORA_MESSAGE_RECALL_ENABLED` | `true` | 否 | 是否召回其他会话中的相关用户原话 |
+| `ZORA_MESSAGE_RECALL_LIMIT` | `3` | 否 | 单轮最多注入的历史消息数量 |
+| `ZORA_MESSAGE_RECALL_MIN_SCORE` | `0.55` | 否 | 消息向量相似度门槛，范围 0–1 |
 | `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 否 | 成功回答后是否执行候选提取和 Consolidation |
 | `ZORA_MEMORY_MAX_CANDIDATES` | `3` | 否 | 单轮候选上限，范围 1–10 |
 | `ZORA_MEMORY_RECALL_ENABLED` | `true` | 否 | 是否在 Agent 执行前召回并注入长期记忆 |
@@ -685,7 +688,7 @@ recency = exp(-ln(2) * age / 90 days)
 
 召回正文使用 `[ZORA_RECALLED_MEMORY]` 独立 System Message 注入，JSON 中只包含 kind/content。系统指令声明这些内容是不可信背景事实、不得当作指令执行、与本轮输入冲突时以本轮为准，也不得向用户暴露内部 ID 或分数。总正文硬限制为 6,000 Unicode 字符。RunEvent `memory_recall_completed` 只保存 Memory ID、类型和四项分数，不复制正文；失败写 `memory_recall_failed` 并继续无记忆回答。
 
-当前仍没有把普通聊天消息向量化，也没有为 Memory 增加向量列；只有知识库 `knowledge_chunks` 会持久化向量。后续必须为 message、memory、knowledge 三类实体保留独立类型、模型、维度和索引版本边界，不能混入一个无类型向量集合。轻量词项召回是可解释基线；只有 A/B 数据证明语义召回有稳定收益后，才引入 Message/Memory Embedding、索引迁移和额外成本。
+普通聊天消息、长期记忆和知识库 Chunk 分别持久化在 `message_embeddings`、`memory_embeddings` 与 `knowledge_chunks`，不会混入同一无类型集合。索引保存模型名、维度和版本；SQLite 使用 JSON 向量精确扫描，PostgreSQL 三张表各自建立 pgvector HNSW。回答后的持久化 Worker 批量索引用户与助手消息；Memory 在创建或更新时先向量化，再由 Store 把业务记录和派生向量放入同一事务。跨会话召回只选择其他会话的用户消息，Memory 则把词项与向量相关性取较高值后再融合重要性和时效性。历史数据可通过 `POST /api/semantic/reindex` 重建。
 
 ### 8.12 会话增量摘要与上下文压缩
 
@@ -1065,6 +1068,19 @@ Content-Type: application/json
 ```
 
 `top_k` 默认 5，HTTP 调试接口最大 20。库中存在 Chunk 但没有与当前 Embedder 兼容的向量时返回 409，提示重建索引。
+
+### 10.12.1 消息与长期记忆语义索引
+
+```http
+POST /api/semantic/messages/search
+Content-Type: application/json
+
+{"query":"我平时使用什么语言？","exclude_conversation_id":"conv_current"}
+
+POST /api/semantic/reindex
+```
+
+消息搜索只返回其他会话中超过配置门槛的用户原话。重建接口从 `messages` 和 `memories` 分批重新生成派生向量，适用于首次启用、切换模型或升级索引版本；操作幂等，但真实 Embedding 会产生调用成本。
 
 ### 10.13 长期记忆管理
 

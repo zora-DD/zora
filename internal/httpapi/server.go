@@ -25,6 +25,7 @@ import (
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/observability"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -37,6 +38,7 @@ type Server struct {
 	knowledge      *knowledge.Service
 	memory         *memory.Service
 	memoryQueue    *memory.CaptureQueue
+	semantic       *semantic.Service
 	approval       *approval.Service
 	office         *office.Service
 	telemetry      *observability.Telemetry
@@ -62,6 +64,10 @@ func WithTelemetry(telemetry *observability.Telemetry) Option {
 
 func WithMemoryCaptureQueue(queue *memory.CaptureQueue) Option {
 	return func(server *Server) { server.memoryQueue = queue }
+}
+
+func WithSemanticService(service *semantic.Service) Option {
+	return func(server *Server) { server.semantic = service }
 }
 
 // WithMCPInfo 只向展示层暴露启用状态和已通过门禁的工具数，不泄露命令、参数或环境变量。
@@ -126,6 +132,10 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 		mux.HandleFunc("GET /api/memory-capture/jobs", server.listMemoryCaptureJobs)
 		mux.HandleFunc("GET /api/memory-capture/jobs/{jobID}", server.getMemoryCaptureJob)
 	}
+	if server.semantic != nil {
+		mux.HandleFunc("POST /api/semantic/messages/search", server.searchSemanticMessages)
+		mux.HandleFunc("POST /api/semantic/reindex", server.reindexSemanticData)
+	}
 
 	// 前端资源编译进 Go 二进制，部署时不需要额外静态文件服务器。
 	assets, err := fs.Sub(webFiles, "web")
@@ -164,6 +174,9 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.chat.MemoryRecallEnabled() {
 		capabilities = append(capabilities, "memory-recall", "memory-context-injection")
 	}
+	if s.chat.MessageRecallEnabled() {
+		capabilities = append(capabilities, "message-vector-index", "cross-conversation-message-recall")
+	}
 	if s.chat.SummaryEnabled() {
 		capabilities = append(capabilities, "conversation-summary", "context-compression")
 	}
@@ -187,15 +200,22 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.8.0-dev",
+		"name": "Zora", "version": "0.9.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"models": s.chat.ModelProfiles(), "default_model_id": s.chat.DefaultModelID(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
-		"human_approval":       s.chat.ApprovalEnabled(),
-		"embedding_model":      s.knowledge.EmbeddingModel(),
-		"retrieval_backend":    s.knowledge.RetrievalBackend(),
-		"memory_auto_capture":  s.memory.AutoCaptureEnabled(),
-		"memory_recall":        s.chat.MemoryRecallEnabled(),
+		"human_approval":      s.chat.ApprovalEnabled(),
+		"embedding_model":     s.knowledge.EmbeddingModel(),
+		"retrieval_backend":   s.knowledge.RetrievalBackend(),
+		"memory_auto_capture": s.memory.AutoCaptureEnabled(),
+		"memory_recall":       s.chat.MemoryRecallEnabled(),
+		"message_recall":      s.chat.MessageRecallEnabled(),
+		"semantic_index": func() any {
+			if s.semantic == nil {
+				return nil
+			}
+			return map[string]any{"model": s.semantic.Model(), "dimensions": s.semantic.Dimensions(), "version": s.semantic.IndexVersion()}
+		}(),
 		"conversation_summary": s.chat.SummaryEnabled(),
 		"mcp_enabled":          s.mcpEnabled,
 		"mcp_tool_count":       s.mcpToolCount,
@@ -589,6 +609,32 @@ func (s *Server) getMemoryCaptureJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) searchSemanticMessages(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Query                 string `json:"query"`
+		ExcludeConversationID string `json:"exclude_conversation_id"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		s.problem(w, err)
+		return
+	}
+	results, err := s.semantic.RecallMessages(r.Context(), input.Query, input.ExcludeConversationID)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func (s *Server) reindexSemanticData(w http.ResponseWriter, r *http.Request) {
+	result, err := s.semantic.Reindex(r.Context())
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) listOfficeDrafts(w http.ResponseWriter, r *http.Request) {

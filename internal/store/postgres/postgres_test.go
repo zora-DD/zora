@@ -15,7 +15,7 @@ func TestBuildSearchTermsIsDeterministicAndKeepsFrequency(t *testing.T) {
 
 func TestSchemaUsesConfiguredVectorDimensions(t *testing.T) {
 	t.Parallel()
-	schema := strings.Replace(postgresSchema, "%d", "384", 1)
+	schema := strings.ReplaceAll(postgresSchema, "%d", "384")
 	for _, expected := range []string{
 		"embedding vector(384)",
 		"USING hnsw (embedding vector_cosine_ops)",
@@ -34,6 +34,9 @@ func TestSchemaUsesConfiguredVectorDimensions(t *testing.T) {
 		"idx_office_draft_events_draft_created",
 		"CREATE TABLE IF NOT EXISTS office_operations",
 		"CREATE TABLE IF NOT EXISTS memory_capture_jobs",
+		"CREATE TABLE IF NOT EXISTS message_embeddings",
+		"CREATE TABLE IF NOT EXISTS memory_embeddings",
+		"INSERT INTO zora_schema_versions(version) VALUES (11)",
 		"idx_memory_capture_jobs_status_available",
 		"CREATE TABLE IF NOT EXISTS office_operation_events",
 		"idempotency_key TEXT NOT NULL UNIQUE",

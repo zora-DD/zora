@@ -27,6 +27,7 @@ import (
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/observability"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/store/postgres"
 	"github.com/zhiruo/zora/internal/store/sqlite"
@@ -38,6 +39,7 @@ type applicationStore interface {
 	knowledge.Store
 	memory.Store
 	memory.CaptureJobStore
+	semantic.Store
 	approval.Store
 	office.Store
 	summary.Store
@@ -69,7 +71,7 @@ func run(logger *slog.Logger) error {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancelStartup()
 	telemetry, err := observability.NewTelemetry(startupCtx, observability.TelemetryConfig{
-		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.8.0-dev",
+		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.9.0-dev",
 		Environment: cfg.OTelEnvironment, TracingEnabled: cfg.OTelEnabled,
 		OTLPEndpoint: cfg.OTelEndpoint, TraceSampleRatio: cfg.OTelSampleRatio,
 		PrometheusEnabled: cfg.PrometheusEnabled,
@@ -198,6 +200,12 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	semanticService, err := semantic.NewService(database, embedder, semantic.Options{
+		MessageRecallLimit: cfg.MessageRecallLimit, MessageRecallMinScore: cfg.MessageRecallMinScore,
+	})
+	if err != nil {
+		return err
+	}
 	// 知识库检索和时间、计算器一样走统一 Tool 协议，便于后续加入多 Agent 调度。
 	knowledgeTool, err := knowledge.NewSearchTool(knowledgeService)
 	if err != nil {
@@ -212,7 +220,8 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	chatModel = telemetry.WrapChatModel(chatModel, cfg.Provider, cfg.Model)
-	memoryOptions := make([]memory.Option, 0, 1)
+	memoryOptions := make([]memory.Option, 0, 2)
+	memoryOptions = append(memoryOptions, memory.WithVectorIndex(semanticService))
 	if cfg.MemoryAutoCapture {
 		var extractor memory.Extractor
 		if cfg.Provider == "mock" {
@@ -230,12 +239,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	var memoryQueue *memory.CaptureQueue
-	if cfg.MemoryAutoCapture {
-		memoryQueue, err = memory.NewCaptureQueue(database)
-		if err != nil {
-			return err
-		}
+	// Capture Job 同时负责消息向量化；即使关闭自动记忆，也必须保留此持久化 Worker。
+	memoryQueue, err := memory.NewCaptureQueue(database)
+	if err != nil {
+		return err
 	}
 	runtimeProfiles := make([]chat.RuntimeProfile, 0, len(cfg.ModelProfiles))
 	var defaultRuntime *agentruntime.Runtime
@@ -300,6 +307,9 @@ func run(logger *slog.Logger) error {
 	if cfg.MemoryRecallEnabled {
 		chatOptions = append(chatOptions, chat.WithMemoryRecaller(memoryService))
 	}
+	if cfg.MessageRecallEnabled {
+		chatOptions = append(chatOptions, chat.WithMessageRecaller(semanticService))
+	}
 	if cfg.SummaryEnabled {
 		var summarizer summary.Summarizer
 		if cfg.Provider == "mock" {
@@ -330,6 +340,7 @@ func run(logger *slog.Logger) error {
 			TaskTimeout:     cfg.MemoryWorkerTaskTimeout,
 			RetryBase:       cfg.MemoryWorkerRetryBase,
 			Instrumentation: telemetry,
+			MessageIndexer:  semanticService,
 			Observer: func(ctx context.Context, job memory.CaptureJob, result *memory.CaptureResult, _ error) {
 				eventType := "memory_capture_completed"
 				payload := map[string]any{"job_id": job.ID, "attempt": job.Attempt, "status": job.Status}
@@ -380,6 +391,7 @@ func run(logger *slog.Logger) error {
 	if memoryQueue != nil {
 		httpOptions = append(httpOptions, httpapi.WithMemoryCaptureQueue(memoryQueue))
 	}
+	httpOptions = append(httpOptions, httpapi.WithSemanticService(semanticService))
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout, httpOptions...)
 	if err != nil {
 		return err
@@ -399,6 +411,7 @@ func run(logger *slog.Logger) error {
 			"模型配置数", len(cfg.ModelProfiles), "默认模型ID", cfg.DefaultModelID,
 			"向量提供方", cfg.EmbeddingProvider, "向量模型", embedder.Name(),
 			"自动记忆", cfg.MemoryAutoCapture, "记忆召回", cfg.MemoryRecallEnabled,
+			"消息召回", cfg.MessageRecallEnabled,
 			"会话摘要", cfg.SummaryEnabled, "多Agent", cfg.MultiAgentEnabled,
 			"MCP已启用", cfg.MCPEnabled, "MCP工具数", mcpToolCount,
 			"办公执行器", cfg.OfficeExecutor,
