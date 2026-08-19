@@ -12,7 +12,7 @@
 - [x] 自动化测试与 Docker 构建文件
 - [x] 项目分析、技术设计、README 和文档维护约定
 
-## V0.2 Knowledge Base — 工程项已完成，真实语义验收待加强
+## V0.2 Knowledge Base — 真实语义基线已完成，融合排序待优化
 
 - [x] PostgreSQL + pgvector Store（完整会话/Run/知识库持久化）
 - [x] 文档上传和 SHA-256 内容去重
@@ -29,10 +29,13 @@
 - [x] 文档级权限过滤（服务端可信主体 + private/public）
 - [x] 固定检索评测集：Recall@K、MRR、命中率和单路/混合对比
 - [x] 确定性答案事实覆盖、有效引用覆盖与引用忠实度评估
+- [x] 10 份文档、64 题的真实 Embedding 领域检索集和纯检索评测入口
+- [x] 使用 `text-embedding-v4` 记录 vector/keyword/hybrid 的 64 题真实指标
+- [ ] 输出失败 Case 明细，按语义、关键词、分块和多文档问题归因并调整 Hybrid 融合策略
 
 验收条件：每个知识库答案能够定位到原文；能用固定数据证明混合召回优于单一路径。
 
-当前验证结果：上传 → 文本/PDF 解析 → 递归字符分块 → Embedding → 向量/关键词 → RRF → `knowledge_search` → 对话 SSE 的纵向链路已打通。相同主体和文档名形成单调版本链，默认列表与检索只使用最新版，删除最新版会恢复上一版；服务端可信主体控制 owner，private 仅 owner 可见、public 可跨主体读取，非 owner 不得删除。SQLite 旧表可迁移，PostgreSQL 在版本组上使用事务级 advisory lock。自动化测试覆盖版本回退、旧版检索隔离、ACL、PDF 文本层解析、递归边界和 HTTP 元数据。`zora-rag-smoke-v1` 在默认 Hash Embedding 下仍为 Recall@3=1、MRR=1，事实覆盖率/有效引用覆盖率/引用忠实度均为 1；但三种检索模式打平，确定性小样本不能证明融合优于单路，也不能替代真实模型语义评审。因此代码清单完成，验收结论仍保留该限制。
+当前验证结果：上传 → 文本/PDF 解析 → 递归字符分块 → Embedding → 向量/关键词 → RRF → `knowledge_search` → 对话 SSE 的纵向链路已打通。相同主体和文档名形成单调版本链，默认列表与检索只使用最新版，删除最新版会恢复上一版；服务端可信主体控制 owner，private 仅 owner 可见、public 可跨主体读取，非 owner 不得删除。SQLite 旧表可迁移，PostgreSQL 在版本组上使用事务级 advisory lock。自动化测试覆盖版本回退、旧版检索隔离、ACL、PDF 文本层解析、递归边界和 HTTP 元数据。小型答案集用于事实与引用冒烟；`starship-domain-retrieval-v1` 使用 10 份文档、64 题评估真实向量。2026-08-18 的 `text-embedding-v4` 基线中，Vector Recall@3/MRR 为 0.911458/0.828125，Keyword 为 0.963542/0.945313，Hybrid 为 0.934896/0.914063，阶段阈值通过。Hybrid 相对 Vector 的 Recall 与 MRR 分别提升 0.023438 和 0.085938，但仍低于 Keyword 0.028646 和 0.031250；因此真实语义链路已验收，融合排序优势尚未成立，需结合失败 Case 明细继续调权和归因。
 
 ## V0.3 Long-term Memory — 主链路已完成
 
@@ -108,6 +111,29 @@
 验收条件：指标必须来自真实 Runtime 与持久化 RunEvent；Provider 不返回 Usage 时不得估算成“真实 Token”；同一 Run 的实时 `done.metrics`、聚合 API 和事件明细可以互相核对。
 
 当前验证结果：Runtime 在每条 Assistant 输出合并完成后记录模型调用，兼容工具调用轮次、最终回答和专业 Agent 输出。真实 Provider 返回的 `ResponseMeta.Usage` 被转换为与 SDK 解耦的结构，RunEvent 保存调用级 Token 与 `usage_reported`；聚合器统计 Usage 完整性。Chat 在第一个用户可见 `delta` 时记录 `first_token`，并用 ToolCall ID 分别关联普通工具和 Agent 交接的开始、完成与耗时。最近 Run API 从 SQLite/PostgreSQL 的 `agent_runs` 读取终态，再使用追加式事件重建指标；Web 监控按需读取最近 50 次。Mock 端到端实测为 2 次模型调用、1 次工具调用、Usage 未上报，页面/API 会如实显示“Provider 未上报”。浏览器自动化环境无法连接本机回环地址，因此本轮完成了真实 HTTP/SSE、静态资源、JavaScript 语法和 API 测试，但不把截图级视觉检查描述为已通过。
+
+## V0.7 OpenTelemetry & Prometheus — 已完成
+
+- [x] OTLP/HTTP Trace Exporter、W3C TraceContext/Baggage 与 ParentBased 比例采样
+- [x] HTTP Server Span 与路由、状态码、耗时指标
+- [x] 持久化 Run 与 `agent.run` Span 关联，SSE/RunEvent 返回 Trace ID
+- [x] 模型 Generate/Stream Span、耗时与 Provider 真实 Token 指标
+- [x] 内置、知识库、办公、MCP 与专业 Agent Tool 的统一 Span/指标包装
+- [x] Embedding 写入/查询 Span、输入数量与耗时指标
+- [x] 独立 Prometheus Registry 和 `GET /metrics`，自抓取不进入业务 HTTP 指标
+- [x] Jaeger/Prometheus Compose、Makefile 命令和阶段使用文档
+- [x] Trace 父子关系与 Prometheus 导出的自动化测试
+
+验收条件：同一次知识库 Agent 请求中，HTTP、Run、模型、知识库工具和 Embedding 必须拥有相同 Trace ID，且父子关系正确；指标不得把 Prompt、回答、文档或 Tool 参数正文作为 Attribute/Label。
+
+当前验证结果：自动化测试构造完整调用链并验证 `HTTP → Run → model/tool → embedding` 的父子 Span 与同一 Trace ID，Prometheus Handler 可导出 Run Counter 和延迟 Histogram。业务 Run 的 `trace_id`、`span_id` 同时进入 SSE `start` 和持久化 `run_started`，可从产品审计跳转到 Jaeger。当前是本地直接导出到 Jaeger 的开发方案，生产仍需 Collector、Grafana Dashboard 与告警规则。
+
+## 后续技术待办
+
+- [ ] 普通对话消息向量化与语义历史召回；当前 `messages` 只持久化原文，不持久化向量。
+- [ ] 长期记忆向量化与混合召回；当前 `memories` 使用词项相关性、重要性和时效性，不持久化向量。
+- [ ] 为消息向量、记忆向量和知识库 Chunk 向量增加明确的集合/实体类型、模型名、维度与索引版本边界；当前只有知识库 `knowledge_chunks` 持久化向量。
+- [ ] 上述能力进入实现前先补独立离线评测，避免无差别召回消息造成隐私扩大、上下文污染和额外 Embedding 成本。
 
 ## 每个版本的文档完成标准
 

@@ -134,21 +134,22 @@ flowchart TD
 `cmd/zora/main.go` 按以下顺序启动：
 
 1. `config.Load` 读取并校验环境变量；
-2. 根据 `ZORA_STORE_PROVIDER` 打开 SQLite 或 PostgreSQL；
-3. SQLite 启用 WAL/busy timeout；PostgreSQL 初始化连接池、pgvector 类型和幂等迁移；
-4. 构造时间、计算器和项目状态工具；
-5. 创建 Office Service 与邮件/日历草稿预览工具；草稿写入当前应用数据库，不调用外部写接口；
-6. 启用 MCP 时启动白名单中的 stdio Server，握手、发现只读工具并建立生命周期管理；
-7. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder；
-8. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
-9. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel；
-10. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
-11. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
-12. 创建 Eino Runner；多 Agent 模式包装受控 AgentTool，并开启内部 Agent 事件透传；
-13. 按配置创建 Model/Rule Summarizer 和 Summary Service；
-14. 多 Agent 审批模式不为 off 时创建 Approval Service；
-15. 创建 Chat Service，按开关接入 Memory Capture/Recall、会话摘要和审批，再创建含 Office Service 的 HTTP Handler；
-16. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭。
+2. 创建 OTel/Prometheus Telemetry；关闭开关时使用 No-op Provider，保持调用方无分支；
+3. 根据 `ZORA_STORE_PROVIDER` 打开 SQLite 或 PostgreSQL；
+4. SQLite 启用 WAL/busy timeout；PostgreSQL 初始化连接池、pgvector 类型和幂等迁移；
+5. 构造时间、计算器和项目状态工具，并追加 Trace/Metric 包装；
+6. 创建 Office Service 与邮件/日历草稿预览工具；草稿写入当前应用数据库，不调用外部写接口；
+7. 启用 MCP 时启动白名单中的 stdio Server，握手、发现只读工具并建立生命周期管理；
+8. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder，再追加可观察包装；
+9. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
+10. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel，再追加可观察包装；
+11. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
+12. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
+13. 创建 Eino Runner；多 Agent 模式包装受控 AgentTool，并开启内部 Agent 事件透传；
+14. 按配置创建 Model/Rule Summarizer 和 Summary Service；
+15. 多 Agent 审批模式不为 off 时创建 Approval Service；
+16. 创建 Chat Service，按开关接入 Memory Capture/Recall、会话摘要、审批和 Run Trace，再创建含 Office Service 与 HTTP Trace 的 Handler；
+17. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭；最后刷新并关闭 Telemetry。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
 
@@ -161,6 +162,12 @@ flowchart TD
 | `ZORA_STORE_PROVIDER` | `sqlite` | 否 | `sqlite` 或 `postgres` |
 | `ZORA_POSTGRES_DSN` | 空 | postgres 模式必填 | PostgreSQL 连接串，只从环境变量读取 |
 | `ZORA_POSTGRES_MAX_CONNS` | `10` | 否 | pgxpool 最大连接数，范围 1–100 |
+| `ZORA_OTEL_ENABLED` | `false` | 否 | 是否通过 OTLP/HTTP 导出 Trace |
+| `OTEL_SERVICE_NAME` | `zora` | 否 | OTel Resource 的稳定服务名 |
+| `ZORA_OTEL_ENVIRONMENT` | `development` | 否 | `deployment.environment.name` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Trace 开启时必填 | Collector 或 Jaeger 的 OTLP/HTTP 根地址 |
+| `ZORA_OTEL_SAMPLE_RATIO` | `1` | 否 | ParentBased 根 Trace 采样比例，范围 0–1 |
+| `ZORA_PROMETHEUS_ENABLED` | `false` | 否 | 是否通过独立 Registry 注册 `GET /metrics` |
 | `ZORA_MODEL_PROVIDER` | `mock` | 否 | `mock` 或 `openai` |
 | `ZORA_MODEL` | `qwen-plus` | openai 模式需要 | 模型名称 |
 | `ZORA_API_KEY` | 空 | openai 模式必填 | 模型服务密钥 |
@@ -543,7 +550,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    Dataset["evals/knowledge.json"] --> CLI["cmd/zora-eval"]
+    Dataset["小型答案集 / 64 题领域检索集"] --> CLI["cmd/zora-eval"]
     CLI --> TempDB["隔离的临时 SQLite"]
     CLI --> Ingest["按线上配置重新摄取"]
     Ingest --> Modes["vector / keyword / hybrid"]
@@ -566,11 +573,13 @@ flowchart LR
 - `citation_coverage`：带有效引用的已出现事实数 / 已出现事实数；有效引用必须能解析到本次 `knowledge_search` 返回的证据；
 - `citation_faithfulness`：能由所引原文锚点支持的事实数 / 带有效引用的事实数。
 
-报告同时给出 hybrid 相对 vector 和 keyword 的 Recall/MRR 差值。最终 `passed` 同时受 hybrid 检索指标和三项答案指标约束；未达任一阈值时，命令输出完整报告后以非零状态退出，可直接接入 CI。
+报告同时给出 hybrid 相对 vector 和 keyword 的 Recall/MRR 差值。最终 `passed` 同时受 hybrid 检索指标和已启用的答案指标约束；未达任一阈值时，命令输出报告后以非零状态退出，可直接接入 CI。`-answers=false` 可以只运行三路检索，避免大样本产生聊天模型费用；`-details=false` 只输出聚合指标，需要定位失败题目时再打开明细。
 
 答案评测采用 `expected_facts.answer_contains` 与 `evidence_contains` 的规范化锚点，优点是零密钥、稳定、失败可定位；限制是无法发现标注范围之外的开放式幻觉，也不能判断同义改写。生产验收仍需真实模型数据集、人工抽检或可校准的 LLM Judge。
 
 默认 `zora-rag-smoke-v1` 含 4 份文档和 4 个问题。在 Hash Embedding 下实际结果为 Recall@3=1、MRR=1，三种模式当前打平。这是小规模冒烟基线，不构成“混合召回优于单路”的证据。
+
+`starship-domain-retrieval-v1` 位于 `evals/knowledge-domain.json`，包含 10 份领域文档和 64 个问题，覆盖精确事实、语义改写、跨文档组合、版本冲突、范围边界与 Prompt Injection。`make eval-rag-real` 自动加载 `.env.local`，以 `-answers=false -details=false` 运行真实 Embedding 检索摘要；默认 Hash 基线为 vector Recall@3 0.924479 / MRR 0.877604，keyword 0.963542 / 0.945313，hybrid 0.971354 / 0.940104。该结果只验证数据集和命令契约，不替代真实 Embedding 报告。
 
 ### 8.9 PostgreSQL、pgvector 与 FTS
 
@@ -656,7 +665,7 @@ recency = exp(-ln(2) * age / 90 days)
 
 召回正文使用 `[ZORA_RECALLED_MEMORY]` 独立 System Message 注入，JSON 中只包含 kind/content。系统指令声明这些内容是不可信背景事实、不得当作指令执行、与本轮输入冲突时以本轮为准，也不得向用户暴露内部 ID 或分数。总正文硬限制为 6,000 Unicode 字符。RunEvent `memory_recall_completed` 只保存 Memory ID、类型和四项分数，不复制正文；失败写 `memory_recall_failed` 并继续无记忆回答。
 
-当前仍没有把聊天消息批量向量化，也没有为 Memory 增加向量列。轻量词项召回是可解释基线；只有 A/B 数据证明语义召回有稳定收益后，才引入 Memory Embedding、索引迁移和额外成本。
+当前仍没有把普通聊天消息向量化，也没有为 Memory 增加向量列；只有知识库 `knowledge_chunks` 会持久化向量。后续必须为 message、memory、knowledge 三类实体保留独立类型、模型、维度和索引版本边界，不能混入一个无类型向量集合。轻量词项召回是可解释基线；只有 A/B 数据证明语义召回有稳定收益后，才引入 Message/Memory Embedding、索引迁移和额外成本。
 
 ### 8.12 会话增量摘要与上下文压缩
 
@@ -1223,6 +1232,7 @@ make test
 make vet
 make check
 make eval-rag
+make eval-rag-real
 make eval-memory
 make eval-agents
 make postgres-up
@@ -1374,7 +1384,26 @@ SSE done.metrics / REST / Web 运行监控
 
 `agentruntime.Event` 使用独立 `ModelUsage`，隔离 Eino 版本细节。Chat 只持久化完成后的模型级 Usage，不把逐 Token delta 写库；即使一次 Run 调用模型多次，也能以 `model_calls` 和 `usage_reported_calls` 表达完整度。普通工具与 Agent 交接都按 ToolCall ID 分别计算耗时；缺失关联 ID 的事件不会虚构耗时。
 
-Store 新增 `GetRun` / `ListRuns`，SQLite 和 PostgreSQL 保持相同契约。`observability.Aggregate` 是纯聚合函数；HTTP 与 Chat 均通过 Service 调用，页面不自行推导指标。Run 列表默认 20、最多 100，当前 N+1 读取事件是明确的 MVP 边界。生产化可增加时间窗聚合表、OpenTelemetry exporter 和价格快照，但不能覆盖原始 RunEvent。
+Store 新增 `GetRun` / `ListRuns`，SQLite 和 PostgreSQL 保持相同契约。`observability.Aggregate` 是纯聚合函数；HTTP 与 Chat 均通过 Service 调用，页面不自行推导指标。Run 列表默认 20、最多 100，当前 N+1 读取事件是明确的 MVP 边界。生产化可增加时间窗聚合表和价格快照，但不能覆盖原始 RunEvent。
+
+### 17.6 V0.7 OpenTelemetry 与 Prometheus
+
+V0.7 在产品审计之外增加基础设施级观测，但不让 Jaeger 或 Prometheus 成为业务正确性的依赖：
+
+```text
+HTTP Server Span
+  └── agent.run（持久化 Run ID / Conversation ID）
+      ├── gen_ai.chat（Generate 或完整 Stream 生命周期）
+      ├── tool.<name>
+      │   └── embedding.generate（知识检索时）
+      └── tool.<specialist_agent>（多 Agent 交接）
+```
+
+`cmd/zora` 创建 `observability.Telemetry`，用装饰器包装模型、Embedding 和 Tool，再注入 Chat 与 HTTP。所有装饰器复用调用方 Context，因此不需要 Eino 业务代码了解 Jaeger；模型 Stream Span 只有在读取 EOF、错误或消费者关闭时结束，而不是在拿到 `StreamReader` 时提前结束。HTTP 中间件从请求 Header 提取 W3C TraceContext/Baggage；Run 开始后把 Trace/Span ID 写入 SSE `start` 和 `run_started`，完成时按 completed/failed/cancelled/rejected 标记 Span 与指标。
+
+Prometheus 使用进程内独立 Registry，`/metrics` 由根路由直接处理，不进入业务 HTTP 中间件。Counter/Histogram 标签限定为 method、route、status、provider、model、tool name 等有限集合；`run_id`、`conversation_id` 只作为 Span Attribute，避免指标高基数。正文、Prompt、知识片段、工具参数和密钥既不进入 Trace，也不进入 Metric。
+
+RunEvent 与 OTel 的职责不同：前者是不可采样的产品审计事实，后者允许采样和过期，服务于跨层耗时与故障定位。两者通过 Run ID/Trace ID 关联，而不是互相替换。当前开发环境直接发往 Jaeger；生产应在 Zora 与后端之间加入 Collector，承担重试、脱敏、尾采样和多后端路由，并通过网络策略保护 `/metrics`。完整启动与验收见[第二阶段文档](phase-2-observability.md)。
 
 ## 18. 维护约定
 

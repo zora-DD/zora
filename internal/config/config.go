@@ -57,6 +57,12 @@ type Config struct {
 	Instruction                 string         // Agent 的系统指令。
 	RequestTimeout              time.Duration  // 单次模型请求和整条消息链路的超时上限。
 	MaxIterations               int            // ReAct 最大循环次数，防止模型无限调用工具。
+	OTelEnabled                 bool           // 是否通过 OTLP/HTTP 导出 Trace。
+	OTelServiceName             string         // Trace Resource 中的稳定服务名。
+	OTelEnvironment             string         // deployment.environment.name，例如 development。
+	OTelEndpoint                string         // OTLP/HTTP 根地址，通常为 Collector 或 Jaeger 的 4318 端口。
+	OTelSampleRatio             float64        // 根 Trace 采样比例，范围 0 到 1。
+	PrometheusEnabled           bool           // 是否在 /metrics 暴露 Prometheus 指标。
 	MultiAgentEnabled           bool           // 是否启用 Supervisor + 专业 Agent；默认关闭以控制模型成本。
 	MultiAgentMaxHandoffs       int            // 单轮最多允许的专业 Agent 交接次数，避免失控循环。
 	MultiAgentMaxParallel       int            // 单轮专业 Agent 的最大并行数，限制瞬时模型请求压力。
@@ -113,6 +119,18 @@ func Load() (Config, error) {
 	maxIterations, err := strconv.Atoi(env("ZORA_MAX_ITERATIONS", "8"))
 	if err != nil || maxIterations < 1 || maxIterations > 50 {
 		return Config{}, fmt.Errorf("ZORA_MAX_ITERATIONS 必须在 1 到 50 之间")
+	}
+	otelEnabled, err := strconv.ParseBool(env("ZORA_OTEL_ENABLED", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_OTEL_ENABLED 必须是 true 或 false")
+	}
+	prometheusEnabled, err := strconv.ParseBool(env("ZORA_PROMETHEUS_ENABLED", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_PROMETHEUS_ENABLED 必须是 true 或 false")
+	}
+	otelSampleRatio, err := strconv.ParseFloat(env("ZORA_OTEL_SAMPLE_RATIO", "1"), 64)
+	if err != nil || math.IsNaN(otelSampleRatio) || math.IsInf(otelSampleRatio, 0) || otelSampleRatio < 0 || otelSampleRatio > 1 {
+		return Config{}, fmt.Errorf("ZORA_OTEL_SAMPLE_RATIO 必须在 0 到 1 之间")
 	}
 	multiAgentEnabled, err := strconv.ParseBool(env("ZORA_MULTI_AGENT_ENABLED", "false"))
 	if err != nil {
@@ -250,6 +268,12 @@ func Load() (Config, error) {
 		Instruction:                 env("ZORA_SYSTEM_PROMPT", defaultInstruction),
 		RequestTimeout:              timeout,
 		MaxIterations:               maxIterations,
+		OTelEnabled:                 otelEnabled,
+		OTelServiceName:             env("OTEL_SERVICE_NAME", "zora"),
+		OTelEnvironment:             env("ZORA_OTEL_ENVIRONMENT", "development"),
+		OTelEndpoint:                strings.TrimRight(env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"), "/"),
+		OTelSampleRatio:             otelSampleRatio,
+		PrometheusEnabled:           prometheusEnabled,
 		MultiAgentEnabled:           multiAgentEnabled,
 		MultiAgentMaxHandoffs:       multiAgentMaxHandoffs,
 		MultiAgentMaxParallel:       multiAgentMaxParallel,

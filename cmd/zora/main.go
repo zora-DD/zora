@@ -23,6 +23,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/mcpbridge"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/observability"
 	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/store/postgres"
@@ -64,6 +65,23 @@ func run(logger *slog.Logger) error {
 	}
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancelStartup()
+	telemetry, err := observability.NewTelemetry(startupCtx, observability.TelemetryConfig{
+		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.7.0-dev",
+		Environment: cfg.OTelEnvironment, TracingEnabled: cfg.OTelEnabled,
+		OTLPEndpoint: cfg.OTelEndpoint, TraceSampleRatio: cfg.OTelSampleRatio,
+		PrometheusEnabled: cfg.PrometheusEnabled,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		// 关闭阶段会刷新 BatchSpanProcessor，避免进程退出前丢失最后一批 Trace。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutdownErr := telemetry.Shutdown(shutdownCtx); shutdownErr != nil {
+			logger.Warn("关闭可观察性组件失败", "错误", shutdownErr)
+		}
+	}()
 	database, err := buildStore(startupCtx, cfg)
 	if err != nil {
 		return err
@@ -73,6 +91,10 @@ func run(logger *slog.Logger) error {
 	registeredTools, err := agenttools.Build()
 	if err != nil {
 		return err
+	}
+	registeredTools, err = telemetry.WrapTools(startupCtx, registeredTools)
+	if err != nil {
+		return fmt.Errorf("包装内置工具可观察性失败：%w", err)
 	}
 	var officeExecutor *mcpbridge.OfficeExecutor
 	if cfg.OfficeExecutor == "microsoft_graph" {
@@ -126,6 +148,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	draftTools, err = telemetry.WrapTools(startupCtx, draftTools)
+	if err != nil {
+		return fmt.Errorf("包装办公草稿工具可观察性失败：%w", err)
+	}
 	var mcpManager *mcpbridge.Manager
 	var mcpTools []tool.BaseTool
 	if cfg.MCPEnabled {
@@ -152,11 +178,17 @@ func run(logger *slog.Logger) error {
 		}()
 		// MCP 工具已经过 Server 名称空间、白名单和只读声明校验，之后才进入 Agent 工具集合。
 		mcpTools = mcpManager.Tools()
+		mcpTools, err = telemetry.WrapTools(startupCtx, mcpTools)
+		if err != nil {
+			return fmt.Errorf("包装 MCP 工具可观察性失败：%w", err)
+		}
 	}
 	embedder, err := buildEmbedder(cfg)
 	if err != nil {
 		return err
 	}
+	// Embedding 在知识库写入和查询时共用此包装，二者会自然挂到调用方当前 Trace 下。
+	embedder = telemetry.WrapEmbedder(embedder, cfg.EmbeddingProvider)
 	knowledgeService, err := knowledge.NewService(database, embedder, knowledge.ChunkOptions{
 		MaxRunes: cfg.KnowledgeChunkSize, OverlapRunes: cfg.KnowledgeOverlap,
 	}, knowledge.WithPrincipal(cfg.KnowledgePrincipalID))
@@ -168,10 +200,15 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	knowledgeTool, err = telemetry.WrapTool(startupCtx, knowledgeTool)
+	if err != nil {
+		return fmt.Errorf("包装知识库工具可观察性失败：%w", err)
+	}
 	chatModel, err := agentruntime.NewChatModel(context.Background(), cfg)
 	if err != nil {
 		return err
 	}
+	chatModel = telemetry.WrapChatModel(chatModel, cfg.Provider, cfg.Model)
 	memoryOptions := make([]memory.Option, 0, 1)
 	if cfg.MemoryAutoCapture {
 		var extractor memory.Extractor
@@ -200,6 +237,7 @@ func run(logger *slog.Logger) error {
 			if err != nil {
 				return fmt.Errorf("创建模型配置 %s 失败：%w", profile.ID, err)
 			}
+			profileChatModel = telemetry.WrapChatModel(profileChatModel, profile.Provider, profile.Model)
 		}
 		var profileRuntime *agentruntime.Runtime
 		if cfg.MultiAgentEnabled {
@@ -208,6 +246,7 @@ func run(logger *slog.Logger) error {
 				Research: registeredTools,
 				Document: append([]tool.BaseTool{knowledgeTool}, mcpTools...),
 				Writer:   draftTools,
+				Observe:  telemetry.WrapTool,
 			}, profileChatModel)
 		} else {
 			singleAgentTools := append(append([]tool.BaseTool{}, registeredTools...), mcpTools...)
@@ -234,6 +273,7 @@ func run(logger *slog.Logger) error {
 	chatOptions := []chat.Option{
 		chat.WithMemoryCapturer(memoryService),
 		chat.WithRuntimeProfiles(cfg.DefaultModelID, runtimeProfiles),
+		chat.WithTelemetry(telemetry),
 	}
 	var approvalService *approval.Service
 	if cfg.MultiAgentEnabled && cfg.MultiAgentApprovalMode != approval.ModeOff {
@@ -280,6 +320,7 @@ func run(logger *slog.Logger) error {
 	}
 	httpOptions = append(httpOptions, httpapi.WithMCPInfo(cfg.MCPEnabled, mcpToolCount))
 	httpOptions = append(httpOptions, httpapi.WithOfficeService(officeService))
+	httpOptions = append(httpOptions, httpapi.WithTelemetry(telemetry))
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout, httpOptions...)
 	if err != nil {
 		return err
@@ -301,7 +342,8 @@ func run(logger *slog.Logger) error {
 			"自动记忆", cfg.MemoryAutoCapture, "记忆召回", cfg.MemoryRecallEnabled,
 			"会话摘要", cfg.SummaryEnabled, "多Agent", cfg.MultiAgentEnabled,
 			"MCP已启用", cfg.MCPEnabled, "MCP工具数", mcpToolCount,
-			"办公执行器", cfg.OfficeExecutor)
+			"办公执行器", cfg.OfficeExecutor,
+			"OTel Trace", cfg.OTelEnabled, "Prometheus", cfg.PrometheusEnabled)
 		serveErrors <- server.ListenAndServe()
 	}()
 

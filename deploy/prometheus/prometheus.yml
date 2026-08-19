@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: zora
+    metrics_path: /metrics
+    static_configs:
+      # Zora 通常通过 make run 在宿主机 8088 启动；容器模式也映射同一端口。
+      - targets: ["host.docker.internal:8088"]

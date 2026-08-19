@@ -17,10 +17,13 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
+	"github.com/zhiruo/zora/internal/observability"
 	"github.com/zhiruo/zora/internal/office"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
@@ -35,6 +38,7 @@ type Server struct {
 	memory         *memory.Service
 	approval       *approval.Service
 	office         *office.Service
+	telemetry      *observability.Telemetry
 	mcpEnabled     bool
 	mcpToolCount   int
 	logger         *slog.Logger
@@ -49,6 +53,10 @@ func WithApprovalService(service *approval.Service) Option {
 
 func WithOfficeService(service *office.Service) Option {
 	return func(server *Server) { server.office = service }
+}
+
+func WithTelemetry(telemetry *observability.Telemetry) Option {
+	return func(server *Server) { server.telemetry = telemetry }
 }
 
 // WithMCPInfo 只向展示层暴露启用状态和已通过门禁的工具数，不泄露命令、参数或环境变量。
@@ -116,7 +124,15 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 		return nil, fmt.Errorf("加载内嵌 Web 资源失败：%w", err)
 	}
 	mux.Handle("/", spaHandler{assets: assets})
-	return server.middleware(mux), nil
+	application := server.middleware(mux)
+	if server.telemetry == nil || server.telemetry.MetricsHandler() == nil {
+		return application, nil
+	}
+	// /metrics 使用独立 Registry，且不进入业务 HTTP 指标，避免 Prometheus 自抓取制造噪声。
+	root := http.NewServeMux()
+	root.Handle("GET /metrics", server.telemetry.MetricsHandler())
+	root.Handle("/", application)
+	return root, nil
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -162,7 +178,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.6.0-dev",
+		"name": "Zora", "version": "0.7.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"models": s.chat.ModelProfiles(), "default_model_id": s.chat.DefaultModelID(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
@@ -754,6 +770,14 @@ func (s *Server) problem(w http.ResponseWriter, err error) {
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
+		var observedWriter *statusResponseWriter
+		var traceSpan trace.Span
+		var traceStarted time.Time
+		if s.telemetry != nil {
+			r, traceSpan, traceStarted = s.telemetry.StartHTTP(r)
+			observedWriter = &statusResponseWriter{ResponseWriter: w, status: http.StatusOK}
+			w = observedWriter
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data:")
@@ -764,11 +788,52 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "服务器内部错误"})
 				}
 			}
+			if s.telemetry != nil {
+				statusCode := http.StatusOK
+				if observedWriter != nil {
+					statusCode = observedWriter.status
+				}
+				s.telemetry.EndHTTP(r.Context(), traceSpan, traceStarted, r.Method, r.Pattern, statusCode)
+			}
 			s.logger.Info("请求完成", "方法", r.Method, "路径", r.URL.Path, "耗时", time.Since(started))
 		}()
 		next.ServeHTTP(w, r)
 	})
 }
+
+// statusResponseWriter 记录最终 HTTP 状态，同时保留 SSE 依赖的 Flusher 能力。
+type statusResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *statusResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.status = status
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusResponseWriter) Write(contents []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(contents)
+}
+
+func (w *statusResponseWriter) Flush() {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *statusResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, destination any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)

@@ -41,6 +41,8 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 	flags := flag.NewFlagSet("zora-eval", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	datasetPath := flags.String("dataset", "./evals/knowledge.json", "RAG 评测集 JSON 文件")
+	evaluateAnswers := flags.Bool("answers", true, "是否调用聊天模型评估答案事实与引用；大规模检索集可关闭以控制费用")
+	includeDetails := flags.Bool("details", true, "是否输出每道题的检索与答案明细")
 	if err := flags.Parse(args); err != nil {
 		return fmt.Errorf("解析评测命令参数失败：%w", err)
 	}
@@ -108,27 +110,37 @@ func run(ctx context.Context, args []string, output io.Writer) error {
 		return err
 	}
 
-	// 答案评测走和线上相同的 Eino Runtime 与 knowledge_search 工具，
-	// 因而能够同时发现“没有调用知识库”和“回答引用了不存在证据”等问题。
-	registeredTools, err := agenttools.Build()
-	if err != nil {
-		return err
+	if *evaluateAnswers {
+		// 答案评测走和线上相同的 Eino Runtime 与 knowledge_search 工具，
+		// 因而能够同时发现“没有调用知识库”和“回答引用了不存在证据”等问题。
+		registeredTools, err := agenttools.Build()
+		if err != nil {
+			return err
+		}
+		knowledgeTool, err := knowledge.NewSearchTool(service)
+		if err != nil {
+			return err
+		}
+		registeredTools = append(registeredTools, knowledgeTool)
+		agentRuntime, err := agentruntime.New(ctx, cfg, registeredTools)
+		if err != nil {
+			return err
+		}
+		answerReport, err := rageval.EvaluateAnswers(ctx, agentAnswerer{runtime: agentRuntime}, dataset)
+		if err != nil {
+			return err
+		}
+		report = rageval.AttachAnswerReport(report, answerReport)
 	}
-	knowledgeTool, err := knowledge.NewSearchTool(service)
-	if err != nil {
-		return err
-	}
-	registeredTools = append(registeredTools, knowledgeTool)
-	agentRuntime, err := agentruntime.New(ctx, cfg, registeredTools)
-	if err != nil {
-		return err
-	}
-	answerReport, err := rageval.EvaluateAnswers(ctx, agentAnswerer{runtime: agentRuntime}, dataset)
-	if err != nil {
-		return err
-	}
-	report = rageval.AttachAnswerReport(report, answerReport)
 	report.EmbeddingModel = service.EmbeddingModel()
+	if !*includeDetails {
+		for i := range report.Modes {
+			report.Modes[i].Cases = []rageval.CaseResult{}
+		}
+		if report.Answer != nil {
+			report.Answer.Cases = []rageval.AnswerCaseResult{}
+		}
+	}
 	encoder := json.NewEncoder(output)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(report); err != nil {

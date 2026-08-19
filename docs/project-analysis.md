@@ -1,793 +1,1041 @@
 # Zora 项目分析文档
 
-> 文档基线：V0.6 Agent 可靠性与可观测性阶段
-> 最后更新：2026-08-18
-> 文档定位：用于需求讨论、架构评审、项目复盘和 Agent 开发岗位面试介绍。
+本文用于深入理解 Zora，并为 Agent 开发岗位的简历与面试做准备。
 
-## 1. 项目概述
+阅读顺序建议：
 
-Zora 是一个以 Go 为主语言、基于 Eino ADK 构建的可观察 Agent 产品。项目不以“接入大模型并提供聊天页面”为终点，而是围绕 Agent 产品真正需要解决的问题逐步演进：
+1. 先用 [README](../README.md) 启动并完成[手工测试](manual-test-guide.md)；
+2. 用本文建立业务、数据和架构全貌；
+3. 结合[项目亮点全面分析](project-highlights.md)阅读关键源码；
+4. 最后查阅[项目技术文档](technical-design.md)确认接口与实现细节。
 
-- 模型如何可靠调用工具并获得反馈；
-- 会话和每次 Agent 执行如何持久化、追踪和恢复；
-- 知识库如何提供有引用、可评估的答案；
-- 长期记忆如何提取、更新、遗忘并由用户控制；
-- 多 Agent 如何分工、控制预算并证明其收益；
-- 办公写操作如何经过授权、审批和审计。
+## 1. 项目一句话定位
 
-当前 V0.1 单 Agent 核心链路已完成；V0.2 已打通知识库、固定检索/答案评测及 SQLite/PostgreSQL 双存储闭环，并补齐版本链、PDF 文本层、递归字符切块和文档级 ACL。V0.3 已建立可控制、可追溯、可 A/B 评测的长期记忆。V0.4 已实现可配置 Supervisor、专业 Agent、隔离交接、执行保险丝、父子 Run、Human-in-the-loop 和对照门禁。V0.5 已完成 Microsoft Graph 写执行器、OAuth/Secret 和 reader/writer 最小权限边界；真实租户验收因外部资源暂缓。V0.6 在既有 RunEvent 上建立运行指标：记录真实 Provider Usage、首字延迟、工具/交接耗时和总耗时，并通过 REST、SSE 与 Web 监控面板统一查询。
+**Zora 是一个用 Go 和 Eino 构建的可观察 Agent 工作台，通过受控工具、RAG、长期记忆、多 Agent、人工审批和可恢复办公任务，把普通 LLM 对话升级为可执行、可审计、可评估的 Agent 系统。**
 
-## 2. 背景与问题
+面试中的更短版本：
 
-普通聊天壳通常只有三层：聊天页面、模型 API、历史消息列表。这类实现可以展示模型调用，却无法回答 Agent 岗位经常关注的问题：
+> 我用 Go 实现了一个 Agent 工作台，重点解决模型工具调用、知识与记忆、多 Agent 治理、外部副作用安全和运行可观察性，而不只是封装一次模型 API。
 
-- 工具如何声明、选择、执行和防止越权；
-- Agent 为什么停止，如何避免无限循环；
-- 流式输出、取消、超时和失败如何处理；
-- 一次复杂任务经过了哪些步骤，如何审计；
-- RAG、Memory 和 Multi-Agent 是否真的提高效果；
-- 如何在能力、成本、延迟和安全之间做取舍。
+## 2. 项目边界与当前状态
 
-Zora 将这些问题作为项目主线。V0.1 建立可运行、可测试、可观察的执行骨架；V0.2 通过端到端知识库来验证这套骨架能够承载真实 Agent 能力。
+### 2.1 已完成
 
-## 3. 项目目标与非目标
+- OpenAI-compatible 与本地 Mock 模型；
+- 多模型服务端注册和请求级选择；
+- Eino ReAct、流式 SSE、工具调用、停止生成；
+- SQLite/PostgreSQL 对话、Run 和事件持久化；
+- TXT/Markdown/PDF 知识摄取、版本、ACL、混合检索和引用；
+- Semantic/Episodic 长期记忆、自动提取、合并、召回与用户 CRUD；
+- 增量会话摘要和最近消息窗口；
+- Supervisor + Research/Document/Writer 多 Agent；
+- 交接预算、并行限制、专家超时、重试、父子 Run 与人工审批；
+- MCP stdio Client、文件连接器、Microsoft Graph 只读连接器；
+- 邮件/日程草稿、确认状态机、Operation、幂等和专用写执行器；
+- Token Usage、TTFT、工具/交接耗时和 Web 运行监控；
+- HTTP、Run、模型、Tool、Embedding 的 OTel Trace 与 Prometheus 指标；
+- RAG、Memory、Multi-Agent 固定数据集评测。
 
-### 3.1 目标
 
-1. 用 Go 验证 Agent Runtime、工具调用、流式传输和持久化的完整工程闭环。
-2. 支持通义千问等 OpenAI-compatible 模型，同时避免业务层绑定单一厂商。
-3. 把 Conversation、AgentRun、RunEvent 分离，使用户历史和内部轨迹分别演进。
-4. 默认提供零密钥、零外部数据库的本地体验，降低项目运行门槛。
-5. 为 RAG、Memory、Multi-Agent、MCP 和 Human-in-the-loop 保留清晰扩展边界。
-6. 用自动化评估和运行数据证明能力收益，而不是只展示功能清单。
 
-### 3.2 当前非目标
+### 2.2 尚未完成或没有宣称完成
 
-- 当前不提供公网多租户服务和用户登录系统。
-- 当前不执行 Shell、代码或任意外部写操作。
-- 当前的 Hash Embedding 只用于本地链路验证，不宣称具有生产语义检索质量。
-- 不把全部聊天历史直接向量化并称为长期记忆。
-- 不为了展示多 Agent 而堆叠多个 Prompt。
-- 不承担本地大模型推理，模型能力通过 API 接入。
+- 完整登录、组织、租户和 RBAC；
+- 面向大规模生产环境的分布式锁、任务队列和多实例调度；
+- OCR、异步文档摄取、向量化批处理任务；
+- 普通对话消息/长期记忆向量化与学习型重排；当前只有知识库 Chunk 持久化向量；
+- OTel Collector 生产管道、Grafana 仪表盘与告警规则；
+- Microsoft 365 真实租户在线写入验收；
+- 面向公网部署的完整限流、配额、WAF 和合规体系。
 
-## 4. 用户与使用场景
+项目的可信表达应是“主链路和工程边界已实现，部分生产基础设施与真实外部资源验收仍待完成”，而不是“已经是生产级通用 Agent 平台”。
+
+## 3. 背景与核心问题
+
+
+
+### 3.1 为什么普通聊天应用不够
+
+普通聊天应用通常只有：用户输入 → 模型请求 → 文本回答。它无法稳定处理以下需求：
+
+- 根据私有文档回答并给出证据；
+- 跨会话记住稳定偏好；
+- 调用计算器、时间、文件、邮件和日历工具；
+- 将复合问题拆给多个专业 Agent；
+- 阻止高风险请求自动产生外部副作用；
+- 回答失败后解释失败在哪一层；
+- 比较两个模型、两种检索算法或单/多 Agent 的真实收益。
+
+
+
+### 3.2 Zora 解决的工程问题
+
+
+| 问题             | Zora 的回答                      |
+| -------------- | ----------------------------- |
+| 模型如何执行动作       | 使用结构化 ToolCall 和最小工具集         |
+| 模型如何获得私有知识     | 文档摄取、混合检索、证据引用                |
+| 如何跨会话保留信息      | 独立 Memory 模型、提取、合并、召回         |
+| 长对话如何控制上下文     | 增量摘要 + 最近原文窗口                 |
+| 多 Agent 如何避免失控 | 专业权限、预算、并行度、超时、重试             |
+| 高风险动作如何拦截      | 持久化 Human-in-the-loop 审批      |
+| 外部写操作如何可靠      | Draft、确认、Operation、幂等执行器      |
+| 如何观察 Agent     | Run、RunEvent、Metrics 和 Web 监控 |
+| 如何证明架构有效       | 固定数据集、Control/Treatment、质量门禁  |
+
+
+
+
+## 4. 用户、场景与业务模型
+
+
 
 ### 4.1 目标用户
 
-| 用户 | 核心需求 | Zora 的价值 |
-|---|---|---|
-| 项目开发者 | 学习 Agent 的核心实现 | 能直接阅读和调试 Runtime、工具、事件和持久化代码 |
-| Agent 岗位面试官 | 判断候选人的工程深度 | 能讨论取舍、失败语义、评估方案与扩展设计 |
-| 个人用户 | 使用可靠的对话助手 | 获得流式回复、精确工具结果和持久化历史 |
-| 后续办公用户 | 处理文档、邮件和日历 | 通过知识库、MCP 和审批机制逐步实现 |
+当前最适合三类用户：
 
-### 4.2 当前典型场景
+1. 希望学习 Agent 工程实现的 Go 开发者；
+2. 需要小型私有知识助手的个人或小团队；
+3. 希望验证办公 Agent 安全边界的技术团队。
 
-1. 用户创建或选择一个对话。
-2. 用户输入问题，服务保存消息并创建一次 AgentRun。
-3. Eino ChatModelAgent 判断直接回答还是调用工具。
-4. 工具调用和结果实时展示，同时写入审计事件。
-5. 模型基于工具结果生成最终回答。
-6. 回答落库，Run 进入 completed、failed 或 cancelled 状态。
 
-知识库场景增加两条业务链：
 
-1. 用户上传文档，系统验证大小和 UTF-8，按内容哈希去重，分块并批量生成向量，最后事务入库。
-2. 对话涉及上传资料时，Agent 调用 `knowledge_search`，系统独立计算向量相似度与 BM25，用 RRF 融合后返回带文档名和分块序号的证据。
+### 4.2 核心业务场景
 
-长期记忆写入场景增加一条回答后增强链：
 
-1. 回答成功落库后，真实模型结构化提取最多 N 个候选；Mock 使用保守确定性规则。
-2. Memory Service 校验候选并按 `kind + memory_key` 查找同一事实槽位。
-3. 新事实创建、重复内容跳过、冲突值更新；用户手动修正后的记录禁止自动覆盖。
-4. 来源会话/消息写入 Memory，处理计数进入 RunEvent 和 SSE；提取失败不影响已经成功的回答。
 
-长期记忆召回场景增加一条回答前增强链：
+#### 场景 A：通用问题解决
 
-1. 用本轮问题检索未过期 Memory，计算词项相关性、重要性和时效性联合分数。
-2. 过滤低分项并选择 Top-K，总正文不超过 6,000 字符。
-3. 以不可信 JSON 背景数据注入独立 System Message；本轮输入与旧记忆冲突时优先本轮。
-4. RunEvent 只保存 Memory ID 与分数组件；召回失败退化为无记忆回答。
+用户通过对话提问。Agent 可以直接回答，或调用时间、计算器等工具。回答以 SSE 流式返回，执行全过程可查询。
 
-长对话增加一条跨轮上下文压缩链：
+#### 场景 B：基于文档回答
 
-1. 回答保存后按当前会话实际统计尚未摘要的消息数量，达到阈值才触发摘要。
-2. 最近消息保留原文，较早消息与已有摘要增量合并，并持久化覆盖到的 sequence。
-3. 下一轮只向模型发送会话摘要、相关长期记忆和最近原始消息；全部 Message 仍保留在数据库中。
-4. 历史内容按不可信 JSON 数据处理；摘要读取或生成失败时退化为最近原始消息，不影响正常回答。
+用户上传设计文档，询问发布日期、门禁或接口约束。Document Agent 检索最新可见版本，回答携带证据引用。
 
-多 Agent 模式增加一条可选协作链：
+#### 场景 C：个性化长期助手
 
-1. 用户通过 `ZORA_MULTI_AGENT_ENABLED=true` 显式开启，避免真实模型默认增加调用成本。
-2. Supervisor 判断直接回答或调用 Research、Document、Writer AgentTool；专业 Agent 只收到最小 `request`，不默认共享主会话完整历史。
-3. Research 只能调用时间、计算器和项目状态，Document 只能调用知识库，Writer 没有底层工具；复合文档写作按 Document → Writer 串行交接。
-4. 协作开始、专家输出和协作完成进入 SSE 与 RunEvent；专家草稿不拼进最终回答，只由 Supervisor 输出一次定稿。
-5. 彼此独立的子任务可在同一轮并行；每个根 Run 拥有独立交接次数、最大并行度、专家超时和重试预算，取消信号贯穿全部子任务。
-6. 每次交接创建 `AgentTaskRun`；高影响请求先创建 `ApprovalRequest` 并暂停，批准后恢复，拒绝或超时进入终态。
+用户表达“主要语言是 Go”“希望中文回答”。系统在成功回答后提取稳定事实，后续会话按问题相关性召回。
 
-办公只读场景增加一条 MCP 取证链：
+#### 场景 D：复合任务协作
 
-1. 部署者显式启用 MCP，并为每个 Server 配置命令、工具白名单和可透传环境变量。
-2. Zora 启动独立 stdio 子进程，只注册同时命中本地白名单且声明只读的工具。
-3. 文件请求由目录沙箱处理；邮件和日历请求由 Microsoft Graph 子进程使用 reader OAuth 身份查询。
-4. 连接器只返回元数据和正文摘要，并标记为不可信外部内容；Agent 忽略内容内嵌的指令、链接与权限请求。
-5. ToolCall/ToolResult 继续进入现有 RunEvent，不把令牌、命令或连接器环境写入模型上下文和公开接口。
+用户要求“核对发布文档并起草邮件”。Supervisor 先交给 Document Agent 取证，再交给 Writer Agent 生成结构化草稿。
 
-## 5. 业务能力模型
+#### 场景 E：安全办公自动化
 
-| 能力域 | 当前状态 | 说明 |
-|---|---|---|
-| 对话管理 | 已实现 | 创建、列表、重命名、删除和历史查询 |
-| 流式交互 | 已实现 | SSE 增量文本、工具轨迹、停止生成 |
-| Agent Runtime | 已实现 | Eino ReAct、最大迭代、上下文传递 |
-| 模型接入 | 已实现 | Mock 与 OpenAI-compatible Provider |
-| 多模型配置与选择 | 已实现 | 最多 20 个安全模型配置、环境变量密钥引用、请求级 Web/API 选择和实际模型 Run 审计 |
-| 工具系统 | 已实现 | 三个内置只读工具、知识库工具；MCP 工具使用 Server 名称空间、显式 allowlist 和 Schema 转换 |
-| 执行审计 | 已实现 | AgentRun 与 append-only RunEvent |
-| 本地持久化 | 已实现 | SQLite、WAL、事务与级联删除 |
-| 知识库本地 MVP | 已实现 | TXT/Markdown/PDF 文本层、版本化去重、递归重叠分块、Embedding、向量 + BM25/RRF、引用 |
-| RAG 检索与答案评测 | 已实现 | 三种召回指标，以及 Agent 答案的事实覆盖、有效引用覆盖、引用忠实度和联合门禁 |
-| PostgreSQL 知识库 | 已实现 | pgxpool、完整 Store、pgvector HNSW、FTS/GIN、RRF 候选融合 |
-| 知识库权限与版本 | 已实现 | owner/private/public、最新版检索、版本历史和删除最新版回退；完整登录与 tenant 隔离仍属平台层能力 |
-| 长期记忆底座 | 已实现 | Semantic/Episodic Schema、来源/重要性/过期字段、双存储和用户 CRUD |
-| 自动记忆写入 | 已实现 | 结构化/规则提取、Memory Key 去重与冲突更新、来源追踪、人工修正保护和审计 |
-| 记忆召回与注入 | 已实现 | 相关性/重要性/时效性联合评分、Top-K 安全注入、调试 API 和 Run 审计 |
-| 会话摘要与上下文压缩 | 已实现 | 阈值触发、增量合并、最近窗口、双存储、安全注入和审计 |
-| 记忆 A/B 评估 | 已实现 | 隔离数据集、完整 Chat Control/Treatment、预期/错误召回、事实增益、污染和延迟报告 |
-| 多 Agent 路由与协作 | 已实现 | Supervisor、三个专业 Agent、上下文/工具隔离、串行依赖、并行独立任务和协作审计 |
-| 多 Agent 生产治理 | 已实现 | 执行预算、并行限流、超时、有限重试、取消、父子 Run 和审批等待/恢复 |
-| 多 Agent 对照评测 | 已实现 | 路由闭环及单/多 Agent 的质量、调用次数代理、耗时比例门禁 |
-| MCP 办公底座 | 已实现 | 官方 Go SDK、stdio 生命周期、只读双门禁、子进程环境隔离和 RunEvent 审计 |
-| 文件连接器 | 已实现 | 目录沙箱、列表和 UTF-8 读取；拒绝隐藏路径、越界与符号链接逃逸 |
-| Microsoft 邮件/日历连接器 | 已实现 | Graph 邮件搜索/详情、日历窗口查询/详情；只返回摘要和元数据 |
-| 邮件/日程草稿预览 | 已实现 | 结构化校验、双数据库、可信 Run 来源、内容哈希幂等、REST 与 Web 草稿箱 |
-| 草稿级人工确认 | 已实现 | CAS 状态迁移、一次性批准/拒绝、不可变事件、REST/Web 与无外部副作用提示 |
-| Office Operation 执行内核 | 已实现 | 草稿唯一任务、稳定幂等键、租约/attempt、失败重试、启动恢复、SQLite/PostgreSQL 双审计 |
-| Graph 外部写适配 | 已实现、默认关闭 | 邮件两段式执行、日程 transactionId、远端引用检查点和失败恢复已通过本地测试 |
-| OAuth/Secret 上线准备 | 已实现 | `/.default` client credentials、Secret 文件、令牌刷新/失效、读写服务主体隔离和 Exchange RBAC Runbook |
-| Agent 运行指标 | 已实现 | 总耗时、首字延迟、模型调用、真实 Token Usage 完整度、工具调用/耗时和 Agent 交接统计 |
-| 运行监控面板 | 已实现 | 最近 Run 列表、状态和核心指标；REST 详情与 SSE 完成事件复用同一聚合逻辑 |
-| 真实租户上线 | 外部资源暂缓 | 缺少测试租户/邮箱和管理员授权，在线读写与范围外拒绝尚未执行；不阻塞其他版本开发 |
+Agent 只能生成内部草稿。用户在草稿箱确认后创建 Operation，专用写执行器才可能产生真实外部副作用。
 
-## 6. 业务模型
+### 4.3 业务价值链
 
-### 6.1 核心业务对象
+```mermaid
+flowchart LR
+    Input["用户问题 / 文档 / 偏好"] --> Understand["模型理解与任务规划"]
+    Understand --> Ground["知识、记忆、工具补充事实"]
+    Ground --> Collaborate["可选专业 Agent 协作"]
+    Collaborate --> Answer["流式答案 / 内部草稿"]
+    Answer --> Control["审批与外部执行边界"]
+    Control --> Audit["Run、事件、指标与评测"]
+    Audit --> Improve["调优 Prompt、检索和路由"]
+```
 
-| 对象 | 含义 | 生命周期 |
-|---|---|---|
-| Conversation | 一个持续的用户对话空间 | 创建后持续存在，可重命名或删除 |
-| Message | 用户可见的对话消息 | 追加写入，随 Conversation 删除 |
-| AgentRun | 一次用户请求对应的一次根 Agent 执行 | running → completed/failed/cancelled/rejected |
-| AgentTaskRun | 根 Run 下的一次专业 Agent 交接 | running → completed/failed/cancelled；保存任务与输出摘要 |
-| RunEvent | Run 内部发生的可观察事实 | append-only，随 AgentRun 删除 |
-| RunMetrics | 由 AgentRun 与 RunEvent 派生的运行快照 | 查询时聚合，不复制一份易失真的指标表；随底层事件自然更新 |
-| Tool | Agent 可选择的受控能力 | 启动时注册；外部系统工具只读，草稿工具只写 Zora 内部预览 |
-| MCPServer | 独立运行的办公连接器进程 | 启动握手 → 工具发现/调用 → 应用退出时关闭 |
-| MCPToolAdapter | MCP Tool 到 Eino Tool 的命名空间与 Schema 适配 | 启动时创建，只允许白名单且声明只读的工具 |
-| MicrosoftConnector | Graph 邮件和日历适配器 | 子进程独占 Secret/TokenSource；reader 默认只读，writer 仅供 OfficeExecutor |
-| MicrosoftTokenSource | Microsoft 子进程内的鉴权边界 | 短期令牌/文件/OAuth 三选一；缓存、提前刷新、401 失效，不持久化 Token |
-| OfficeDraft | 邮件或日程参数快照 | draft → pending_confirmation → approved/rejected；执行时再进入 executing/completed/failed |
-| OfficeDraftEvent | 草稿状态迁移的不可变审计记录 | 每次提交、决定和执行迁移追加一条，随草稿级联删除 |
-| OfficeOperation | approved 草稿对应的唯一持久化外部写任务 | pending/failed → executing → completed/failed；重试复用幂等键 |
-| OfficeOperationEvent | 执行任务状态与 attempt 的追加式审计 | 创建、领取、失败、重试和完成各追加一条 |
-| OfficeExecutor | 审批后专用外部写权限边界 | 默认关闭；只接受固定 MCP 写协议，不向模型公开工具 |
-| Specialist Agent | Research/Document/Writer 专业执行单元 | 启动时组装，通过 AgentTool 接收 request，执行后返回交付物 |
-| Agent Handoff | Supervisor 与专业 Agent 的一次结构化交接 | started → agent output → completed；关联 AgentTaskRun 与顶层 RunEvent |
-| ApprovalRequest | 高影响请求的人工审批记录 | pending → approved/rejected/expired；决定可恢复等待中的 Run |
-| Model Provider | 生成回答和工具决策的模型来源 | 由环境配置选择 |
-| KnowledgeDocument | 一份完成索引的不可变文档版本 | 同 owner + name 形成版本链；仅最新版参与默认列表/检索，删除最新版恢复上一版 |
-| KnowledgeChunk | 可检索、可引用的原文片段 | 与文档在同一事务创建，随文档级联删除 |
-| Memory | 经筛选的长期事实、偏好或事件 | 可由对话提取或手动创建、编辑、过期和删除；同 Key 候选执行合并 |
-| ConversationSummary | 一段对话较早历史的增量压缩结果 | 达到阈值后 Upsert，随 Conversation 级联删除；不删除原始 Message |
 
-### 6.2 对象关系
+
+
+
+### 4.4 输入、处理、输出与安全边界
+
+
+| 类别     | 内容                                                                 |
+| ------ | ------------------------------------------------------------------ |
+| 输入     | 用户消息、上传文档、手工记忆、模型选择、审批决定                                           |
+| 处理     | 上下文构建、模型调用、ToolCall、检索、记忆召回、Agent 交接                               |
+| 内部输出   | 对话答案、RunEvent、知识索引、Memory、Summary、Draft                            |
+| 外部输出   | 仅专用 Executor 在显式启用并确认后发送邮件或创建日程                                    |
+| 默认安全边界 | Mock、SQLite、Office Executor disabled、MCP disabled、多 Agent disabled |
+
+
+
+
+### 4.5 核心业务规则
+
+1. 用户消息先持久化，再启动 AgentRun；
+2. 同一会话同一时刻只执行一个发送请求；
+3. 请求只能选择服务端注册的模型 ID；
+4. 知识检索只能访问可信主体可见的最新版文档；
+5. 记忆只在本轮回答成功后自动提取；
+6. 用户手工编辑的 Memory 不被自动流程覆盖；
+7. 专业 Agent 只能使用职责内工具；
+8. 高影响多 Agent 请求可在执行前等待人工审批；
+9. Agent 只能创建 Draft，不能直接调用 Graph 写工具；
+10. 外部 Operation 只有获得可核验远端引用后才能完成；
+11. Token 只记录 Provider 返回值，缺失时不伪造估算；
+12. 规划能力不以空接口冒充已完成。
+
+
+
+## 5. 领域模型
+
+
+
+### 5.1 聚合划分
+
+
+| 聚合           | 核心实体                                      | 职责                  |
+| ------------ | ----------------------------------------- | ------------------- |
+| Conversation | Conversation、Message、Summary              | 用户可见对话与长上下文         |
+| Execution    | AgentRun、AgentTaskRun、RunEvent、Approval   | 一次 Agent 执行、专业交接和审计 |
+| Knowledge    | Document、Chunk                            | 文档版本、权限、向量与引用       |
+| Memory       | Memory                                    | 跨会话稳定事实与事件          |
+| Office       | Draft、DraftEvent、Operation、OperationEvent | 草稿确认和外部写任务          |
+
+
+
+
+### 5.2 为什么要拆分这些聚合
+
+- Conversation 的生命周期由用户管理；Run 的生命周期由一次请求管理；
+- Knowledge 是外部事实来源，Memory 是与用户相关的长期信息，不能混成同一向量库；
+- Draft 是可编辑/可确认内容，Operation 是可重试的外部副作用任务，两者状态语义不同；
+- Event 是追加审计，实体表保存当前状态，二者查询模式不同。
+
+
+
+### 5.3 关系图
 
 ```mermaid
 erDiagram
     CONVERSATION ||--o{ MESSAGE : contains
     CONVERSATION ||--o{ AGENT_RUN : starts
-    MESSAGE ||--o| AGENT_RUN : triggers
+    CONVERSATION ||--o| CONVERSATION_SUMMARY : compresses
     AGENT_RUN ||--o{ RUN_EVENT : records
     AGENT_RUN ||--o{ AGENT_TASK_RUN : delegates
-    AGENT_RUN ||--o{ APPROVAL_REQUEST : gates
-    AGENT_RUN }o--o| MESSAGE : produces
-
-    CONVERSATION {
-        string id PK
-        string title
-        datetime created_at
-        datetime updated_at
-    }
-    MESSAGE {
-        int sequence PK
-        string id UK
-        string conversation_id FK
-        string role
-        text content
-        datetime created_at
-    }
-    AGENT_RUN {
-        string id PK
-        string conversation_id FK
-        string user_message_id FK
-        string assistant_message_id
-        string status
-        string model
-        text error
-    }
-    RUN_EVENT {
-        int sequence PK
-        string id UK
-        string run_id FK
-        string type
-        string agent_name
-        string tool_name
-        json payload
-    }
-    AGENT_TASK_RUN {
-        string id PK
-        string parent_run_id FK
-        string agent_name
-        string tool_call_id UK
-        string status
-        text task
-        text output_preview
-    }
-    APPROVAL_REQUEST {
-        string id PK
-        string run_id FK
-        string status
-        text trigger_reason
-        text decision_reason
-    }
-```
-
-知识库对象独立于对话，因此同一文档能够被多个 Conversation 复用：
-
-```mermaid
-erDiagram
-    KNOWLEDGE_DOCUMENT ||--|{ KNOWLEDGE_CHUNK : contains
-    KNOWLEDGE_DOCUMENT {
-        string id PK
-        string version_group_id
-        int version
-        bool is_latest
-        string content_hash UK
-        string owner_id
-        string visibility
-        string embedding_model
-        int embedding_dimensions
-        int chunk_count
-    }
-    KNOWLEDGE_CHUNK {
-        string id UK
-        string document_id FK
-        int ordinal
-        text content
-        json embedding
-        json term_counts
-    }
-```
-
-长期记忆不是 Message 的别名。Memory 可以引用来源会话/消息，但删除来源时只清空引用，不删除用户已经确认的长期记忆：
-
-```mermaid
-erDiagram
-    CONVERSATION o|--o{ MEMORY : source
-    MESSAGE o|--o{ MEMORY : source
-    MEMORY {
-        string id PK
-        string kind
-        string memory_key
-        text content
-        float importance
-        bool user_edited
-        string source_type
-        datetime expires_at
-        datetime created_at
-        datetime updated_at
-    }
-```
-
-会话摘要与对话一一对应，只记录压缩结果和覆盖边界；原始 Message 继续作为审计与重新生成来源：
-
-```mermaid
-erDiagram
-    CONVERSATION ||--o| CONVERSATION_SUMMARY : compresses
-    CONVERSATION_SUMMARY {
-        string conversation_id PK
-        text content
-        int through_sequence
-        int message_count
-        string model
-        datetime updated_at
-    }
-```
-
-办公写链路把草稿、执行任务和两类审计分开；确认成功不会直接触发外部副作用：
-
-```mermaid
-erDiagram
+    AGENT_RUN ||--o| APPROVAL_REQUEST : may_wait_for
+    MESSAGE ||--o| AGENT_RUN : triggers
+    CONVERSATION ||--o{ MEMORY : sources
+    MESSAGE ||--o{ MEMORY : sources
+    KNOWLEDGE_DOCUMENT ||--o{ KNOWLEDGE_CHUNK : contains
+    AGENT_RUN ||--o{ OFFICE_DRAFT : creates
+    OFFICE_DRAFT ||--o{ OFFICE_DRAFT_EVENT : transitions
     OFFICE_DRAFT ||--o| OFFICE_OPERATION : prepares
-    OFFICE_DRAFT ||--o{ OFFICE_DRAFT_EVENT : records
     OFFICE_OPERATION ||--o{ OFFICE_OPERATION_EVENT : records
-    OFFICE_DRAFT {
-        string id PK
-        string status
-        string content_hash
-        json payload
-    }
-    OFFICE_OPERATION {
-        string id PK
-        string draft_id UK
-        string idempotency_key UK
-        string status
-        int attempt
-        datetime lease_until
-        string external_reference
-    }
 ```
 
-### 6.3 AgentRun 状态模型
+
+
+
+
+## 6. 数据模型
+
+数据定义可在 `[internal/store/sqlite/sqlite.go](../internal/store/sqlite/sqlite.go)` 和 `[internal/store/postgres/schema.go](../internal/store/postgres/schema.go)` 查看。
+
+### 6.1 对话与执行数据
+
+
+
+#### conversations
+
+
+| 字段                      | 含义        |
+| ----------------------- | --------- |
+| id                      | 对话 ID     |
+| title                   | 展示标题      |
+| created_at / updated_at | 创建与最后更新时间 |
+
+
+
+
+#### messages
+
+
+| 字段                       | 含义                      |
+| ------------------------ | ----------------------- |
+| sequence                 | 单调递增序号，用于历史顺序和摘要覆盖范围    |
+| id                       | 消息 ID                   |
+| conversation_id          | 所属对话                    |
+| role                     | user / assistant / tool |
+| content                  | 用户可见内容                  |
+| tool_name / tool_call_id | 可选工具关联                  |
+| created_at               | 创建时间                    |
+
+
+
+
+#### agent_runs
+
+
+| 字段                        | 含义                                                  |
+| ------------------------- | --------------------------------------------------- |
+| id                        | 根 Run ID                                            |
+| conversation_id           | 所属对话                                                |
+| user_message_id           | 触发消息                                                |
+| assistant_message_id      | 成功后对应回答                                             |
+| status                    | running / completed / failed / cancelled / rejected |
+| model                     | 实际使用模型                                              |
+| error                     | 失败原因                                                |
+| started_at / completed_at | 执行时间范围                                              |
+
+
+
+
+#### agent_task_runs
+
+保存专业 Agent 子任务：父 Run、Agent 名称、ToolCall ID、任务、attempt、状态、输出摘要和错误。`parent_run_id + tool_call_id` 唯一，避免同一次交接重复建子 Run。
+
+#### run_events
+
+保存追加式执行事实：Run、event type、agent/tool name、JSON payload、sequence 和时间。它是工具轨迹、模型 Usage、首字延迟和交接耗时的基础。
+
+#### approval_requests
+
+保存根 Run 级审批：触发原因、pending/approved/rejected/expired 状态、决定说明和时间。状态迁移使用条件更新阻止重复决定。
+
+### 6.2 上下文数据
+
+
+
+#### conversation_summaries
+
+
+| 字段               | 含义          |
+| ---------------- | ----------- |
+| conversation_id  | 每个会话一份当前摘要  |
+| content          | 压缩后的历史事实与约束 |
+| through_sequence | 已覆盖到的消息序号   |
+| message_count    | 本次累计覆盖数量    |
+| model            | 摘要模型        |
+| updated_at       | 最后更新时间      |
+
+
+
+
+#### memories
+
+
+| 字段                                         | 含义                    |
+| ------------------------------------------ | --------------------- |
+| kind                                       | semantic 或 episodic   |
+| memory_key                                 | 稳定事实槽位，用于合并冲突         |
+| content                                    | 记忆正文                  |
+| importance                                 | 0–1 重要性               |
+| user_edited                                | 是否被用户手动修改             |
+| source_type                                | manual 或 conversation |
+| source_conversation_id / source_message_id | 来源追踪                  |
+| expires_at                                 | 可选过期时间                |
+
+
+
+
+### 6.3 知识数据
+
+
+
+#### knowledge_documents
+
+
+| 字段组                                  | 含义                |
+| ------------------------------------ | ----------------- |
+| id、name、source_type、mime_type        | 文档身份与来源           |
+| version_group_id、version、is_latest   | 版本链               |
+| content_hash                         | 内容去重              |
+| owner_id、visibility                  | private/public 权限 |
+| embedding_model、embedding_dimensions | 索引兼容性             |
+| chunk_count                          | 分块数量              |
+
+
+
+
+#### knowledge_chunks
+
+
+| 字段组                                        | 含义               |
+| ------------------------------------------ | ---------------- |
+| document_id、ordinal                        | 所属文档和顺序          |
+| content、start_rune、end_rune                | 原文与 Unicode 引用范围 |
+| embedding                                  | 向量               |
+| term_counts / search_terms / search_vector | 关键词检索特征          |
+| token_count                                | 分块规模             |
+
+
+PostgreSQL 为 embedding 建 HNSW，为 search_vector 建 GIN。SQLite 保存向量与词频并在进程内精确计算。
+
+### 6.4 Office 数据
+
+
+
+#### office_drafts / office_draft_events
+
+Draft 保存邮件或日程的规范化 JSON、来源 Run、内容哈希和状态。`source_run_id + content_hash` 唯一，用于吸收模型重试。DraftEvent 保存每次不可变迁移。
+
+#### office_operations / office_operation_events
+
+Operation 与 Draft 一对一，保存稳定幂等键、executor、attempt、lease、远端引用和错误。OperationEvent 记录每次领取、检查点、成功和失败。
+
+### 6.5 为什么当前不建立统一 JSON 大表
+
+Agent 系统容易把所有状态塞进一张 `runs(metadata JSON)`。Zora 保留 JSON payload 作为扩展字段，但对 Conversation、Memory、Document、Draft 和 Operation 使用明确列与约束，原因是：
+
+- 关键状态可以由数据库 CHECK/UNIQUE 保护；
+- 更容易查询过期记忆、待执行 Operation 和最新版文档；
+- 领域对象的生命周期更清晰；
+- 面试和维护时可以解释一致性边界。
+
+
+
+## 7. 关键功能与核心流程
+
+
+
+### 7.1 核心对话流程
 
 ```mermaid
-stateDiagram-v2
-    [*] --> running: 保存用户消息并创建 Run
-    running --> completed: 回答及完成事件落库
-    running --> failed: 模型、工具或持久化失败
-    running --> cancelled: 客户端断开或执行超时
-    running --> rejected: 人工审批拒绝
-    completed --> [*]
-    failed --> [*]
-    cancelled --> [*]
-    rejected --> [*]
+sequenceDiagram
+    participant U as User
+    participant H as HTTP/SSE
+    participant C as Chat Service
+    participant S as Store
+    participant R as Runtime
+    participant M as Model
+    participant T as Tool
+
+    U->>H: message + model_id
+    H->>C: SendWithModel(ctx)
+    C->>C: 获取 conversation 级锁
+    C->>S: 保存 user Message
+    C->>S: 创建 running AgentRun
+    C->>S: 读取 Summary、最近消息、相关 Memory
+    C->>R: Execute(context)
+    R->>M: 历史 + 系统约束 + Tool Schema
+    opt 模型需要工具
+        M-->>R: ToolCall
+        R-->>H: tool_call
+        R->>T: InvokableRun(ctx)
+        T-->>R: ToolResult
+        R-->>H: tool_result
+        R->>M: ToolResult
+    end
+    M-->>R: streamed chunks
+    R-->>H: delta
+    C->>S: 保存 assistant Message
+    C->>S: Run completed + events
+    C->>S: 成功后 Capture Memory / Update Summary
+    C-->>H: done + metrics
 ```
 
-终态不会重新回到 running。浏览器断开时，服务使用一个短时独立 Context 补写终态，避免产生永久运行中的脏数据。
 
-## 7. 数据模型
 
-### 7.1 conversations
+关键点：
 
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `conv_` 前缀的随机 ID |
-| `title` | TEXT | NOT NULL | 默认“新对话”，首条消息后自动命名 |
-| `created_at` | TEXT | NOT NULL | UTC RFC3339Nano |
-| `updated_at` | TEXT | NOT NULL | 新消息或重命名时更新，用于列表排序 |
+- 用户消息先保存，失败请求也有可追踪输入；
+- Context 从 HTTP 传到模型与工具；
+- Run 必须进入明确终态；
+- Memory 和 Summary 属于回答后的增强任务，失败不推翻已成功回答；
+- 内部 ToolCall 不反复写进下一轮用户历史。
 
-### 7.2 messages
 
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `sequence` | INTEGER | PK AUTOINCREMENT | 保证稳定的消息顺序 |
-| `id` | TEXT | UNIQUE | `msg_` 前缀 ID |
-| `conversation_id` | TEXT | FK | 删除 Conversation 时级联删除 |
-| `role` | TEXT | CHECK | `user`、`assistant` 或 `tool` |
-| `content` | TEXT | NOT NULL | 用户可见正文 |
-| `tool_name` | TEXT | NOT NULL | Tool 消息预留字段 |
-| `tool_call_id` | TEXT | NOT NULL | ToolCall 关联 ID |
-| `created_at` | TEXT | NOT NULL | 创建时间 |
 
-V0.1 的主消息历史只写 user 和最终 assistant 消息。中间工具轨迹写入 RunEvent，避免对话上下文被内部事件快速撑大。
+### 7.2 RAG 摄取与查询
 
-### 7.3 agent_runs
+```mermaid
+flowchart TD
+    Upload["上传文件"] --> Validate["类型、大小、编码校验"]
+    Validate --> Hash["SHA-256 去重"]
+    Hash --> Version["建立/推进版本链"]
+    Version --> Chunk["Unicode 重叠分块"]
+    Chunk --> Embed["批量 Embedding"]
+    Embed --> Persist["Document + Chunks 原子保存"]
+    Query["用户问题"] --> QueryEmbed["问题向量 + 词项"]
+    QueryEmbed --> Vector["向量候选"]
+    QueryEmbed --> Keyword["BM25 / FTS 候选"]
+    Vector --> RRF["RRF 融合"]
+    Keyword --> RRF
+    RRF --> ACL["可信主体 + 最新版过滤"]
+    ACL --> Evidence["原文、文档、区间引用"]
+    Evidence --> Agent["knowledge_search ToolResult"]
+```
 
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `run_` 前缀 ID |
-| `conversation_id` | TEXT | FK | 所属对话 |
-| `user_message_id` | TEXT | FK | 触发该 Run 的消息 |
-| `assistant_message_id` | TEXT | Nullable | 成功后生成的回答 |
-| `status` | TEXT | NOT NULL | running/completed/failed/cancelled/rejected |
-| `model` | TEXT | NOT NULL | 本次执行使用的模型 |
-| `error` | TEXT | NOT NULL | 失败原因，成功时为空 |
-| `started_at` | TEXT | NOT NULL | 开始时间 |
-| `completed_at` | TEXT | Nullable | 进入终态的时间 |
 
-### 7.3.1 agent_task_runs
 
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `task_` 前缀的子 Run ID |
-| `parent_run_id` | TEXT | FK | 所属根 Run，删除根 Run 时级联删除 |
-| `agent_name` / `tool_call_id` | TEXT | NOT NULL / UNIQUE(parent, call) | 专业 Agent 与交接关联 |
-| `task` | TEXT | NOT NULL | 从结构化 request 提取的任务，最多持久化 2,000 字符 |
-| `status` / `attempt` | TEXT / INTEGER | NOT NULL | 终态与当前实现的执行轮次 |
-| `output_preview` / `error` | TEXT | NOT NULL | 最多 1,000 字符交付物摘要或失败原因 |
-| `started_at` / `completed_at` | TEXT | NOT NULL / Nullable | 用于计算子任务耗时 |
 
-### 7.3.2 approval_requests
 
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `approval_` 前缀 ID |
-| `run_id` / `conversation_id` / `user_message_id` | TEXT | FK | 审批与请求事实的关联 |
-| `status` | TEXT | CHECK | pending/approved/rejected/expired |
-| `trigger_reason` / `decision_reason` | TEXT | NOT NULL | 触发策略和人工决定说明 |
-| `requested_at` / `decided_at` | TEXT | NOT NULL / Nullable | 等待和决策时间 |
-
-### 7.4 run_events
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `sequence` | INTEGER | PK AUTOINCREMENT | 全局事件落库顺序 |
-| `id` | TEXT | UNIQUE | `evt_` 前缀 ID |
-| `run_id` | TEXT | FK | 所属执行 |
-| `type` | TEXT | NOT NULL | 事件类型 |
-| `agent_name` | TEXT | NOT NULL | 当前产生事件的 Agent |
-| `tool_name` | TEXT | NOT NULL | 工具事件对应名称 |
-| `payload` | TEXT | JSON 内容 | 事件扩展数据 |
-| `created_at` | TEXT | NOT NULL | 事件发生时间 |
-
-持久事件包括：`run_started`、审批状态、工具/交接、`model_output` 和各类根 Run 终态。交接开始/完成 payload 包含 `child_run_id`；token 级 `delta` 只通过 SSE 发送，不逐条落库。
-
-### 7.5 knowledge_documents
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `doc_` 前缀 ID |
-| `name` | TEXT | NOT NULL | 显示文档名 |
-| `source_type` | TEXT | NOT NULL | 当前为 `upload` |
-| `mime_type` | TEXT | NOT NULL | `text/plain` 或 `text/markdown` |
-| `content_hash` | TEXT | UNIQUE | SHA-256，用于内容去重 |
-| `embedding_model` | TEXT | NOT NULL | 索引使用的向量空间标识 |
-| `embedding_dimensions` | INTEGER | NOT NULL | 索引向量维度，用于变更检测 |
-| `chunk_count` | INTEGER | NOT NULL | 分块数 |
-| `created_at` / `updated_at` | TEXT | NOT NULL | UTC RFC3339Nano |
-
-### 7.6 knowledge_chunks
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `sequence` | INTEGER | PK AUTOINCREMENT | 稳定扫描顺序 |
-| `id` | TEXT | UNIQUE | `chunk_` 前缀 ID |
-| `document_id` | TEXT | FK | 删除 Document 时级联删除 |
-| `ordinal` | INTEGER | UNIQUE(document, ordinal) | 文档内从 0 开始的片段序号 |
-| `content` | TEXT | NOT NULL | 可引用原文 |
-| `start_rune` / `end_rune` | INTEGER | NOT NULL | 归一化文本中的 Unicode 字符区间 |
-| `embedding_model` | TEXT | NOT NULL | 用于防止向量空间混用 |
-| `embedding` | TEXT | JSON 数组 | 本地 MVP 的稠密向量 |
-| `term_counts` | TEXT | JSON 对象 | BM25 词频；中文使用单字 + 双字特征 |
-| `token_count` | INTEGER | NOT NULL | BM25 文档长度 |
-
-SQLite 中向量和词频使用 JSON，以保持零运维；PostgreSQL 中 `embedding` 使用 `vector(N)`，并增加 `search_terms`、stored generated `search_vector`、HNSW 与 GIN 索引。两个实现共享同一 Document/Chunk 领域模型。
-
-### 7.7 memories
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `mem_` 前缀 ID |
-| `kind` | TEXT | CHECK | `semantic` 或 `episodic` |
-| `memory_key` | TEXT | NOT NULL | 自动合并的稳定事实槽位；手动创建可为空 |
-| `content` | TEXT | NOT NULL | 经筛选的记忆正文，最多 2,000 字符 |
-| `importance` | REAL/DOUBLE | CHECK 0–1 | 联合召回 20% 权重的重要性信号 |
-| `user_edited` | BOOLEAN/INTEGER | NOT NULL | 人工修正保护；为真时自动候选不得覆盖 |
-| `source_type` | TEXT | CHECK | 手动创建为 `manual`，自动提取使用 `conversation` |
-| `source_conversation_id` | TEXT | Nullable FK | 来源会话，删除会话时置空 |
-| `source_message_id` | TEXT | Nullable FK | 来源消息，删除消息时置空 |
-| `created_at` / `updated_at` | 时间 | NOT NULL | 生命周期与时效性信号 |
-| `expires_at` | 时间 | Nullable | 可选过期时间；普通列表默认排除过期项 |
-
-来源字段在用户编辑时保持不可变，防止手动记忆伪造为模型自动提取结果；编辑会设置 `user_edited=true`，后续自动 Consolidation 必须跳过。当前没有向量列：在真正确定召回算法、Embedding 迁移和评估方案前，不提前把聊天历史变成不可控的向量副本。
-
-### 7.8 conversation_summaries
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `conversation_id` | TEXT | PK/FK | 每个对话最多一份摘要；删除对话时级联删除 |
-| `content` | TEXT | NOT NULL | 增量合并后的会话摘要 |
-| `through_sequence` | INTEGER/BIGINT | >= 0 | 已被摘要覆盖的最后一条 Message sequence |
-| `message_count` | INTEGER | >= 0 | 累计进入摘要的消息数 |
-| `model` | TEXT | NOT NULL | 生成当前摘要的模型标识 |
-| `updated_at` | 时间 | NOT NULL | 最近成功更新摘要的时间 |
-
-该表不替代 `messages`。上下文加载时仅用 `through_sequence` 过滤重复发送给模型的早期消息，查询消息历史仍可获得完整原文。
-
-### 7.9 office_drafts
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `draft_` 前缀 ID |
-| `kind` | TEXT | CHECK | `email` 或 `calendar` |
-| `status` | TEXT | CHECK | `draft/pending_confirmation/approved/executing/completed/rejected/failed/cancelled` |
-| `conversation_id` | TEXT | Nullable FK | 来源会话，删除会话时置空而不删除用户草稿 |
-| `source_run_id` | TEXT | Nullable FK | 创建草稿的可信根 Run，由 Chat Context 注入 |
-| `title` | TEXT | NOT NULL | 邮件主题或日程主题 |
-| `payload` | TEXT/JSONB | 合法 JSON | 规范化收件人、正文、时间窗、参与人等参数 |
-| `content_hash` | TEXT | NOT NULL | Kind + 规范化 Payload 的 SHA-256 |
-| `created_at` / `updated_at` | 时间 | NOT NULL | 创建和最近更新时间 |
-
-`UNIQUE(source_run_id, content_hash)` 使同一 Agent Run 的工具重试返回已有草稿。Store 使用 compare-and-swap 推进状态，删除 SQL 再次限制 `status='draft'`；`approved` 只表示人工决定已记录，只有 Operation 成功提交后才进入 `completed`。
-
-### 7.10 office_draft_events
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `draft_event_` 前缀事件 ID |
-| `draft_id` | TEXT | FK | 归属草稿；删除草稿时级联删除 |
-| `from_status` / `to_status` | TEXT | NOT NULL | 迁移前后状态 |
-| `actor` | TEXT | NOT NULL | 当前为 `user`；接入鉴权后替换为主体 ID |
-| `reason` | TEXT | NOT NULL | 提交或人工决定原因，最多 500 字符 |
-| `created_at` | 时间 | NOT NULL | 决定时间 |
-
-状态更新与事件插入在同一 SQLite/PostgreSQL 事务提交；状态不匹配返回 409。因此两个并发决定不会同时成功，也不会出现“状态已变但审计事件丢失”的半完成结果。
-
-### 7.11 office_operations
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `office_operation_` 前缀任务 ID |
-| `draft_id` | TEXT | UNIQUE/FK | 每份草稿最多一个执行任务 |
-| `kind` / `status` | TEXT | CHECK | 邮件/日程；pending、executing、completed、failed |
-| `idempotency_key` | TEXT | UNIQUE | 草稿 ID + 内容哈希生成的 SHA-256，所有重试保持不变 |
-| `executor_name` / `attempt` | TEXT/INTEGER | NOT NULL | 最近执行器与领取次数 |
-| `lease_owner` / `lease_until` | TEXT/时间 | 内部字段 | 防止并发重复领取，API 不暴露 owner |
-| `external_reference` | TEXT | NOT NULL | 成功后的远端邮件/日程引用 |
-| `last_error` | TEXT | NOT NULL | 最近一次失败原因，最多保存 2,000 字符 |
-| `created_at` / `updated_at` / `completed_at` | 时间 |  | 生命周期时间 |
-
-创建使用 `draft_id` 唯一约束吸收并发请求。领取时 Operation 与 Draft 同时进入 executing；完成或失败时两者和两类事件同事务提交。执行器未配置时不会领取任务，pending 与 attempt=0 保持不变。
-
-### 7.12 office_operation_events
-
-| 字段 | 类型 | 约束 | 说明 |
-|---|---|---|---|
-| `id` | TEXT | PK | `operation_event_` 前缀事件 ID |
-| `operation_id` | TEXT | FK | 归属执行任务 |
-| `from_status` / `to_status` | TEXT | NOT NULL | 任务状态迁移 |
-| `attempt` | INTEGER | >= 0 | 对应领取次数；创建事件为 0 |
-| `actor` / `reason` / `created_at` | TEXT/时间 | NOT NULL | 操作者、中文原因和时间 |
-
-## 8. 技术架构
+### 7.3 长期记忆生命周期
 
 ```mermaid
 flowchart LR
-    Browser["Web UI"] -->|"JSON / SSE"| HTTP["httpapi"]
-    HTTP --> Chat["chat.Service"]
-    HTTP --> Knowledge["knowledge.Service"]
-    HTTP --> Memory["memory.Service"]
-    HTTP --> Office["office.Service"]
-    Chat --> Summary["summary.Service"]
-    Chat --> Runtime["agentruntime.Runtime"]
-    Runtime --> ADK["Eino ChatModelAgent"]
-    ADK --> Model["Mock / OpenAI-compatible Model"]
-    ADK --> Tools["Read-only Tool Allowlist"]
-    Tools --> Knowledge
-    Tools --> Office
-    Chat --> Store["store.Store"]
-    Knowledge --> KStore["knowledge.Store"]
-    Memory --> MStore["memory.Store"]
-    Summary --> SStore["summary.Store"]
-    Office --> OStore["office.Store"]
-    Store --> SQLite["SQLite"]
-    KStore --> SQLite
-    MStore --> SQLite
-    SStore --> SQLite
-    OStore --> SQLite
-    Store --> PostgreSQL["PostgreSQL"]
-    KStore --> PostgreSQL
-    MStore --> PostgreSQL
-    SStore --> PostgreSQL
-    OStore --> PostgreSQL
-    PostgreSQL --> PGVector["pgvector HNSW + FTS GIN"]
-    Knowledge --> Embedder["Hash / OpenAI Embedder"]
-    EvalCLI["zora-eval"] --> RAGEval["rageval"]
-    EvalCLI --> Knowledge
-    MemoryEvalCLI["zora-memory-eval"] --> MemoryEval["memoryeval"]
-    MemoryEvalCLI --> Chat
-    MemoryEval --> Memory
-    AgentEvalCLI["zora-agent-eval"] --> AgentEval["agentseval"]
-    AgentEvalCLI --> Chat
-    AgentEvalCLI --> Runtime
-    Runtime --> Supervisor["Supervisor"]
-    Supervisor --> Specialists["Research / Document / Writer"]
-    Runtime --> MCPBridge["mcpbridge"]
-    MCPBridge --> MCPFiles["文件 MCP Server"]
-    MCPBridge --> MCPMicrosoft["Microsoft Graph MCP Server"]
-    MCPMicrosoft --> Graph["Microsoft Graph"]
-
-    Runtime -. "领域事件" .-> Chat
-    Chat -. "SSE 事件" .-> HTTP
+    Success["回答成功"] --> Extract["规则/模型提取候选"]
+    Extract --> Validate["类型、Key、重要性校验"]
+    Validate --> Existing{"同 kind + key 已存在?"}
+    Existing -- 否 --> Create["创建 Memory"]
+    Existing -- 是 --> Edited{"user_edited?"}
+    Edited -- 是 --> Skip["保护人工修正"]
+    Edited -- 否 --> Merge["冲突合并/更新"]
+    Question["后续问题"] --> Recall["相关性 + 重要性 + 时效性"]
+    Recall --> Threshold["Top-K + 最低门槛"]
+    Threshold --> Inject["作为不可信数据注入上下文"]
 ```
 
-### 8.1 分层职责
 
-| 层 | 包 | 职责 |
-|---|---|---|
-| 启动层 | `cmd/zora` | 依赖组装、HTTP Server、信号和优雅关闭 |
-| 传输层 | `internal/httpapi` | REST、SSE、输入限制、安全头、静态 UI |
-| 应用层 | `internal/chat` | 用例编排、执行顺序、状态落库、会话锁 |
-| Agent 适配层 | `internal/agentruntime` | Eino 组装、模型选择、事件归一化 |
-| 能力层 | `internal/agenttools` | 工具 Schema、校验和安全执行 |
-| 知识库应用层 | `internal/knowledge` | 分块、Embedding 适配、混合召回、引用与 Agent Tool |
-| RAG 评测层 | `internal/rageval` | 固定集校验、检索指标、答案引用/忠实度和联合门禁 |
-| 记忆应用层 | `internal/memory` | Semantic/Episodic 模型、候选提取、Consolidation、联合召回、输入校验和用户 CRUD |
-| Memory 评测层 | `internal/memoryeval` | Control/Treatment 编排、召回/事实/污染指标、报告和门禁 |
-| Multi-Agent 评测层 | `internal/agentseval` | 路由序列、答案质量、调用次数代理、耗时对照、报告和门禁 |
-| 人工审批层 | `internal/approval` | 高影响策略、持久请求、等待/恢复和一次性决策 |
-| 摘要应用层 | `internal/summary` | 触发窗口、增量摘要、Model/Rule Summarizer 和持久化边界 |
-| MCP 适配层 | `internal/mcpbridge` | stdio 生命周期、工具发现、只读白名单、Schema 与 Eino 适配 |
-| MCP 连接器层 | `internal/mcpfiles`、`internal/mcpmicrosoft` | 文件目录沙箱；Graph 邮件/日历只读查询、Token 隔离与外部内容标记 |
-| 办公应用层 | `internal/office` | 草稿校验、确认状态机、Operation 幂等键、执行器门禁、租约恢复与双审计 |
-| 领域层 | `internal/domain` | Conversation、Message、Run、Event |
-| 持久化抽象 | `internal/store` | Store 接口和统一错误 |
-| 基础设施层 | `internal/store/sqlite` | SQLite DDL、查询、事务和映射 |
-| 基础设施层 | `internal/store/postgres` | pgxpool、迁移、业务 Store、HNSW/FTS 候选召回 |
 
-### 8.2 关键技术选型
 
-| 选型 | 当前方案 | 原因 |
-|---|---|---|
-| 主语言 | Go | 并发、网络服务、部署和类型约束能力强 |
-| Agent 框架 | Eino ADK | Go 原生、ReAct、Tool、流式事件及后续多 Agent 能力 |
-| 模型协议 | OpenAI-compatible | 可连接通义千问及其他兼容模型 |
-| 本地数据库 | SQLite | 零运维，便于演示、测试和 RAG 纵向切片 |
-| 生产数据库 | PostgreSQL + pgvector | 多连接持久化、HNSW 向量索引和 GIN 全文索引 |
-| 检索 | SQLite 精确扫描 / PostgreSQL 候选下推 + RRF | 两后端共享融合规则，能用固定集做迁移回归 |
-| Embedding | Hash / OpenAI-compatible | 本地零密钥与生产语义模型共用接口 |
-| RAG 评测 | 版本化 JSON + 隔离 SQLite | 同一语料可在 Hash、真实 Embedding 和 PostgreSQL 候选链路上重复对比 |
-| 多 Agent 模式 | Eino AgentTool + 显式工具分组 | 避免完整上下文共享；让交接、权限和专家输出可独立审计 |
-| Multi-Agent 评测 | 版本化 JSON + 隔离 Chat/RunEvent | 核对真实协作闭环，并运行单 Agent Control / 多 Agent Treatment |
-| 办公连接协议 | 官方 MCP Go SDK + stdio | 连接器独立进程、工具发现标准化、主进程无需绑定具体 SaaS SDK |
-| Microsoft 办公 API | Graph REST | reader/writer 两个受控连接器覆盖邮件与日历，分别管理最小权限、Token、超时和错误 |
-| 前端传输 | SSE | 单向模型流简单、代理支持广、易于调试 |
-| UI 发布 | `go:embed` | 单二进制运行，无 Node.js 部署依赖 |
-| ID | `crypto/rand` | 不依赖数据库自增 ID，不暴露业务规模 |
 
-## 9. 项目亮点
+### 7.4 多 Agent 路由
 
-### 9.1 Mock 也走真实 Agent 链路
+```mermaid
+flowchart TD
+    Q["用户任务"] --> Approval{"高影响且需审批?"}
+    Approval -- 拒绝/超时 --> Stop["Run rejected"]
+    Approval -- 通过或无需 --> Supervisor
+    Supervisor --> Research["Research Agent\n计算/时间"]
+    Supervisor --> Document["Document Agent\nRAG/MCP 只读"]
+    Supervisor --> Writer["Writer Agent\n内部草稿"]
+    Research --> Evidence["结构化交付物"]
+    Document --> Evidence
+    Writer --> Evidence
+    Evidence --> Supervisor
+    Supervisor --> Final["统一最终回答"]
+```
 
-Mock 模型实现 Eino 的 `BaseChatModel` 和工具调用语义。无密钥模式依然经过 ChatModelAgent、ToolNode、ToolCall 和 AgentEvent，因此测试的不是另一套简化业务代码。
 
-### 9.2 用户历史与执行轨迹分离
 
-Message 面向下一轮对话上下文，RunEvent 面向调试、审计和可观测性。两者分离后，可以独立控制上下文长度、审计粒度和保留策略。
+独立任务可以在最大并行度内并发；有依赖的“先检索再写作”保持串行。每个根 Run 维护交接预算，专家拥有单独超时和有限重试。
 
-### 9.3 明确的失败与取消语义
+### 7.5 办公草稿与外部执行
 
-请求 Context 从 HTTP 一路传递到 Runtime 和模型。用户停止生成或连接断开时，Run 会落为 cancelled；普通错误落为 failed，避免状态含糊。
+```mermaid
+stateDiagram-v2
+    [*] --> draft: Agent 创建内部预览
+    draft --> pending_confirmation: 用户提交确认
+    pending_confirmation --> approved: 用户批准
+    pending_confirmation --> rejected: 用户拒绝
+    approved --> executing: Operation 被执行器领取
+    executing --> completed: 获得真实远端引用
+    executing --> failed: 超时/错误/租约恢复
+    failed --> executing: 使用原幂等键重试
+```
 
-### 9.4 安全工具边界
 
-工具由代码显式注册。计算器采用递归下降解析器，不使用 `eval`、Shell 或代码解释器，能展示 Agent 工具安全不是只依靠 Prompt。
 
-### 9.5 框架隔离
+实际实现中 Draft 状态与 Operation 状态分别保存；图中合并展示业务体验。四层边界是：
 
-HTTP 和 Store 不依赖 Eino 事件类型。`agentruntime.Event` 作为防腐层，降低框架升级或更换对产品层的影响。
+1. Draft：模型产生的内部内容；
+2. Confirmation：用户对内容负责；
+3. Operation：可持久化、可重试的外部任务；
+4. Executor：唯一持有写权限的组件。
 
-### 9.6 面向评估演进
 
-RAG 已把语料、问题、相关文档、预期事实/证据锚点和阈值作为版本化资产：对 vector、keyword、hybrid 分别计算 Recall@K、MRR、命中率和延迟，并让真实 Agent Runtime 生成答案，检查事实覆盖、引用能否解析到本次工具证据、所引原文是否包含支持锚点。Memory 已建立 Control/Treatment 对照指标；Multi-Agent 也把期望专家序列、答案锚点和阈值版本化，从真实 RunEvent 核对协作闭环，并在相同问题上对比单/多 Agent 的质量、调用次数代理和耗时。当前仍默认关闭，避免“功能数量等于技术深度”的误区。
 
-### 9.7 可交换的 RAG 边界
+### 7.6 可观察性流程
 
-`knowledge.Service` 不依赖数据库细节，`Embedder` 也不依赖具体厂商。SQLite 负责教学友好的精确向量/BM25；PostgreSQL 通过可选 `CandidateStore` 下推 HNSW/FTS 候选，RRF、HTTP 与 Agent Tool 契约保持不变。
+```mermaid
+flowchart TB
+    Runtime["Runtime 事件"] --> Events["append-only RunEvent"]
+    Run["AgentRun 终态"] --> Aggregate["Metrics Aggregate"]
+    Events --> Aggregate
+    Aggregate --> API["Run/Metrics API"]
+    API --> Web["运行监控"]
+    Events --> Eval["评测与回归"]
+    HTTP["HTTP Span"] --> TraceRun["agent.run"]
+    TraceRun --> Model["gen_ai.chat"]
+    TraceRun --> Tool["tool.*"]
+    Tool --> Embedding["embedding.generate"]
+    TraceRun --> OTLP["OTLP/HTTP → Jaeger/Collector"]
+    Runtime --> Prom["低基数 Metrics → /metrics"]
+```
 
-### 9.8 证据引用不是 Prompt 幻觉
+RunEvent 是不可采样的产品审计，指标包括总耗时、TTFT、模型调用、工具次数与耗时、Agent 交接次数与耗时、Provider Token Usage 完整性。OTel/Prometheus 是可采样、可按保留策略清理的基础设施观测，两者通过 Run ID 与 Trace ID 关联而不是互相替代。
 
-每个 SearchResult 都带 `document_id`、`document_name`、`chunk_id`、`ordinal`、`start_rune` 和 `end_rune`。引用信息来自持久化原文坐标，而不是让模型临时编造来源。
+## 8. 技术架构
 
-### 9.9 长期记忆先控制、再自动写入
 
-V0.3 没有直接把最近 40 条消息写入向量库，而是先建立独立 Memory 生命周期和用户控制面，再接入自动写入。类型、稳定 Key、来源、重要性、人工修正和过期时间均为一等字段；自动提取通过 `source_type=conversation` 关联原始事实。真实模型 Prompt 只允许提取用户明确表达的稳定信息，Service 负责二次校验和同 Key 合并。错误记忆能够被定位、修正和删除，人工修正后不会被下一轮模型覆盖。
 
-召回也先采用可解释基线：中文双字/西文词项相关性占 65%，重要性占 20%，90 天半衰期时效性占 15%。无相关词项默认不注入，非总览问题还需达到 0.20 最低主题相关性；记忆正文被标记为不可信背景数据且有 6,000 字符硬上限。线上可通过 `ZORA_MEMORY_RECALL_ENABLED` 独立关闭注入，离线 A/B 命令则显式组装 Control/Treatment 两个 Chat Service。
+### 8.1 分层架构
 
-### 9.10 A/B 门禁真实经过产品链路
+```mermaid
+flowchart TB
+    subgraph Presentation["表现层"]
+        Web["Embedded Web UI"]
+        HTTP["REST + SSE"]
+    end
+    subgraph Application["应用层"]
+        Chat["Chat Service"]
+        Knowledge["Knowledge Service"]
+        Memory["Memory Service"]
+        Summary["Summary Service"]
+        Approval["Approval Service"]
+        Office["Office Service"]
+    end
+    subgraph Agent["Agent 层"]
+        Runtime["Eino Runtime"]
+        Supervisor["Supervisor / Specialists"]
+        Tools["Built-in / RAG / Draft Tools"]
+        MCP["MCP Bridge"]
+    end
+    subgraph Infrastructure["基础设施层"]
+        Models["Mock / OpenAI-compatible"]
+        SQLite["SQLite"]
+        PG["PostgreSQL + pgvector"]
+        External["Files / Microsoft Graph"]
+    end
+    Web --> HTTP
+    HTTP --> Application
+    Chat --> Runtime
+    Runtime --> Supervisor
+    Runtime --> Tools
+    Tools --> Knowledge
+    Tools --> Office
+    Tools --> MCP
+    MCP --> External
+    Application --> SQLite
+    Application --> PG
+    Runtime --> Models
+```
 
-Memory 评测不是直接调用 `Recall` 后检查返回数量。Control 和 Treatment 使用相同 Runtime/Store，分别关闭和开启 `MemoryRecaller`，完整经过 `chat.Send`、Eino、消息持久化和 RunEvent；评测器再从实际 Run 审计读取注入 ID。固定集包含相似主题硬负例，第一次运行确实发现通用 Go 问题被个人记忆污染，并推动召回器加入 0.20 最低主题相关性。这能作为“评估驱动实现演进”的面试案例。
 
-### 9.11 会话摘要保留原文与失败隔离
 
-摘要以 `through_sequence` 精确标记覆盖边界，而不是删除或覆盖 Message；因此可以回放、审计或更换模型后重新生成。触发判断按当前会话实际消息条数计算，避免全库自增 sequence 在多会话下产生误判。摘要正文和历史消息都作为不可信数据注入，RunEvent 只保存覆盖序号和统计值；生成失败不会让已成功回答变为失败。
 
-### 9.12 多 Agent 先隔离、治理与评测，再谈自治
 
-V0.4 没有让多个角色共享全部历史自由对话，而是把专业 Agent 包装为 AgentTool：Supervisor 只交付最小 request，工具能力按职责隔离，子 Agent 输出作为审计事实但不直接进入用户最终答案。受控 AgentTool 在每个根 Run 上限制交接、并行、超时和重试；子 Run 与审批状态分别持久化。`make eval-agents` 通过完整 Chat/Eino/RunEvent 链路校验交接顺序和闭环；当前 7 题路由准确率 1、意外专家调用率 0、答案完成率 1。相同问题的单 Agent Control 质量 0.785714，多 Agent Treatment 为 1，增益 0.214286，调用次数代理比 2。这是可讨论的上下文工程、最小权限、执行治理与评估驱动设计；Mock 小样本不能替代真实 Token Usage 和人工业务验收。
+### 8.2 包职责
 
-### 9.13 MCP 连接器把协议、授权和外部内容隔离
 
-V0.5 把“办公能力”落成独立 MCP 进程，而不是把文件系统或 SaaS 调用直接塞进 Agent 主进程。Zora 只负责协议、工具门禁、超时、输出上限和审计；文件 Server 负责目录授权，Microsoft Server 负责 Graph 与 OAuth。reader/writer 使用两个 Entra 身份和两套 Secret 文件，主进程只知道路径；连接器新增或替换时不改 Chat/Runtime/HTTP 契约，模型凭据也不会默认进入连接器环境。
+| 包            | 职责                 | 不应该承担的职责      |
+| ------------ | ------------------ | ------------- |
+| config       | 环境变量解析与启动校验        | 业务执行          |
+| agentruntime | Eino、模型、事件、多 Agent | 数据库事务与 HTTP   |
+| chat         | 核心用例和 Run 生命周期     | Provider 具体协议 |
+| knowledge    | 摄取与检索              | 会话状态          |
+| memory       | 长期记忆生命周期           | 全量消息持久化       |
+| summary      | 会话压缩               | Memory 冲突合并   |
+| approval     | 根 Run 审批           | Office 草稿确认   |
+| office       | 草稿与外部任务状态机         | 普通只读工具发现      |
+| mcpbridge    | MCP Client 与工具安全适配 | 用户业务状态        |
+| store        | 持久化契约与实现           | Agent 决策      |
+| httpapi      | API、SSE、Web        | 核心领域规则        |
+| observability | Run 聚合、Trace、Metric | Prompt/正文持久化与业务决策 |
 
-Microsoft 邮件与日历只返回完成问答所需的元数据和正文摘要，不下载 HTML/附件。内容同时由工具结果警告和系统 Prompt 标记为不可信数据，避免邮件正文中的“忽略规则、调用工具、打开链接”等文本被当成 Agent 指令。这个实现同时体现协议落地、最小数据暴露和 Prompt Injection 防线分层。
 
-### 9.14 草稿与外部执行显式分层
 
-邮件/日程草稿不是 Writer 输出的一段不可追踪文本，而是独立 `OfficeDraft`。Chat 在创建根 Run 后通过 Context 注入可信来源，工具参数中不允许模型填写 Conversation/Run ID；Service 对邮箱、正文长度、RFC3339 时间窗和 IANA 时区二次校验。规范化 Payload 与 Kind 计算 SHA-256，同一 Run 重试相同工具参数不会制造重复草稿。
 
-草稿工具固定返回 `external_effect=false`，Web 使用“仅预览”标记。独立 REST/Web 操作把草稿从 draft 提交到 pending_confirmation，再以数据库 CAS 一次性批准或拒绝；迁移和事件原子落库。approved 在页面和 API 中仍明确标注“尚未执行”，因此不会把“生成预览”“人工确认”和“执行外部操作”混为一谈。
+### 8.3 依赖方向
 
-第五阶段再把 approved 与执行拆成唯一 `OfficeOperation`。任务持有稳定幂等键、租约、attempt、执行器名称、错误和远端引用；失败重试和重启恢复不生成第二个业务任务。Executor 若未声明幂等安全会在组装时被拒绝，若未返回真实副作用标记和可核验引用则只能落为 failed。
+HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；基础设施实现接口。领域包不会反向依赖 Web。`cmd/zora` 是 Composition Root，负责选择具体实现。
 
-第六阶段实现 Graph Executor，但仍不把写能力交给模型。邮件先创建 Graph 远端草稿，拿到不可变 ID 后必须在当前数据库租约下写入检查点和审计事件，检查点成功后才允许发送；重试先核对 `isDraft`，从而区分继续发送与恢复已完成状态。日程用稳定幂等键派生固定 `transactionId`。这使“远端调用成功但本地进程退出”成为可解释、可恢复的工程路径，而不是仅靠接口名称声称幂等。
+## 9. 技术选型与取舍
 
-### 9.15 指标从真实执行事实派生
 
-V0.6 没有用字符数估算 Token，也没有新增一套与审计轨迹可能不一致的指标写库。Runtime 在每次模型回复完成后写入 `model_call_completed`；只有 Provider 返回 `ResponseMeta.Usage` 时才记录输入、输出、总量、缓存和推理 Token，并单独统计 `usage_reported`。因此 Mock 或不返回 Usage 的 Provider 会明确显示“Usage 不完整”，而不是制造看似精确的成本数据。
+| 选型                    | 选择原因                      | 放弃或暂缓的方案                | 代价与限制             |
+| --------------------- | ------------------------- | ----------------------- | ----------------- |
+| Go                    | 熟悉、并发/Context/HTTP 强、单二进制 | Python Agent 生态         | AI 组件和示例相对少       |
+| Eino                  | Go 原生 ReAct、Tool、流式事件     | 完全手写循环、LangChain Python | 需要适配框架事件和版本变化     |
+| SSE                   | 响应单向流简单、HTTP 友好           | WebSocket               | 不适合双向实时协同         |
+| SQLite 默认             | 零依赖、纯 Go、便于演示             | 一开始强制 PostgreSQL        | 大规模检索和多实例有限       |
+| PostgreSQL + pgvector | 统一事务、向量、FTS、连接池           | 专用向量数据库                 | 超大规模向量能力不如专用系统    |
+| HNSW                  | 查询快、pgvector 成熟           | IVFFlat、精确全扫            | 索引占空间，更新成本更高      |
+| RRF                   | 不需校准异构分数，稳定简单             | 学习排序、手工线性加权             | 没有 query-aware 权重 |
+| Hash Embedding 默认     | 无 Key、可复现、测试链路            | 本地大模型默认下载               | 不具备真实语义能力         |
+| 环境变量配置                | 12-factor、部署简单            | 配置中心、后台动态配置             | 修改需要重启，不适合大规模租户   |
+| MCP stdio             | 进程隔离、官方 SDK、部署直观          | 远程 HTTP MCP             | 跨机器治理能力有限         |
+| 自包含 Web               | 无 Node 构建和独立部署            | React/Vue SPA           | 复杂 UI 可维护性有限      |
+| 追加式 RunEvent          | 可审计、可重算指标                 | 只打日志、只存最终 JSON          | 事件量增长，需要归档策略      |
+| OTel + Prometheus       | 标准协议、跨层 Trace、低基数聚合       | 自定义埋点平台                    | 生产还需 Collector/告警治理 |
+| 规则 + 模型双实现            | Mock 可测、真实模型可用            | 所有增强都调用 LLM             | 两种路径需要保持语义一致      |
+| 同步文档摄取                | MVP 简单、失败立即反馈             | 队列和异步 Worker            | 大文件会占用请求连接        |
+| 多 Agent 默认关闭          | 避免意外成本，先评测收益              | 始终开启                    | 使用者需要显式配置         |
 
-Chat 在第一段用户可见 `delta` 到达时记录 `first_token`，用 ToolCall ID 分别关联普通工具和 Agent 交接的开始与完成事件。总耗时由 AgentRun 起止时间计算，其余指标从 append-only RunEvent 聚合。`done.metrics`、运行详情 API 和 Web 监控面板调用同一个聚合器，避免页面、接口和审计轨迹分别计算后产生口径漂移。
 
-该设计同时保留两个诚实边界：模型成本只有真实 Provider Usage 才能计算；当前运行列表采用最多 100 条逐 Run 聚合，适合单机调试和作品演示，生产规模应升级为数据库聚合或异步指标投影。
 
-## 10. 当前限制与风险
 
-| 限制/风险 | 当前影响 | 后续处理 |
-|---|---|---|
-| SQLite 单连接 | 适合单机和作品演示，不适合高并发多实例 | 生产配置切换 PostgreSQL Store |
-| 本地向量精确扫描 | 最多读取 10,000 个 chunk，内存和延迟随数据增长 | PostgreSQL 模式使用 pgvector HNSW + FTS |
-| PostgreSQL 容器验收未在当前环境执行 | 代码、单测和可选集成测试已完成，但缺少本机 Docker 实测记录 | 在有 Docker 的环境运行 `make postgres-up && make test-postgres` |
-| Hash Embedding 无深度语义 | 适合关键词相关性和链路测试，不适合生产问答 | 生产切换 text-embedding-v4 等语义模型 |
-| 固定评测集仅 4 题 | 能做冒烟回归，无法证明复杂语义场景或融合收益 | 增加语义改写、难负例、多相关文档和真实业务问题 |
-| 答案评测使用确定性锚点 | 零密钥且稳定，但无法识别未标注幻觉或复杂同义改写 | 增加真实模型人工集与经校准的 LLM Judge，对确定性门禁形成补充 |
-| 同步文档索引 | 大文件会占用 HTTP 请求 | 异步 Ingestion Job、重试和状态机 |
-| 进程内会话锁 | 多实例之间不能互斥 | advisory lock 或带租约分布式锁 |
-| 摘要模型可能遗漏早期细节 | 长对话成本降低，但压缩是有损的 | 保留完整原始消息和最近窗口；增加摘要信息保留率评测与重新生成能力 |
-| 自动记忆仍同步执行 | 真实模型会增加一次调用延迟；多副本仅有进程内合并锁 | 后续改为任务队列，并在数据库增加唯一约束/版本号 |
-| 轻量召回缺少深层语义 | 可解释且零额外调用，但同义改写可能漏召回 | 用现有 A/B 门禁评估 Memory Embedding 或 Rerank 的真实增益 |
-| Memory A/B 固定集仅 5 题 | 能发现弱相关污染并做零密钥回归，但不能代表真实用户分布 | 扩充同义改写、冲突记忆、多轮更新和真实模型人工集 |
-| Multi-Agent 默认会增加模型调用 | 固定集质量增益 0.214286，但调用次数代理为单 Agent 的 2 倍 | 默认关闭；接入真实 Provider Usage 后按业务集重新决定 |
-| Multi-Agent 固定集仅 7 题 | 能验证串/并行、路由、审计和确定性质量增益，不能代表复杂业务 | 扩充对抗提示、失败恢复和真实模型人工集 |
-| 子 Run 暂不支持恢复 | 可独立查询状态和耗时，但进程重启后不能从单个子任务继续 | 引入 Checkpoint、租约任务队列和幂等 Resume |
-| 通用审批等待器在进程内 | 决定已持久化，但重启会丢失等待中的 SSE 恢复通道；Office Operation 不受此限制 | 后续将通用审批也升级为可恢复任务状态机 |
-| MCP Server 属于受信部署组件 | 白名单和只读声明不能证明第三方实现绝对无副作用 | 只部署审核过的连接器；文件 Server 再用 OS 目录权限和进程隔离限制影响面 |
-| Graph 只完成模拟集成验收 | 代码和协议测试已通过，但没有真实 Microsoft 租户凭据的在线验收记录 | 建立最小权限 Entra 测试应用和专用测试账号，执行真实邮件/日历冒烟 |
-| 邮件/日历仅支持 Microsoft | Google Workspace 等来源尚不能接入 | 保持 MCP 工具语义稳定，新增独立 Provider 连接器而不修改 Chat 主链路 |
-| Secret 生命周期依赖部署平台 | 子进程已支持 Secret/Token 文件和轮换，但不内置 Vault/KMS SDK | 生产由容器 Secret、Vault Agent 或云平台挂载文件，后续增加证书/Workload Identity |
-| Graph 写执行器默认关闭 | 默认运行只能把 approved 草稿准备为 pending，避免开发环境误发邮件 | 仅在 writer 独立身份、Secret 文件、邮箱 RBAC scope 和双写开关下启用 |
-| Graph 真实租户尚未验收 | 适配器与故障恢复测试通过，但不能证明真实权限、租户策略与投递结果 | 建立专用 Entra 应用/测试账号，完成最小权限与在线冒烟 |
-| 执行器幂等契约依赖实现正确性 | 内核拒绝未声明幂等的执行器，但无法仅靠接口证明远端绝不重复 | Graph 适配使用可重放资源 ID/transactionId，并增加故障注入与真实租户测试 |
-| 邮件远端创建与本地检查点无法跨系统原子提交 | Graph 已返回草稿 ID、但进程在检查点前被强杀时可能留下未发送的孤立草稿；正常错误/取消会尽力无取消落库 | 增加远端幂等标记与对账任务；当前保证检查点成功前绝不发送，因此不会把该窗口放大为重复投递 |
-| 草稿 Payload 尚未加密 | 本地数据库读取者可以看到邮件正文和日程内容 | 生产环境增加磁盘/列加密、数据保留策略和 Tenant ACL |
-| 无鉴权和租户隔离 | 不适合直接公网开放 | 增加 User/Tenant、鉴权、ACL |
-| 模型错误分类有限 | API 可能返回过于笼统或过于底层的信息 | 统一错误码和 Provider 错误映射 |
-| Token Usage 依赖 Provider 返回 | Mock 或部分兼容服务只能展示调用次数和 Usage 完整度，不能给出伪造成本 | 保持缺失可见；生产 Provider 返回 Usage 后再结合版本化价格表计算成本 |
-| 无恢复运行 | 中断后只能重新发起 | 引入 Eino Checkpoint/Resume |
-| Eino 尚未 1.0 | API 存在演进风险 | 固定版本、适配层隔离、升级回归测试 |
+## 10. 项目亮点结论
 
-## 11. 成功指标
+完整 18 项分析见[项目亮点全面分析](project-highlights.md)。最值得面试展开的五项是：
 
-### V0.1 工程指标
+1. **执行模型清晰**：Message、Run、RunEvent 分离；
+2. **RAG 有治理和评测**：版本、ACL、引用、混合检索和回归指标；
+3. **Memory 可控**：独立模型、同 Key 合并、人工修正保护；
+4. **多 Agent 有治理**：权限、预算、并发、超时、父子 Run 和对照评测；
+5. **副作用安全**：Draft、确认、Operation、幂等、租约和远端检查点。
 
-- 普通对话和工具对话端到端成功；
-- SSE 事件顺序稳定；
-- Run 不遗留永久 running 状态；
-- 单元、集成、竞态、静态分析和无 CGO 构建通过；
-- 默认模式无需外部密钥和数据库即可运行。
+这五项能体现 Go 后端能力与 Agent 工程能力的结合。
 
-### 后续产品指标
+## 11. 项目缺陷与待改进项
 
-| 能力 | 建议指标 |
-|---|---|
-| RAG | Recall@K、MRR、引用覆盖率、答案忠实度 |
-| Memory | Recall@K、意外召回率、事实覆盖增益、答案污染率、用户删除成功率 |
-| Multi-Agent | 任务成功率、P95 延迟、token 成本、人工干预率 |
-| 办公 Agent | 审批覆盖率、越权操作数、操作成功率、可恢复率 |
 
-### V0.2 本地 MVP 工程指标
 
-- 同一文档内容可被 SHA-256 稳定去重；
-- 所有分块都能用 Unicode 偏移恢复原文；
-- 向量召回和 BM25 召回分别计分，RRF 不依赖两类分数量纲；
-- 知识库工具结果必须包含文档名、分块序号和原文；
-- 默认无密钥可运行，同时有真实 Embedding 适配器的契约测试。
-- 固定评测命令在隔离数据库中复现语料，并输出 vector、keyword、hybrid 的 Recall@K、MRR、命中率和延迟；
-- 同一命令经过 Eino Runtime 与 `knowledge_search` 生成答案，输出事实覆盖率、有效引用覆盖率和引用忠实度；
-- 默认 `zora-rag-smoke-v1` 的实际基线为 Recall@3=1、MRR=1，三种模式打平，尚不能证明融合收益。
-- PostgreSQL 与 SQLite 实现相同 Store 契约，数据库侧只下推 Top 50 单路候选，RRF 仍由应用层统一计算；
-- PostgreSQL 启动校验 `vector(N)` 维度，多实例 DDL 使用 advisory transaction lock。
-- private 文档只对 owner 可见，public 可跨主体读取；删除始终要求 owner，HTTP 把越权映射为 403；当前单用户主体来自服务端 `ZORA_KNOWLEDGE_PRINCIPAL_ID`。
-- 同 owner + 文档名形成版本组，写入时原子切换 latest；列表和两类检索候选只读取最新版，删除最新版自动回退。
-- PDF 仅解析已有文本层，不做 OCR；递归切块优先 Markdown 标题、段落、换行、句末和空格，最后才硬切。
+### 11.1 P0：对外部署前必须解决
 
-## 12. 演进路线
 
-1. **V0.1 Agent Core**：建立当前可运行基线。
-2. **V0.2 Knowledge Base（工程项完成）**：SQLite/PostgreSQL 双 Store、pgvector/FTS、引用、版本/PDF/递归切块/ACL 和固定评测已实现；继续以真实语义样本验证融合收益。
-3. **V0.3 Long-term Memory（主链路完成）**：Schema、双存储、用户 CRUD、候选提取、Consolidation、召回注入、会话增量摘要和 A/B 门禁已实现。
-4. **V0.4 Multi-Agent（已完成）**：Supervisor、三个专业 Agent、隔离交接、串/并行执行治理、父子 Run、人工审批和单/多 Agent 对照门禁已实现。
-5. **V0.5 Office Agent（外部资源暂缓）**：只读连接器、草稿确认、可恢复 Operation、Graph 写适配、OAuth/Secret 和最小权限 Runbook 已完成；在线读写与负向范围验证等待测试租户。
-6. **V0.6 Agent 可靠性与可观测性（已完成）**：真实 Usage、首字延迟、工具/交接耗时、Run 聚合 API、SSE 指标和 Web 监控面板。
+| 缺陷                      | 风险                        | 建议方案                                       |
+| ----------------------- | ------------------------- | ------------------------------------------ |
+| 没有认证与租户体系               | 任意访问者可读取对话、记忆、文档和草稿       | OIDC/JWT、中间件注入 principal、全表 tenant_id、RBAC |
+| 没有 API 限流和配额            | 模型费用、连接和工具可被滥用            | 用户/IP/模型多维令牌桶、并发限额、每日预算                    |
+| Web 缺少完整 CSRF/CORS 部署策略 | 接公网后可能被跨站调用               | SameSite Cookie、CSRF Token、严格 Origin/CORS  |
+| Secret 仍主要依赖环境/文件约定     | 运维误配可能泄漏                  | Vault/KMS/Secret Manager、自动轮换和审计           |
+| Microsoft 写链路未真实租户验收    | 代码测试通过不代表 Graph 权限与幂等真实有效 | 测试租户端到端、失败注入、重复执行验收                        |
 
-详细任务与验收条件见 [Roadmap](roadmap.md)。
+
+
+
+### 11.2 P1：从个人项目走向可靠服务
+
+
+| 缺陷                 | 当前影响               | 建议方案                                  |
+| ------------------ | ------------------ | ------------------------------------- |
+| 会话锁只在单进程内          | 多实例可能并发处理同一会话      | PostgreSQL advisory lock 或 Redis 分布式锁 |
+| Memory/摘要为回答后同步执行  | 增加尾延迟              | Outbox + Worker，done 先返回，增强异步完成       |
+| 文档摄取同步             | 大文件占用 HTTP 连接      | Ingestion Job、状态表、队列、批量 Embedding     |
+| 没有统一任务队列           | Office 仍由请求触发执行    | 持久化队列、Worker、退避重试和死信                  |
+| 迁移方式偏内嵌            | Schema 演进与回滚能力有限   | golang-migrate/Atlas，版本化 SQL 和回滚策略    |
+| RunEvent 无归档策略     | 长期数据量持续增长          | 分区、TTL、冷热分层和聚合表                       |
+| 可观察性仍是开发环境直连 | 尚无 Collector、Dashboard 和告警 | Collector 管道、Grafana、SLO 和告警规则           |
+| 模型容错有限             | Provider 超时或限流直接失败 | 模型级熔断、指数退避、fallback 策略与预算             |
+
+
+
+
+### 11.3 P2：提升 Agent 效果
+
+
+| 缺陷                 | 当前影响              | 建议方案                                 |
+| ------------------ | ----------------- | ------------------------------------ |
+| Hash Embedding 无语义 | 默认知识库只能验证链路       | 开发环境支持 Ollama/本地 Embedding           |
+| 轻量中文分词             | 专有词与长词匹配有限        | jieba/自定义词典，或 PostgreSQL 中文扩展        |
+| RRF 固定参数           | 不同 query 类型不能自适应  | Query 分类、动态权重、Cross-Encoder reranker |
+| Memory 召回非向量       | 语义改写下可能漏召回        | Memory Embedding + 词项 + 时间混合召回       |
+| 自动 Memory 提取依赖单次模型 | 可能错误写入            | 置信度、二次校验、候选确认队列                      |
+| Summary 可能累积失真     | 很长会话中早期事实逐步漂移     | 周期性从原始消息重建、事实槽位校验                    |
+| Multi-Agent 样本较小   | 无法证明真实业务普适收益      | 扩充真实任务集，按复杂度/领域分桶                    |
+| PDF 无 OCR          | 扫描件无法使用           | OCR Worker、页码与版面位置引用                 |
+| 有限 Markdown 渲染器    | 不支持复杂表格、任务列表和链接策略 | 引入受审计 Markdown 库和 HTML sanitizer     |
+
+
+
+
+### 11.4 P3：产品体验
+
+- 工具名仍有英文，应增加友好显示名；
+- Agent 不知道所有 Web UI 入口，系统 Prompt 或 ToolResult 可注入产品能力说明；
+- 知识引用可以做成可点击侧栏并定位原文；
+- 草稿箱需要更明显的创建成功提示和直接跳转；
+- 模型列表可显示能力、上下文长度与费用提示；
+- 运行监控可增加状态筛选、趋势图与失败聚类；
+- 缺少移动端导航、键盘可访问性和主题切换的系统测试。
+
+
+
+### 11.5 最推荐的下一阶段
+
+如果目标是找 Agent 开发岗位，优先级建议不是继续堆功能，而是：
+
+1. 基于现有 64 题真实 Embedding 结果分析失败 Case，调整混合检索；
+2. 为已经接通的 OTel/Prometheus 增加 Collector、Dashboard、SLO 与告警；
+3. 将文档摄取或 Memory Capture 改成 Outbox + Worker；
+4. 完成 JWT + principal + tenant_id 的最小多用户闭环；
+5. 写一篇真实故障复盘：例如流式闪烁、模型误选工具或引用不忠实。
+
+这几项比再增加一个“角色 Agent”更能体现后端和 Agent 工程深度。
+
+## 12. 测试与质量策略
+
+
+
+### 12.1 测试金字塔
+
+
+| 层级         | 示例                                         |
+| ---------- | ------------------------------------------ |
+| 纯函数单测      | 计算器、分块、Tokenizer、RRF、评分、参数校验               |
+| Service 单测 | Memory 合并、Summary 增量、Approval、Office 状态机   |
+| Store 契约   | SQLite 生命周期、PostgreSQL Schema/集成测试         |
+| Runtime 测试 | Mock ToolCall、多 Agent 路由、Usage 事件          |
+| HTTP 集成    | SSE、上传、Memory CRUD、草稿、审批、指标                |
+| 固定评测       | RAG、Memory A/B、单/多 Agent Control/Treatment |
+| 手工验收       | 真实模型、UI 流式体验、文档问答和草稿箱                      |
+
+
+
+
+### 12.2 为什么 Agent 项目需要 Eval
+
+普通单测验证“代码是否按预期执行”；Agent Eval 还要验证“模型输出的效果是否达到业务阈值”。两者不能互相替代：
+
+- 单测适合确定性逻辑、状态机和安全边界；
+- Eval 适合检索召回、答案覆盖、路由和质量/成本权衡；
+- 真实模型手工测试适合发现流式 UI、Provider 兼容和非确定性问题。
+
+
+
+## 13. 三分钟口述稿
+
+下面的稿子约三分钟，不需要逐字背诵。面试时根据岗位删减。
+
+### 0:00–0:30：定位与动机
+
+> 我有两年 Go 后端经验，为了系统学习 Agent 开发，我做了 Zora。它不是一个只调用模型 API 的聊天壳，而是一个可观察 Agent 工作台，重点实现工具调用、RAG、长期记忆、多 Agent、人工审批和办公任务的可靠执行。
+
+
+
+### 0:30–1:10：主链路
+
+> 整体使用 Go 和 Eino。HTTP 层通过 SSE 返回模型增量、工具调用和 Agent 交接事件。Chat Service 会先保存用户消息和 running Run，再组装会话摘要、最近消息和相关记忆，交给 Runtime 执行。最终回答、Run 终态和追加式 RunEvent 都会持久化。Message 只保存用户可见历史，RunEvent 保存内部轨迹，这样既不污染下一轮上下文，又能完整审计。
+
+
+
+### 1:10–1:45：RAG 与 Memory
+
+> RAG 支持文档去重、版本、private/public 权限、Unicode 重叠分块和引用。检索同时使用向量和关键词，PostgreSQL 下推到 pgvector HNSW 与 FTS，再通过 RRF 融合。长期记忆不是简单存聊天向量，而是独立的 Semantic/Episodic 模型，有稳定 Key、重要性、来源和过期时间；同 Key 会合并，用户手工修改后自动流程不再覆盖。
+
+
+
+### 1:45–2:20：多 Agent 与安全
+
+> 多 Agent 使用 Supervisor 加 Research、Document、Writer 三个真实 AgentTool，工具按职责隔离，并设置交接次数、并行度、超时和重试。高影响请求可以进入持久化审批。办公能力进一步把模型能做的事限制为创建内部草稿；真正外部写入必须经过确认、Operation 和专用执行器，使用稳定幂等键、租约和远端检查点处理重试与进程恢复。
+
+
+
+### 2:20–2:45：可观察性与评测
+
+> 每次执行会记录模型调用、首字、工具和交接事件，再从事件聚合 TTFT、Token 和各阶段耗时。Token 只使用 Provider 返回值，不做伪精确估算。同时通过 OpenTelemetry 把 HTTP、Run、模型、工具与 Embedding 串成 Trace，通过 Prometheus 暴露低基数指标。项目还提供 RAG、Memory 和单/多 Agent 的固定评测，使用 Control/Treatment 观察质量、错误注入、延迟和调用成本。
+
+
+
+### 2:45–3:00：取舍与下一步
+
+> 项目默认 Mock 加 SQLite，保证无 Key 可运行，同时提供 PostgreSQL、真实模型和真实 Embedding 路径。目前不足是缺少完整认证、多实例锁、异步任务、生产 Collector/告警和真实 Microsoft 租户验收。下一步我会优先做检索失败归因和 Outbox Worker，而不是继续堆角色数量。
+
+
+
+## 14. 面试追问预判
+
+
+
+### 14.1 为什么选择 Go，而不是 Python？
+
+回答要点：
+
+- 自己有 Go 后端积累，可以把精力放在 Agent 架构；
+- Go 的 Context、并发、HTTP、单二进制适合流式与工具服务；
+- Eino 和 MCP 官方 Go SDK 已能覆盖核心需求；
+- 承认 Python AI 生态更丰富，离线模型、Reranker 或数据处理可通过独立服务集成。
+
+
+
+### 14.2 为什么用 Eino，不自己写 ReAct？
+
+回答要点：
+
+- ToolCall 拼接、模型流和 Agent 循环属于通用机制；
+- 项目价值在业务状态、安全和评测；
+- 用 `agentruntime` 隔离 Eino，Chat/Store 不直接依赖大量框架类型；
+- 可以说明如果换框架，主要替换 Runtime 和模型适配层。
+
+
+
+### 14.3 一次消息为什么需要 Message、Run、Event 三种数据？
+
+回答要点：用户历史、执行终态、内部审计职责不同；Event 追加写可重建时间线和指标；工具轨迹不进入长期对话上下文。
+
+### 14.4 同一会话为什么加锁？锁粒度是什么？
+
+回答要点：防止并发请求基于同一历史生成并交错写入；按 conversation ID 加锁，不同会话并行；当前只在单进程有效，多实例需数据库或 Redis 锁。
+
+### 14.5 客户端断开后如何停止模型和工具？
+
+回答要点：HTTP Context 传入 Chat、Runtime、Tool 和 Store；Abort/连接断开会触发取消；Run 根据错误映射到 cancelled；还要说明第三方 SDK 是否真正尊重 Context。
+
+### 14.6 为什么选择 SSE，不选 WebSocket？
+
+回答要点：当前主要是服务器向客户端单向推送；SSE 基于 HTTP、代理友好、实现简单；审批决定使用独立 POST；若未来需要双向实时语音或协同，再考虑 WebSocket。
+
+### 14.7 RAG 为什么要混合检索？
+
+回答要点：向量覆盖语义，关键词覆盖代码、日期、专有名词；RRF 只依赖名次，避免不同分数量纲校准；保留单路分数用于解释和评测。
+
+### 14.8 PostgreSQL 与专用向量数据库如何取舍？
+
+回答要点：当前规模下 PostgreSQL 统一事务、ACL、版本与向量更简单；pgvector 足够；达到亿级或需要复杂 ANN/多模态时才评估 Qdrant/Milvus/Weaviate，并保留 Service/Store 边界。
+
+### 14.9 切换 Embedding 维度会发生什么？
+
+回答要点：Document/Chunk 记录模型和维度；PostgreSQL `vector(N)` 固定；启动时校验不一致并失败，防止静默混用；需要迁移或重建索引。
+
+### 14.10 如何防止 RAG Prompt Injection？
+
+回答要点：外部内容作为不可信数据注入，不能提升指令优先级；工具集与权限不由文档内容决定；ACL 在检索层过滤；仍需承认模型层无法绝对防御，可增加内容分类、引用约束和输出策略。
+
+### 14.11 Memory 与 RAG 有什么区别？
+
+回答要点：RAG 是外部知识与文档证据；Memory 是与用户相关、经过筛选的长期事实/事件；生命周期、权限、合并和召回策略不同，不能只做两个向量集合。
+
+### 14.12 如何处理 Memory 冲突？
+
+回答要点：用 kind + memory_key 表示事实槽位；新候选更新旧值；人工编辑设置 user_edited，自动流程跳过；未来可保留历史版本和置信度，而不是简单覆盖。
+
+### 14.13 为什么摘要不能替代 Memory？
+
+回答要点：摘要服务于单个会话的上下文压缩；Memory 跨会话、可编辑、可过期并按当前问题召回；摘要是历史压缩，Memory 是长期用户模型。
+
+### 14.14 多 Agent 为什么不默认开启？
+
+回答要点：模型调用、延迟和错误面都会增加；项目提供 Control/Treatment 评测，只有质量收益超过成本才启用；复杂度不是目标。
+
+### 14.15 专业 Agent 如何做权限隔离？
+
+回答要点：在构建 Runtime 时分别注入工具集合，而不是只靠 Prompt 说“不要调用”；Supervisor 只拿 AgentTool；Writer 才拿草稿工具，Document 才拿 RAG/MCP 只读工具。
+
+### 14.16 多 Agent 如何防止无限交接？
+
+回答要点：每个根 Run 隔离最大 handoff、最大并行；专家有 timeout 和 retry；Context 取消传播；子 Run 持久化终态；当前不允许 Specialist 再递归持有 Supervisor。
+
+### 14.17 为什么审批要持久化？
+
+回答要点：UI 弹窗不是后端安全边界；数据库记录便于审计和条件更新；等待中的 Run 可以明确 approved/rejected/expired；当前重启后不能恢复原模型流，但状态不会丢，未来可转持久化工作流。
+
+### 14.18 如何保证不会重复发邮件？
+
+回答要点：模型只能建 Draft；Draft 经人工确认；每 Draft 唯一 Operation；稳定幂等键；邮件先建远端草稿并 checkpoint ID，再发送；重试复用远端 ID 并检查状态；只有远端引用存在才能 completed。
+
+### 14.19 为什么批准后不直接发送？
+
+回答要点：批准是业务决定，执行是可能失败、重试和恢复的外部任务；Operation 解耦短 HTTP 请求与长副作用，并提供租约、attempt 和审计。
+
+### 14.20 Token 为什么不自己估算？
+
+回答要点：不同 Provider/模型 tokenizer 不同，估算不能作为费用事实；项目只聚合 Provider Usage，缺失就标记不完整；如果用于容量预测，可以另加明确命名的 estimated token 指标。
+
+### 14.21 如何计算 TTFT？
+
+回答要点：记录 Run start 和首次非空 delta 的 first_token 事件，聚合时间差；工具执行前可能尚未进入生成，因此 TTFT 表示用户感知首字，不等于纯模型 prefill。
+
+### 14.22 如果模型输出了一半后失败怎么办？
+
+回答要点：SSE 返回 error，Run 进入 failed/cancelled；当前只有完成后的 Assistant Message 作为正式历史，避免下轮误用半截答案；产品可选择显示临时内容但标记未完成。
+
+### 14.23 SQLite 与 PostgreSQL 如何保持行为一致？
+
+回答要点：共享 Store 契约和领域 Service；双实现测试；检索候选路径不同但统一在 Service 做结果契约/RRF；真实 PostgreSQL 使用可选集成测试。
+
+### 14.24 你遇到过什么真实问题？
+
+可以讲流式闪烁：
+
+> 真实模型 token 返回很密，前端原实现每个 delta 都删除并重建全部消息，再触发 smooth scroll，所以页面频繁闪烁。定位后改成 requestAnimationFrame 合并更新，只刷新当前回答，并在流式阶段关闭平滑滚动。同时补全安全 Markdown 渲染。这体现了真实 Provider 验收能发现 Mock 不容易暴露的性能问题。
+
+
+
+### 14.25 如果重做一次，会先做什么？
+
+回答要点：先定义 Run/Event、工具安全和 Eval，再扩展 RAG/Memory/Multi-Agent；更早引入 OTel 和异步 Job；减少早期 README 重复；先用真实小数据集验证复杂功能收益。
+
+## 15. 简历表达
+
+
+
+### 15.1 项目名称
+
+**Zora：Go Agent 工作台与可靠执行系统**
+
+### 15.2 一句话精简版
+
+使用 Go、Eino、PostgreSQL/pgvector 实现可观察 Agent 工作台，覆盖 RAG、长期记忆、多 Agent、MCP、安全审批和幂等办公任务。
+
+### 15.3 三条项目描述
+
+- 基于 Go + Eino 实现流式 ReAct Agent，设计 Message/AgentRun/RunEvent 分层模型，支持多模型请求级路由、Context 取消、会话并发控制，并从持久事件聚合 TTFT、Provider Token 与工具耗时。
+- 实现带版本和 ACL 的 RAG：Unicode 重叠分块、可替换 Embedding、pgvector HNSW + PostgreSQL FTS 双路召回与 RRF 融合，并建立 Recall@K/MRR、事实覆盖和引用忠实度评测。
+- 构建长期记忆与多 Agent 治理：Semantic/Episodic 提取合并、增量摘要、Supervisor 专业工具隔离、预算/超时/重试、人工审批，以及 Draft → Operation → 幂等 Executor 的外部副作用安全链路。
+
+
+
+### 15.4 五条详细版
+
+1. 使用 Eino ChatModelAgent 统一 Mock 与 OpenAI-compatible 模型，Mock 仍经过真实 ToolCall 链路，使无外部 Key 的单元与集成测试可稳定复现；
+2. 使用 SQLite 提供零依赖运行，并基于 pgx、pgvector HNSW 和 FTS GIN 实现 PostgreSQL 生产检索路径，通过 Store 接口保持上层无感；
+3. 设计可编辑、可过期、可追溯的长期记忆模型，支持稳定 Key 冲突合并、人工修正保护、相关性/重要性/时效性联合召回及 Control/Treatment A/B；
+4. 实现 Supervisor、Research/Document/Writer AgentTool 的职责隔离与串并行调度，并对交接次数、并发、超时、重试、取消和父子 Run 进行治理；
+5. 将办公写入拆分为内部草稿、人工确认、持久化 Operation 和专用 Executor，使用内容哈希、幂等键、租约、远端检查点与恢复机制控制重复副作用。
+
+
+
+### 15.5 STAR 表达示例
+
+**S/T：** 为了从传统 Go 后端转向 Agent 开发，需要实现一个不止能聊天、还能安全使用知识和工具的完整项目。
+
+**A：** 使用 Eino 建立 ReAct Runtime，自研 Chat/Run/Event、RAG、Memory、Multi-Agent 治理和 Office 状态机；引入 pgvector + FTS 混合检索、Context 取消、审批、幂等执行与固定评测集。
+
+**R：** 完成从本地 Mock 到真实模型的可运行闭环，能够对工具轨迹、TTFT、Token、RAG 引用和多 Agent 交接进行审计；通过自动测试和手工用例发现并修复真实模型流式重绘问题。
+
+注意：简历不要编造线上用户数、QPS、准确率或成本下降。没有真实数据时，应写“实现”“建立”“通过固定数据集验证”，不要写“提升 80%”。
+
+## 16. 针对两年 Go 后端经验的复习路线
+
+
+
+### 第一阶段：先讲清 Go 工程能力
+
+- `context.Context` 如何跨 HTTP、模型和工具取消；
+- conversation 级锁为什么存在，如何演进到多实例；
+- SQLite/PostgreSQL 事务、唯一约束和 CAS；
+- SSE 生命周期、客户端断开和优雅关闭；
+- interface 如何隔离 Runtime、Store、Embedder 和 Executor。
+
+
+
+### 第二阶段：理解 Agent 核心
+
+- ReAct 的 Thought/Action/Observation 如何映射 ToolCall；
+- Tool Schema 为什么比解析自然语言可靠；
+- System/User/Tool 消息的信任等级；
+- 为什么工具权限必须由代码注入，而不是 Prompt 声明；
+- Agent Run 与普通 HTTP 请求有什么不同。
+
+
+
+### 第三阶段：理解 RAG 与 Memory
+
+- Chunk Size/Overlap 的影响；
+- Embedding、余弦相似度、BM25、HNSW、RRF；
+- Recall@K、MRR、引用忠实度；
+- Memory 提取、Consolidation、Recall、遗忘；
+- Summary 与 Memory 的边界。
+
+
+
+### 第四阶段：理解可靠性与评测
+
+- 幂等键、租约、检查点、Outbox；
+- Human-in-the-loop 与持久化工作流；
+- TTFT、Token、工具耗时和 Trace；
+- Agent 的非确定性为什么需要 Eval；
+- Control/Treatment 如何避免“功能存在即有效”的误区。
+
+
+
+## 17. 面试时不要过度承诺
+
+以下表述要避免：
+
+- “这是生产级通用 Agent 平台”；
+- “Hash Embedding 也能做语义检索”；
+- “多 Agent 一定比单 Agent 好”；
+- “已经完整支持 Microsoft 365 自动办公”；
+- “有审批就绝对安全”；
+- “所有模型都完全兼容 OpenAI 协议”；
+- “Token 指标等于真实账单”；
+- “SQLite 和 PostgreSQL 性能一样”。
+
+更可信的表达方式是明确当前实现、验证范围、已知限制和下一步方案。对于两年经验的候选人，能准确说明边界通常比堆砌术语更加分。
+
+## 18. 总结
+
+Zora 的核心价值不在功能数量，而在以下完整闭环：
+
+```text
+用户需求
+  → 模型规划
+  → 受控工具与知识补充
+  → 可选专业 Agent 协作
+  → 流式答案或内部草稿
+  → 审批与可靠副作用边界
+  → Run/Event/Metrics 审计
+  → 固定 Eval 回归
+  → 基于证据继续优化
+```
+
+如果你能结合代码讲清这条闭环，并坦诚说明认证、多实例、异步任务、消息/记忆向量化、生产观测管道和外部租户验收仍是改进项，这个项目就不再是“Agent 空壳”，而是一个能够体现 Go 后端基本功、Agent 系统理解和工程判断力的作品。

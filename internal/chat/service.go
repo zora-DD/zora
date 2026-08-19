@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cloudwego/eino/schema"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/approval"
@@ -35,6 +36,8 @@ type StreamEvent struct {
 	ToolName       string                    `json:"tool_name,omitempty"`
 	ToolCallID     string                    `json:"tool_call_id,omitempty"`
 	ChildRunID     string                    `json:"child_run_id,omitempty"`
+	TraceID        string                    `json:"trace_id,omitempty"`
+	SpanID         string                    `json:"span_id,omitempty"`
 	Arguments      string                    `json:"arguments,omitempty"`
 	Message        *domain.Message           `json:"message,omitempty"`
 	Memory         *memory.CaptureResult     `json:"memory,omitempty"`
@@ -55,6 +58,7 @@ type Service struct {
 	memoryRecall memoryRecaller
 	summary      conversationSummarizer
 	approval     *approval.Service
+	telemetry    *observability.Telemetry
 	locksMu      sync.Mutex
 	locks        map[string]*sync.Mutex
 }
@@ -104,6 +108,10 @@ func WithConversationSummarizer(summarizer conversationSummarizer) Option {
 
 func WithApprovalGate(gate *approval.Service) Option {
 	return func(service *Service) { service.approval = gate }
+}
+
+func WithTelemetry(telemetry *observability.Telemetry) Option {
+	return func(service *Service) { service.telemetry = telemetry }
 }
 
 func WithRuntimeProfiles(defaultModel string, profiles []RuntimeProfile) Option {
@@ -259,7 +267,7 @@ func (s *Service) Send(ctx context.Context, conversationID, content string, emit
 }
 
 // SendWithModel 按“选择模型 -> 保存用户消息 -> 创建 Run -> 执行 Agent -> 保存回答”的顺序完成一次请求。
-func (s *Service) SendWithModel(ctx context.Context, conversationID, content, modelID string, emit func(StreamEvent) error) error {
+func (s *Service) SendWithModel(ctx context.Context, conversationID, content, modelID string, emit func(StreamEvent) error) (resultErr error) {
 	content = strings.TrimSpace(content)
 	if content == "" {
 		return fmt.Errorf("消息内容不能为空")
@@ -304,13 +312,38 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 	if err := s.store.CreateRun(ctx, run); err != nil {
 		return err
 	}
-	if err := s.appendEvent(ctx, run.ID, "run_started", s.runtime.AgentName(), "", map[string]any{
+	runStatus := domain.RunRunning
+	traceID, spanID := "", ""
+	if s.telemetry != nil {
+		var runSpan trace.Span
+		var traceStarted time.Time
+		ctx, runSpan, traceStarted = s.telemetry.StartRun(
+			ctx, run.ID, conversationID, runtime.AgentName(), runtime.Provider(), runtime.Model(),
+		)
+		traceID, spanID = observability.TraceIDs(ctx)
+		defer func() {
+			status := runStatus
+			if status == domain.RunRunning {
+				status = domain.RunFailed
+				if errors.Is(resultErr, context.Canceled) || errors.Is(resultErr, context.DeadlineExceeded) {
+					status = domain.RunCancelled
+				}
+			}
+			s.telemetry.EndRun(ctx, runSpan, traceStarted, runtime.Provider(), runtime.Model(), status, resultErr)
+		}()
+	}
+	runStartedPayload := map[string]any{
 		"model": runtime.Model(), "model_id": selectedModelID, "provider": runtime.Provider(),
 		"multi_agent": runtime.MultiAgentEnabled(),
-	}); err != nil {
+	}
+	if traceID != "" {
+		runStartedPayload["trace_id"] = traceID
+		runStartedPayload["span_id"] = spanID
+	}
+	if err := s.appendEvent(ctx, run.ID, "run_started", s.runtime.AgentName(), "", runStartedPayload); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
-	if err := emit(StreamEvent{Type: "start", RunID: run.ID, ModelID: selectedModelID, Message: &userMessage}); err != nil {
+	if err := emit(StreamEvent{Type: "start", RunID: run.ID, ModelID: selectedModelID, TraceID: traceID, SpanID: spanID, Message: &userMessage}); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
 	if s.ApprovalEnabled() {
@@ -337,7 +370,19 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 				return s.failRun(ctx, run.ID, err)
 			}
 			if decision.Status != approval.StatusApproved {
-				return s.stopAfterApproval(ctx, run, decision, emit)
+				if decision.Status == approval.StatusExpired {
+					runStatus = domain.RunCancelled
+				} else {
+					runStatus = domain.RunRejected
+				}
+				resultErr = s.stopAfterApproval(ctx, run, decision, emit)
+				if resultErr != nil {
+					runStatus = domain.RunFailed
+					if errors.Is(resultErr, context.Canceled) || errors.Is(resultErr, context.DeadlineExceeded) {
+						runStatus = domain.RunCancelled
+					}
+				}
+				return resultErr
 			}
 			if err := emit(StreamEvent{Type: eventType, RunID: run.ID, Approval: &decision}); err != nil {
 				return s.failRun(ctx, run.ID, err)
@@ -535,6 +580,7 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 	if err := s.store.FinishRun(ctx, run.ID, domain.RunCompleted, assistantMessage.ID, "", completedAt); err != nil {
 		return err
 	}
+	runStatus = domain.RunCompleted
 	runMetrics := s.completedRunMetrics(ctx, run, domain.RunCompleted, assistantMessage.ID, completedAt)
 	return emit(StreamEvent{
 		Type: "done", RunID: run.ID, Message: &assistantMessage,

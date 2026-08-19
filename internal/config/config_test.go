@@ -20,6 +20,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if cfg.Addr != ":8088" {
 		t.Fatalf("default addr = %q, want :8088", cfg.Addr)
 	}
+	if cfg.OTelEnabled || cfg.PrometheusEnabled || cfg.OTelServiceName != "zora" || cfg.OTelSampleRatio != 1 {
+		t.Fatalf("unexpected observability defaults: %+v", cfg)
+	}
 	if cfg.DefaultModelID != "default" || len(cfg.ModelProfiles) != 1 || cfg.ModelProfiles[0].Model != "zora-mock" {
 		t.Fatalf("unexpected model profile defaults: %+v", cfg.ModelProfiles)
 	}
@@ -176,6 +179,26 @@ func TestLoadMultiAgentOptIn(t *testing.T) {
 	}
 }
 
+func TestLoadObservabilityOptIn(t *testing.T) {
+	clearEnvironment(t)
+	t.Setenv("ZORA_OTEL_ENABLED", "true")
+	t.Setenv("ZORA_PROMETHEUS_ENABLED", "true")
+	t.Setenv("OTEL_SERVICE_NAME", "zora-test")
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318/")
+	t.Setenv("ZORA_OTEL_SAMPLE_RATIO", "0.25")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OTelEnabled || !cfg.PrometheusEnabled || cfg.OTelServiceName != "zora-test" || cfg.OTelEndpoint != "http://collector:4318" || cfg.OTelSampleRatio != 0.25 {
+		t.Fatalf("unexpected observability config: %+v", cfg)
+	}
+	t.Setenv("ZORA_OTEL_SAMPLE_RATIO", "1.1")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected invalid trace sample ratio error")
+	}
+}
+
 func TestLoadMCPRequiresExplicitAllowlistAndIsolatesCoreCredentials(t *testing.T) {
 	clearEnvironment(t)
 	t.Setenv("ZORA_MCP_ENABLED", "true")
@@ -203,6 +226,8 @@ func clearEnvironment(t *testing.T) {
 	for _, key := range []string{
 		"ZORA_ADDR", "ZORA_DATA_DIR", "ZORA_MODEL_PROVIDER", "ZORA_MODEL", "ZORA_API_KEY",
 		"ZORA_BASE_URL", "ZORA_MODELS_JSON", "ZORA_DEFAULT_MODEL_ID", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
+		"ZORA_OTEL_ENABLED", "ZORA_PROMETHEUS_ENABLED", "ZORA_OTEL_ENVIRONMENT", "ZORA_OTEL_SAMPLE_RATIO",
+		"OTEL_SERVICE_NAME", "OTEL_EXPORTER_OTLP_ENDPOINT",
 		"ZORA_MULTI_AGENT_ENABLED", "ZORA_MULTI_AGENT_MAX_HANDOFFS", "ZORA_MULTI_AGENT_MAX_PARALLEL",
 		"ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT", "ZORA_MULTI_AGENT_RETRY_COUNT",
 		"ZORA_MULTI_AGENT_APPROVAL_MODE", "ZORA_MULTI_AGENT_APPROVAL_TIMEOUT",

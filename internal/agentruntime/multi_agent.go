@@ -25,6 +25,8 @@ type SpecialistToolset struct {
 	Research []tool.BaseTool
 	Document []tool.BaseTool
 	Writer   []tool.BaseTool
+	// Observe 在 AgentTool 创建后追加统一的工具 Trace/Metric 包装；nil 表示不包装。
+	Observe func(context.Context, tool.BaseTool) (tool.BaseTool, error)
 }
 
 // NewMultiAgentWithModel 使用 AgentTool 组装 Supervisor，而不是共享完整上下文的 Agent Transfer。
@@ -73,6 +75,12 @@ func NewMultiAgentWithModel(ctx context.Context, cfg config.Config, tools Specia
 		controlled, wrapErr := newControlledAgentTool(ctx, base)
 		if wrapErr != nil {
 			return nil, wrapErr
+		}
+		if tools.Observe != nil {
+			controlled, wrapErr = tools.Observe(ctx, controlled)
+			if wrapErr != nil {
+				return nil, fmt.Errorf("包装专业 Agent 工具可观察性失败：%w", wrapErr)
+			}
 		}
 		specialistTools = append(specialistTools, controlled)
 	}

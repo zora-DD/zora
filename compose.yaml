@@ -29,8 +29,28 @@ services:
       ZORA_MULTI_AGENT_ENABLED: ${ZORA_MULTI_AGENT_ENABLED:-false}
       ZORA_EMBEDDING_PROVIDER: hash
       ZORA_EMBEDDING_DIMENSIONS: 384
+      ZORA_OTEL_ENABLED: ${ZORA_OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
+      ZORA_PROMETHEUS_ENABLED: ${ZORA_PROMETHEUS_ENABLED:-false}
     ports:
       - "8088:8088"
+
+  jaeger:
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.20.0
+    profiles: ["observability"]
+    ports:
+      - "4318:4318"
+      - "16686:16686"
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    profiles: ["observability"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
 
 volumes:
   zora-postgres-data:
