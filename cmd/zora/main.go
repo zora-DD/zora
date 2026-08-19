@@ -28,6 +28,7 @@ import (
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/observability"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/security"
 	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/store/postgres"
@@ -41,6 +42,7 @@ type applicationStore interface {
 	memory.Store
 	memory.CaptureJobStore
 	semantic.Store
+	security.QuotaStore
 	background.Store
 	approval.Store
 	office.Store
@@ -73,7 +75,7 @@ func run(logger *slog.Logger) error {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancelStartup()
 	telemetry, err := observability.NewTelemetry(startupCtx, observability.TelemetryConfig{
-		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.10.0-dev",
+		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.11.0-dev",
 		Environment: cfg.OTelEnvironment, TracingEnabled: cfg.OTelEnabled,
 		OTLPEndpoint: cfg.OTelEndpoint, TraceSampleRatio: cfg.OTelSampleRatio,
 		PrometheusEnabled: cfg.PrometheusEnabled,
@@ -94,6 +96,17 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer database.Close()
+	securityManager, err := security.New(security.Config{
+		RateLimitEnabled: cfg.RateLimitEnabled, RequestsPerSecond: cfg.RateLimitRequestsPerSecond,
+		Burst: cfg.RateLimitBurst, DailyRequestQuota: cfg.DailyRequestQuota,
+		DailyChatQuota: cfg.DailyChatQuota, DailyUploadByteQuota: cfg.DailyUploadBytesQuota,
+		CSRFEnabled: cfg.CSRFEnabled, CookieSecure: cfg.CookieSecure,
+		AllowedOrigins: cfg.CORSAllowedOrigins, TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
+		PrincipalID: cfg.KnowledgePrincipalID,
+	}, database)
+	if err != nil {
+		return fmt.Errorf("初始化 API 安全边界失败：%w", err)
+	}
 
 	registeredTools, err := agenttools.Build()
 	if err != nil {
@@ -454,6 +467,7 @@ func run(logger *slog.Logger) error {
 	}
 	httpOptions = append(httpOptions, httpapi.WithSemanticService(semanticService))
 	httpOptions = append(httpOptions, httpapi.WithBackgroundQueue(backgroundQueue))
+	httpOptions = append(httpOptions, httpapi.WithSecurity(securityManager))
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout, httpOptions...)
 	if err != nil {
 		return err

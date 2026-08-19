@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.10 文档摄取与会话摘要异步化阶段
+> 适用版本：V0.11 部署准备阶段
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -161,7 +161,7 @@ flowchart TD
 | `ZORA_ADDR` | `:8088` | 否 | HTTP 监听地址 |
 | `ZORA_DATA_DIR` | `./data` | 否 | SQLite 数据目录 |
 | `ZORA_STORE_PROVIDER` | `sqlite` | 否 | `sqlite` 或 `postgres` |
-| `ZORA_POSTGRES_DSN` | 空 | postgres 模式必填 | PostgreSQL 连接串，只从环境变量读取 |
+| `ZORA_POSTGRES_DSN` / `_FILE` | 空 | postgres 模式必填 | PostgreSQL 连接串；直接值与 Secret 文件二选一 |
 | `ZORA_POSTGRES_MAX_CONNS` | `10` | 否 | pgxpool 最大连接数，范围 1–100 |
 | `ZORA_OTEL_ENABLED` | `false` | 否 | 是否通过 OTLP/HTTP 导出 Trace |
 | `OTEL_SERVICE_NAME` | `zora` | 否 | OTel Resource 的稳定服务名 |
@@ -169,9 +169,19 @@ flowchart TD
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Trace 开启时必填 | Collector 或 Jaeger 的 OTLP/HTTP 根地址 |
 | `ZORA_OTEL_SAMPLE_RATIO` | `1` | 否 | ParentBased 根 Trace 采样比例，范围 0–1 |
 | `ZORA_PROMETHEUS_ENABLED` | `false` | 否 | 是否通过独立 Registry 注册 `GET /metrics` |
+| `ZORA_RATE_LIMIT_ENABLED` | `true` | 否 | 是否启用按可信客户端 IP 的令牌桶 |
+| `ZORA_RATE_LIMIT_REQUESTS_PER_SECOND` | `10` | 否 | 单 IP 每秒补充令牌数 |
+| `ZORA_RATE_LIMIT_BURST` | `20` | 否 | 单 IP 瞬时突发容量 |
+| `ZORA_DAILY_REQUEST_QUOTA` | `10000` | 否 | UTC 日请求配额；0 为不限 |
+| `ZORA_DAILY_CHAT_QUOTA` | `500` | 否 | UTC 日 Agent Run 配额；0 为不限 |
+| `ZORA_DAILY_UPLOAD_BYTES_QUOTA` | `104857600` | 否 | UTC 日知识上传字节配额；0 为不限 |
+| `ZORA_CSRF_ENABLED` | `true` | 否 | 是否校验浏览器写请求双提交 Token |
+| `ZORA_COOKIE_SECURE` | `false` | HTTPS 生产必须 true | CSRF Cookie 是否仅经 HTTPS 发送 |
+| `ZORA_CORS_ALLOWED_ORIGINS` | 空 | 否 | 逗号分隔的跨源精确 Origin 白名单 |
+| `ZORA_TRUSTED_PROXY_CIDRS` | 空 | 反向代理部署建议 | 可声明原始客户端 IP/协议的代理网段 |
 | `ZORA_MODEL_PROVIDER` | `mock` | 否 | `mock` 或 `openai` |
 | `ZORA_MODEL` | `qwen-plus` | openai 模式需要 | 模型名称 |
-| `ZORA_API_KEY` | 空 | openai 模式必填 | 模型服务密钥 |
+| `ZORA_API_KEY` / `_FILE` | 空 | openai 模式必填 | 模型服务密钥；生产推荐 Secret 文件 |
 | `ZORA_BASE_URL` | 空 | 视 Provider 而定 | OpenAI-compatible 地址 |
 | `ZORA_MODELS_JSON` | 空 | 否 | 最多 20 个模型配置；配置后启用请求级选择并覆盖单模型入口 |
 | `ZORA_DEFAULT_MODEL_ID` | 第一项 | 多模型时可选 | 默认 Agent、自动记忆提取和摘要使用的模型配置 ID |
@@ -187,7 +197,7 @@ flowchart TD
 | `ZORA_MULTI_AGENT_APPROVAL_TIMEOUT` | `60s` | 否 | 等待人工决定的最长时间，应小于整条请求超时 |
 | `ZORA_EMBEDDING_PROVIDER` | `hash` | 否 | `hash` 或 `openai` |
 | `ZORA_EMBEDDING_MODEL` | `text-embedding-v4` | openai Embedding 需要 | Embedding 模型名 |
-| `ZORA_EMBEDDING_API_KEY` | 复用 Chat Key | openai Embedding 需要 | 可独立的 Embedding Key |
+| `ZORA_EMBEDDING_API_KEY` / `_FILE` | 复用 Chat Key | openai Embedding 需要 | 可独立的 Embedding Key；直接值与文件二选一 |
 | `ZORA_EMBEDDING_BASE_URL` | 复用 Chat BaseURL | openai Embedding 需要 | v1 根地址，客户端追加 `/embeddings` |
 | `ZORA_EMBEDDING_DIMENSIONS` | hash 384 / openai 1024 | 否 | 向量维度 |
 | `ZORA_KNOWLEDGE_CHUNK_SIZE` | `800` | 否 | Unicode 字符分块上限，最少 100 |
@@ -239,7 +249,7 @@ flowchart TD
 
 配置原则：
 
-- 密钥只通过环境变量传入；
+- 核心密钥通过环境变量或权限收敛的 `_FILE` 传入，同一密钥的两种来源不能并存；
 - 多模型 JSON 只允许 `api_key_env` 引用密钥环境变量，显式拒绝内嵌 `api_key`；公开接口不返回 BaseURL 和密钥来源；
 - MCP 子进程只继承 `pass_env`，配置层禁止透传模型 Key、Embedding Key 和数据库 DSN；
 - 启动时校验 Provider 和 API Key 组合；
@@ -826,7 +836,7 @@ Browser Abort / HTTP Disconnect / Deadline
 - JSON 请求体最大 1 MiB；文档 multipart 请求最大 6 MiB，其中文件内容最大 5 MiB；
 - 消息正文最大 20,000 个 Unicode 字符；
 - 时间输出为 UTC RFC3339/RFC3339Nano；
-- 资源不存在返回 404；输入错误返回 400。
+- 资源不存在返回 404；输入错误返回 400；跨源/CSRF 拒绝返回 403；限流/配额耗尽返回 429。
 
 ### 10.1 健康检查
 
@@ -848,6 +858,14 @@ GET /api/info
 ```
 
 返回版本、默认 Provider/Model、`models` 安全模型元数据、`default_model_id`、根 `agent_name`、`multi_agent` 开关和已启用能力。模型元数据只包含 ID、展示名、Provider 和模型名，不返回 BaseURL、密钥环境变量名或 API Key。开启多 Agent 时 capabilities 增加 `supervisor`、`specialist-agents` 和 `agent-handoff-audit`。
+
+#### 10.2.1 获取 CSRF Token
+
+```http
+GET /api/security/csrf
+```
+
+启用时返回 `{"enabled":true,"token":"..."}` 并设置 `HttpOnly; SameSite=Strict` Cookie。后续 POST/PUT/PATCH/DELETE 必须同时携带该 Cookie 与 `X-CSRF-Token`。关闭时返回 `{"enabled":false}`。Web 只在内存中保存 Token。
 
 ### 10.3 创建对话
 
@@ -1237,13 +1255,14 @@ POST /api/office/operations/{operationID}/execute
 - 草稿归属的 Conversation/Run ID 由 Chat 注入 Context，模型参数不能覆盖；收件地址、时间窗、时区和内容长度在 Service 层二次校验。
 - 同一 Run 的同内容草稿由数据库唯一约束幂等去重；Web 和回答都明确标记“仅预览、尚未发送/创建”。
 - 人工确认状态迁移使用数据库 CAS 并与审计事件同事务；批准响应和页面仍标记“未执行”，当前没有任何 Graph 写调用。
+- API 入口对 `/api` 使用按可信客户端 IP 的进程内令牌桶；请求、Agent Run 和知识上传字节配额通过 `api_usage_daily` 按 UTC 日持久化并原子扣减。
+- 浏览器写请求必须提供双提交 CSRF Token；CORS 只接受同源或精确白名单，可信代理 CIDR 之外的 `X-Forwarded-*` 一律忽略。
+- 模型 Key、Embedding Key 和 PostgreSQL DSN 支持直接环境变量或 `_FILE`，启动时拒绝双重来源、非普通文件、空文件、超大文件及 Unix group/other 可读权限。
 
-### 上线前必须补充
+### 上线前仍须补充
 
 - 身份认证、Tenant 隔离和资源 ACL；
-- CSRF/Origin 策略；
-- 请求限流和配额；
-- 密钥托管与轮换；
+- 托管式 Vault/KMS、自动轮换与审计（当前已支持部署平台 Secret 文件挂载）；
 - 敏感信息脱敏；
 - 工具权限和审批策略；
 - 数据保留、导出和删除策略。
@@ -1327,10 +1346,12 @@ make run-postgres
 
 Dockerfile 使用 Go 构建阶段产出 Zora、文件 MCP 和 Microsoft MCP 三个静态二进制；最终镜像只包含 Alpine、CA 证书、时区数据和这些二进制。容器以非 root 用户运行，`/app/data` 为持久卷。
 
-生产部署注意：
+生产部署注意（详细安全配置见[部署前 API 安全与 Secret 管理](deployment-security.md)）：
 
 - 挂载持久化数据卷；
-- 通过 Secret 注入 API Key；
+- 通过权限收敛的 `_FILE` Secret 注入 API Key、Embedding Key 和 PostgreSQL DSN；
+- HTTPS 环境启用 Secure Cookie，精确配置 CORS Origin 与可信代理 CIDR；
+- 单实例应用限流不替代网关/WAF；多副本时在入口增加全局限流；
 - 反向代理必须关闭 SSE 缓冲；
 - 健康检查使用 `/api/health`；
 - 多副本部署前必须迁移 PostgreSQL 和分布式会话锁。

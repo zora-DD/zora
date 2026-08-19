@@ -26,6 +26,7 @@ import (
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/observability"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/security"
 	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
@@ -48,6 +49,7 @@ type Server struct {
 	mcpToolCount   int
 	logger         *slog.Logger
 	requestTimeout time.Duration
+	security       *security.Manager
 }
 
 type Option func(*Server)
@@ -76,6 +78,10 @@ func WithBackgroundQueue(queue *background.Queue) Option {
 	return func(server *Server) { server.background = queue }
 }
 
+func WithSecurity(manager *security.Manager) Option {
+	return func(server *Server) { server.security = manager }
+}
+
 // WithMCPInfo 只向展示层暴露启用状态和已通过门禁的工具数，不泄露命令、参数或环境变量。
 func WithMCPInfo(enabled bool, toolCount int) Option {
 	return func(server *Server) {
@@ -95,6 +101,9 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", server.health)
 	mux.HandleFunc("GET /api/info", server.info)
+	if server.security != nil {
+		mux.HandleFunc("GET /api/security/csrf", server.issueCSRFToken)
+	}
 	mux.HandleFunc("GET /api/conversations", server.listConversations)
 	mux.HandleFunc("POST /api/conversations", server.createConversation)
 	mux.HandleFunc("GET /api/conversations/{conversationID}/messages", server.listMessages)
@@ -154,7 +163,11 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 		return nil, fmt.Errorf("加载内嵌 Web 资源失败：%w", err)
 	}
 	mux.Handle("/", spaHandler{assets: assets})
-	application := server.middleware(mux)
+	applicationHandler := http.Handler(mux)
+	if server.security != nil {
+		applicationHandler = server.security.Middleware(applicationHandler)
+	}
+	application := server.middleware(applicationHandler)
 	if server.telemetry == nil || server.telemetry.MetricsHandler() == nil {
 		return application, nil
 	}
@@ -163,6 +176,19 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	root.Handle("GET /metrics", server.telemetry.MetricsHandler())
 	root.Handle("/", application)
 	return root, nil
+}
+
+func (s *Server) issueCSRFToken(w http.ResponseWriter, _ *http.Request) {
+	if !s.security.CSRFEnabled() {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+	token, err := s.security.IssueCSRFToken(w)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": true, "token": token})
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -194,6 +220,18 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.background != nil {
 		capabilities = append(capabilities, "knowledge-ingestion-worker", "conversation-summary-worker")
 	}
+	if s.security != nil {
+		capabilities = append(capabilities, "cors-origin-policy", "secret-file-injection")
+		if s.security.CSRFEnabled() {
+			capabilities = append(capabilities, "csrf-protection")
+		}
+		if s.security.RateLimitEnabled() {
+			capabilities = append(capabilities, "api-rate-limit")
+		}
+		if s.security.QuotaEnabled() {
+			capabilities = append(capabilities, "persistent-api-quota")
+		}
+	}
 	if s.chat.MultiAgentEnabled() {
 		capabilities = append(capabilities, "supervisor", "specialist-agents", "agent-handoff-audit")
 	}
@@ -214,7 +252,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.10.0-dev",
+		"name": "Zora", "version": "0.11.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"models": s.chat.ModelProfiles(), "default_model_id": s.chat.DefaultModelID(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),

@@ -290,6 +290,10 @@ erDiagram
 
 保存根 Run 级审批：触发原因、pending/approved/rejected/expired 状态、决定说明和时间。状态迁移使用条件更新阻止重复决定。
 
+#### api_usage_daily
+
+以 `usage_date + principal_id + resource` 为主键，保存请求数、Agent Run 数和知识上传字节的 UTC 日累计值。扣减使用数据库条件 Upsert 原子完成，超过上限时不修改已用额度；因此并发请求和服务重启不会绕过日配额。
+
 ### 6.2 上下文数据
 
 
@@ -661,7 +665,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 ## 10. 项目亮点结论
 
-完整 20 项分析见[项目亮点全面分析](project-highlights.md)。最值得面试展开的六项是：
+完整 22 项分析见[项目亮点全面分析](project-highlights.md)。最值得面试展开的七项是：
 
 1. **执行模型清晰**：Message、Run、RunEvent 分离；
 2. **RAG 有治理和评测**：版本、ACL、引用、混合检索和回归指标；
@@ -669,8 +673,9 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 4. **多 Agent 有治理**：权限、预算、并发、超时、父子 Run 和对照评测；
 5. **副作用安全**：Draft、确认、Operation、幂等、租约和远端检查点。
 6. **异步可靠性**：助手消息与 Memory Job 原子入队、租约领取、退避重试和崩溃恢复。
+7. **部署安全边界**：可信 IP 限流、持久化日配额、CSRF/CORS 与文件 Secret。
 
-这五项能体现 Go 后端能力与 Agent 工程能力的结合。
+这些能力能体现 Go 后端、安全工程与 Agent 工程能力的结合。
 
 ## 11. 项目缺陷与待改进项
 
@@ -682,9 +687,8 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 | 缺陷                      | 风险                        | 建议方案                                       |
 | ----------------------- | ------------------------- | ------------------------------------------ |
 | 没有认证与租户体系               | 任意访问者可读取对话、记忆、文档和草稿       | OIDC/JWT、中间件注入 principal、全表 tenant_id、RBAC |
-| 没有 API 限流和配额            | 模型费用、连接和工具可被滥用            | 用户/IP/模型多维令牌桶、并发限额、每日预算                    |
-| Web 缺少完整 CSRF/CORS 部署策略 | 接公网后可能被跨站调用               | SameSite Cookie、CSRF Token、严格 Origin/CORS  |
-| Secret 仍主要依赖环境/文件约定     | 运维误配可能泄漏                  | Vault/KMS/Secret Manager、自动轮换和审计           |
+| 尚无 JWT/OIDC 与按模型成本预算       | 当前配额按单用户主体、IP 和资源计数，不能代表真实租户计费 | 认证主体、tenant_id、按模型 Token/费用预算与 RBAC             |
+| Secret 尚未接入托管轮换平台          | 已有严格 `_FILE` 注入，但轮换和访问审计依赖部署平台 | Vault/KMS/Secret Manager、自动轮换和审计                     |
 | Microsoft 写链路未真实租户验收    | 代码测试通过不代表 Graph 权限与幂等真实有效 | 测试租户端到端、失败注入、重复执行验收                        |
 
 
@@ -696,9 +700,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 | 缺陷                 | 当前影响               | 建议方案                                  |
 | ------------------ | ------------------ | ------------------------------------- |
 | 会话锁只在单进程内          | 多实例可能并发处理同一会话      | PostgreSQL advisory lock 或 Redis 分布式锁 |
-| Summary 仍在回答后同步执行  | 长对话触发时增加尾延迟       | 复用 Outbox Worker 模式异步更新，并保留序号幂等边界       |
-| 文档摄取同步             | 大文件占用 HTTP 连接      | Ingestion Job、状态表、队列、批量 Embedding     |
-| 没有统一任务平台           | Memory 有专用 Worker，但文档摄取和 Office 仍由请求触发 | 抽象通用 Job、Worker、退避、死信和管理面              |
+| 通用任务平台尚无优先级/死信面板 | 文档摄取和摘要已共享 Worker，但 Memory/Office 仍保留专用状态机 | 统一运维视图、优先级、死信告警与任务取消协议              |
 | 迁移方式偏内嵌            | Schema 演进与回滚能力有限   | golang-migrate/Atlas，版本化 SQL 和回滚策略    |
 | RunEvent 无归档策略     | 长期数据量持续增长          | 分区、TTL、冷热分层和聚合表                       |
 | 可观察性仍是开发环境直连 | 尚无 Collector、Dashboard 和告警 | Collector 管道、Grafana、SLO 和告警规则           |

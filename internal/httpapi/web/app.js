@@ -23,6 +23,8 @@ const state = {
   draft: null,
   draftArticle: null,
   draftRenderFrame: null,
+  csrfToken: null,
+  csrfPromise: null,
 };
 
 const elements = {
@@ -84,6 +86,11 @@ const elements = {
 
 async function api(path, options = {}) {
   const headers = { ...(options.headers || {}) };
+  const method = String(options.method || "GET").toUpperCase();
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    const token = await getCSRFToken();
+    if (token) headers["X-CSRF-Token"] = token;
+  }
   // multipart/form-data 的 boundary 必须由浏览器生成，不能手动覆盖 Content-Type。
   if (!(options.body instanceof FormData) && !headers["Content-Type"]) {
     headers["Content-Type"] = "application/json";
@@ -91,6 +98,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, {
     ...options,
     headers,
+    credentials: "same-origin",
   });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -98,6 +106,21 @@ async function api(path, options = {}) {
   }
   if (response.status === 204) return null;
   return response.json();
+}
+
+async function getCSRFToken() {
+  if (state.csrfToken !== null) return state.csrfToken;
+  if (!state.csrfPromise) {
+    state.csrfPromise = fetch("/api/security/csrf", { credentials: "same-origin" })
+      .then(async response => {
+        if (!response.ok) throw new Error("获取 CSRF Token 失败");
+        const body = await response.json();
+        state.csrfToken = body.enabled ? body.token : "";
+        return state.csrfToken;
+      })
+      .finally(() => { state.csrfPromise = null; });
+  }
+  return state.csrfPromise;
 }
 
 async function initialize() {
@@ -900,11 +923,13 @@ async function sendMessage(rawContent) {
   const controller = new AbortController();
   state.controller = controller;
   try {
+    const csrfToken = await getCSRFToken();
     const response = await fetch(`/api/conversations/${state.activeID}/messages`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream", ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}) },
       body: JSON.stringify({ content, model_id: state.selectedModelID }),
       signal: controller.signal,
+      credentials: "same-origin",
     });
     if (!response.ok || !response.body) {
       const body = await response.json().catch(() => ({}));

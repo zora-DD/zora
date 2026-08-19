@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zhiruo/zora/internal/secrets"
 )
 
 const defaultInstruction = `你是 Zora，一个可靠、简洁的中文 AI 助手。
@@ -98,6 +100,16 @@ type Config struct {
 	BackgroundWorkerLeaseDuration time.Duration // 通用后台任务租约。
 	BackgroundWorkerRetryBase     time.Duration // 通用后台任务失败退避基数。
 	BackgroundWorkerMaxAttempts   int           // 通用后台任务最大尝试次数。
+	RateLimitEnabled              bool          // 是否启用按客户端 IP 的令牌桶限流。
+	RateLimitRequestsPerSecond    float64       // 单个客户端每秒补充的请求令牌数。
+	RateLimitBurst                int           // 单个客户端允许的瞬时突发请求数。
+	DailyRequestQuota             int64         // 每主体每日 API 请求配额；0 表示不限制。
+	DailyChatQuota                int64         // 每主体每日 Agent Run 配额；0 表示不限制。
+	DailyUploadBytesQuota         int64         // 每主体每日知识库上传字节配额；0 表示不限制。
+	CSRFEnabled                   bool          // 是否校验浏览器写请求的双提交 CSRF Token。
+	CookieSecure                  bool          // 生产 HTTPS 环境应开启，禁止 Cookie 经明文 HTTP 传输。
+	CORSAllowedOrigins            []string      // 跨源访问的精确 Origin 白名单，不支持通配符。
+	TrustedProxyCIDRs             []string      // 仅这些反向代理可提供 X-Forwarded-For。
 
 	SummaryEnabled         bool // 是否启用长对话增量摘要与上下文压缩。
 	SummaryTriggerMessages int  // 尚未摘要的消息达到该数量后触发增量摘要。
@@ -262,6 +274,40 @@ func Load() (Config, error) {
 	if err != nil || backgroundWorkerMaxAttempts > 20 {
 		return Config{}, fmt.Errorf("ZORA_BACKGROUND_WORKER_MAX_ATTEMPTS 必须在 1 到 20 之间")
 	}
+	rateLimitEnabled, err := strconv.ParseBool(env("ZORA_RATE_LIMIT_ENABLED", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_RATE_LIMIT_ENABLED 必须是 true 或 false")
+	}
+	rateLimitRPS, err := strconv.ParseFloat(env("ZORA_RATE_LIMIT_REQUESTS_PER_SECOND", "10"), 64)
+	if err != nil || math.IsNaN(rateLimitRPS) || math.IsInf(rateLimitRPS, 0) || rateLimitRPS <= 0 || rateLimitRPS > 10000 {
+		return Config{}, fmt.Errorf("ZORA_RATE_LIMIT_REQUESTS_PER_SECOND 必须大于 0 且不超过 10000")
+	}
+	rateLimitBurst, err := positiveInt("ZORA_RATE_LIMIT_BURST", "20")
+	if err != nil || rateLimitBurst > 100000 {
+		return Config{}, fmt.Errorf("ZORA_RATE_LIMIT_BURST 必须在 1 到 100000 之间")
+	}
+	dailyRequestQuota, err := nonNegativeInt64("ZORA_DAILY_REQUEST_QUOTA", "10000")
+	if err != nil {
+		return Config{}, err
+	}
+	dailyChatQuota, err := nonNegativeInt64("ZORA_DAILY_CHAT_QUOTA", "500")
+	if err != nil {
+		return Config{}, err
+	}
+	dailyUploadBytesQuota, err := nonNegativeInt64("ZORA_DAILY_UPLOAD_BYTES_QUOTA", "104857600")
+	if err != nil {
+		return Config{}, err
+	}
+	csrfEnabled, err := strconv.ParseBool(env("ZORA_CSRF_ENABLED", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_CSRF_ENABLED 必须是 true 或 false")
+	}
+	cookieSecure, err := strconv.ParseBool(env("ZORA_COOKIE_SECURE", "false"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_COOKIE_SECURE 必须是 true 或 false")
+	}
+	corsAllowedOrigins := splitCSV(os.Getenv("ZORA_CORS_ALLOWED_ORIGINS"))
+	trustedProxyCIDRs := splitCSV(os.Getenv("ZORA_TRUSTED_PROXY_CIDRS"))
 	summaryEnabled, err := strconv.ParseBool(env("ZORA_SUMMARY_ENABLED", "true"))
 	if err != nil {
 		return Config{}, fmt.Errorf("ZORA_SUMMARY_ENABLED 必须是 true 或 false")
@@ -320,16 +366,28 @@ func Load() (Config, error) {
 	if officeExecutor == "microsoft_graph" && !officeMicrosoftWrite {
 		return Config{}, fmt.Errorf("启用 Microsoft Graph 办公执行器时必须显式设置 ZORA_OFFICE_MICROSOFT_WRITE_ENABLED=true")
 	}
+	postgresDSN, err := secrets.Resolve("ZORA_POSTGRES_DSN", "ZORA_POSTGRES_DSN_FILE")
+	if err != nil {
+		return Config{}, err
+	}
+	apiKey, err := secrets.Resolve("ZORA_API_KEY", "ZORA_API_KEY_FILE")
+	if err != nil {
+		return Config{}, err
+	}
+	embeddingAPIKey, err := secrets.Resolve("ZORA_EMBEDDING_API_KEY", "ZORA_EMBEDDING_API_KEY_FILE")
+	if err != nil {
+		return Config{}, err
+	}
 
 	cfg := Config{
 		Addr:                        env("ZORA_ADDR", ":8088"),
 		DataDir:                     env("ZORA_DATA_DIR", "./data"),
 		StoreProvider:               strings.ToLower(env("ZORA_STORE_PROVIDER", "sqlite")),
-		PostgresDSN:                 strings.TrimSpace(os.Getenv("ZORA_POSTGRES_DSN")),
+		PostgresDSN:                 postgresDSN,
 		PostgresMaxConns:            postgresMaxConns,
 		Provider:                    strings.ToLower(env("ZORA_MODEL_PROVIDER", "mock")),
 		Model:                       env("ZORA_MODEL", "qwen-plus"),
-		APIKey:                      strings.TrimSpace(os.Getenv("ZORA_API_KEY")),
+		APIKey:                      apiKey,
 		BaseURL:                     strings.TrimRight(strings.TrimSpace(os.Getenv("ZORA_BASE_URL")), "/"),
 		Instruction:                 env("ZORA_SYSTEM_PROMPT", defaultInstruction),
 		RequestTimeout:              timeout,
@@ -350,7 +408,7 @@ func Load() (Config, error) {
 
 		EmbeddingProvider:     embeddingProvider,
 		EmbeddingModel:        env("ZORA_EMBEDDING_MODEL", "text-embedding-v4"),
-		EmbeddingAPIKey:       strings.TrimSpace(os.Getenv("ZORA_EMBEDDING_API_KEY")),
+		EmbeddingAPIKey:       embeddingAPIKey,
 		EmbeddingBaseURL:      strings.TrimRight(strings.TrimSpace(os.Getenv("ZORA_EMBEDDING_BASE_URL")), "/"),
 		EmbeddingDimensions:   embeddingDimensions,
 		KnowledgeChunkSize:    chunkSize,
@@ -375,6 +433,16 @@ func Load() (Config, error) {
 		BackgroundWorkerLeaseDuration: backgroundWorkerLeaseDuration,
 		BackgroundWorkerRetryBase:     backgroundWorkerRetryBase,
 		BackgroundWorkerMaxAttempts:   backgroundWorkerMaxAttempts,
+		RateLimitEnabled:              rateLimitEnabled,
+		RateLimitRequestsPerSecond:    rateLimitRPS,
+		RateLimitBurst:                rateLimitBurst,
+		DailyRequestQuota:             dailyRequestQuota,
+		DailyChatQuota:                dailyChatQuota,
+		DailyUploadBytesQuota:         dailyUploadBytesQuota,
+		CSRFEnabled:                   csrfEnabled,
+		CookieSecure:                  cookieSecure,
+		CORSAllowedOrigins:            corsAllowedOrigins,
+		TrustedProxyCIDRs:             trustedProxyCIDRs,
 
 		SummaryEnabled:         summaryEnabled,
 		SummaryTriggerMessages: summaryTriggerMessages,
@@ -522,7 +590,11 @@ func buildModelProfile(input modelProfileInput) (ModelProfile, error) {
 		if !validEnvironmentName(apiKeyEnv) {
 			return ModelProfile{}, fmt.Errorf("模型配置 %q 的 api_key_env=%q 无效", input.ID, apiKeyEnv)
 		}
-		profile.APIKey = strings.TrimSpace(os.Getenv(apiKeyEnv))
+		var err error
+		profile.APIKey, err = secrets.ResolveEnvironment(apiKeyEnv)
+		if err != nil {
+			return ModelProfile{}, fmt.Errorf("模型配置 %q 的 API Key 加载失败：%w", input.ID, err)
+		}
 		if profile.APIKey == "" {
 			return ModelProfile{}, fmt.Errorf("模型配置 %q 需要通过环境变量 %s 提供 API Key", input.ID, apiKeyEnv)
 		}
@@ -655,6 +727,25 @@ func nonNegativeInt(key, fallback string) (int, error) {
 		return 0, fmt.Errorf("%s 不能小于 0", key)
 	}
 	return value, nil
+}
+
+func nonNegativeInt64(key, fallback string) (int64, error) {
+	value, err := strconv.ParseInt(env(key, fallback), 10, 64)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s 不能小于 0", key)
+	}
+	return value, nil
+}
+
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
 }
 
 func env(key, fallback string) string {

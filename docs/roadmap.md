@@ -144,6 +144,19 @@
 
 当前验证结果：SQLite 自动化测试覆盖消息与 Job 原子提交及回滚、同 Run 重复入队、available_at、租约和最后尝试恢复；Worker 测试注入一次失败后在第二次完成；HTTP 测试验证 SSE Job 和状态查询；OTel 测试验证后台 `memory.capture` 的父 Span 是原 `agent.run`。PostgreSQL Schema 和领取 SQL 已进入自动化检查，真实 PostgreSQL 并发集成仍应在 Docker 可用环境执行 `make test-postgres`。
 
+## V0.9–V0.11 部署准备能力 — 已完成
+
+- [x] 消息、长期记忆与知识库使用三套物理隔离向量索引，记录模型、维度和索引版本
+- [x] 文档摄取与会话摘要迁入可恢复后台任务，按 kind 使用独立 Worker
+- [x] 后台任务租约、指数退避、人工重投、Payload 清理和异步 Trace/Metric
+- [x] 可信客户端 IP 令牌桶、SQLite/PostgreSQL UTC 每日持久化配额
+- [x] 双提交 CSRF、精确 CORS Origin 白名单与可信代理 CIDR
+- [x] 模型/Embedding Key 和 PostgreSQL DSN 的 `_FILE` Secret 注入与权限校验
+
+验收条件：三类向量不能混表召回；HTTP 不等待真实 Embedding 摄取和摘要完成；重启后任务与日配额状态不丢；伪造代理 Header、非法 Origin、缺失 CSRF 和超额请求必须被明确拒绝；Secret 不得写入配置 JSON、日志或 API 响应。
+
+V0.11 后停止继续扩展非必要功能，进入部署、真实环境负向验证和故障复盘。未完成事项仅保留多用户认证/租户隔离、多副本全局限流、托管 Secret 自动轮换、独立消息/记忆召回评测，以及 Microsoft 365 外部资源验收。
+
 ## 后续技术待办
 
 - [ ] 为不同 Job 并发更新同一 `kind + memory_key` 增加数据库唯一约束、冲突重读与合并重试。

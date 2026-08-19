@@ -2,7 +2,7 @@
 
 | 文档 | 适合读者 | 内容 |
 |---|---|---|
-| [项目亮点全面分析](project-highlights.md) | 项目作者、Agent 岗位候选人 | 18 个亮点的源码位置、业务场景、问题、实现和选型理由 |
+| [项目亮点全面分析](project-highlights.md) | 项目作者、Agent 岗位候选人 | 22 个亮点的源码位置、业务场景、问题、实现和选型理由 |
 | [项目分析文档](project-analysis.md) | 项目作者、架构评审、Agent 岗位候选人 | 定位、业务/数据模型、流程、架构、取舍、缺陷、口述稿、追问和简历表达 |
 | [项目技术文档](technical-design.md) | 开发者、维护者 | 核心流程、包设计、接口、事件、并发、安全、测试和扩展方案 |
 | [面试问题总结](interview-questions.md) | 项目作者、Agent 岗位候选人 | 只归档实际提出过的问题，并结合当前源码给出简答、详解和追问依据 |
@@ -11,6 +11,8 @@
 | [第一阶段：真实 Embedding 与 RAG 基线](phase-1-real-embedding.md) | 项目作者、评测维护者 | 配置、索引隔离、64 题真实向量评测和指标记录 |
 | [第二阶段：OTel 与 Prometheus](phase-2-observability.md) | 开发者、运维、面试复习 | HTTP/Run/模型/Tool/Embedding Trace、指标、本地启动与排障 |
 | [第三阶段：Memory Capture Outbox](phase-3-memory-outbox.md) | 后端开发者、面试复习 | 事务入队、租约 Worker、退避重试、状态 API 与异步 Trace |
+| [第四阶段：后台任务异步化](phase-4-background-jobs.md) | 后端开发者、面试复习 | 文档摄取、会话摘要、任务租约、重试和异步 Trace |
+| [部署前 API 安全](deployment-security.md) | 开发者、运维、面试复习 | 限流、持久化配额、CSRF/CORS、可信代理与 Secret 文件 |
 
 ## 文档维护原则
 

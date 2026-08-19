@@ -40,6 +40,8 @@ func TestSchemaUsesConfiguredVectorDimensions(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS background_jobs",
 		"idx_background_jobs_kind_status_available",
 		"INSERT INTO zora_schema_versions(version) VALUES (12)",
+		"CREATE TABLE IF NOT EXISTS api_usage_daily",
+		"INSERT INTO zora_schema_versions(version) VALUES (13)",
 		"idx_memory_capture_jobs_status_available",
 		"CREATE TABLE IF NOT EXISTS office_operation_events",
 		"idempotency_key TEXT NOT NULL UNIQUE",

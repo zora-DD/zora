@@ -18,6 +18,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/security"
 	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
@@ -225,6 +226,15 @@ CREATE TABLE IF NOT EXISTS background_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_background_jobs_kind_status_available
     ON background_jobs(kind, status, available_at, created_at);
+-- API 配额按 UTC 自然日持久化，保证进程重启后不会重新获得额度。
+CREATE TABLE IF NOT EXISTS api_usage_daily (
+    usage_date TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    resource TEXT NOT NULL CHECK (resource IN ('requests', 'chat_runs', 'knowledge_upload_bytes')),
+    used INTEGER NOT NULL CHECK (used >= 0),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (usage_date, principal_id, resource)
+);
 -- 消息和长期记忆使用独立索引表，避免不同生命周期与召回策略互相污染。
 CREATE TABLE IF NOT EXISTS message_embeddings (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
@@ -298,6 +308,7 @@ var (
 	_ memory.Store           = (*SQLite)(nil)
 	_ memory.CaptureJobStore = (*SQLite)(nil)
 	_ semantic.Store         = (*SQLite)(nil)
+	_ security.QuotaStore    = (*SQLite)(nil)
 	_ office.Store           = (*SQLite)(nil)
 	_ summary.Store          = (*SQLite)(nil)
 )

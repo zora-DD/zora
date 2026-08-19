@@ -4,7 +4,7 @@ Zora 是一个使用 Go 与 Eino 实现的可观察 Agent 工作台：支持流�
 
 这个项目的重点不是复刻一个聊天页面，而是实践 Agent 产品从“模型能回答”走向“系统可控制、可追踪、可评估、可扩展”的核心工程问题。
 
-> 当前版本：V0.10。文档摄取和会话摘要已迁移到可恢复后台 Worker；消息、长期记忆与知识库具有物理隔离的向量索引。Microsoft Graph 写执行器已实现但尚未使用真实 Microsoft 365 租户在线验收。
+> 当前版本：V0.11（部署准备版）。消息/长期记忆独立向量索引、文档摄取/会话摘要后台任务，以及 API 限流、持久化配额、CSRF/CORS 和 Secret 文件注入均已完成。Microsoft Graph 写执行器尚未使用真实 Microsoft 365 租户在线验收。
 
 ## 为什么做 Zora
 
@@ -33,6 +33,8 @@ Zora 围绕这些问题实现了一套可以本地运行、阅读和继续扩展
 | MCP | 官方 Go SDK、stdio Server、工具白名单、只读声明校验、环境变量最小透传 |
 | 办公助手 | 邮件/日程草稿、草稿箱、一次性确认、持久化 Operation、租约、幂等与恢复 |
 | 可观察性 | RunEvent、TTFT、真实 Token Usage、Web 运行监控、OTel Trace、Prometheus 指标 |
+| API 安全 | 按可信客户端 IP 限流、SQLite/PostgreSQL 每日配额、双提交 CSRF、精确 CORS 白名单、可信代理边界 |
+| Secret 管理 | 模型 Key、Embedding Key、PostgreSQL DSN 支持环境变量或权限收敛的 `_FILE` 注入，禁止双重配置 |
 | 数据层 | SQLite 零依赖模式；PostgreSQL + pgvector + FTS 生产检索模式 |
 | 评测 | RAG、Memory A/B、单/多 Agent Control/Treatment 固定数据集与质量门禁 |
 
@@ -42,7 +44,8 @@ Zora 围绕这些问题实现了一套可以本地运行、阅读和继续扩展
 
 ```mermaid
 flowchart LR
-    User["用户 / Web"] --> API["HTTP API + SSE"]
+    User["用户 / Web"] --> Guard["Rate Limit / Quota / CSRF / CORS"]
+    Guard --> API["HTTP API + SSE"]
     API --> Chat["Chat Service"]
     Chat --> Runtime["Eino Agent Runtime"]
     Runtime --> Model["Mock / OpenAI-compatible 模型"]
@@ -115,6 +118,16 @@ cp .env.example .env.local
 ```
 
 `.env.local` 已被 Git 忽略。不要把真实 Key 写入 `.env.example`、源码或 `ZORA_MODELS_JSON`。
+
+生产部署推荐把密钥挂载为 `0400` 或 `0600` 的普通文件：
+
+```bash
+ZORA_API_KEY_FILE=/run/secrets/zora_model_api_key
+ZORA_EMBEDDING_API_KEY_FILE=/run/secrets/zora_embedding_api_key
+ZORA_POSTGRES_DSN_FILE=/run/secrets/zora_postgres_dsn
+```
+
+直接值与对应的 `_FILE` 不能同时设置。多模型 `api_key_env` 也自动支持同名 `_FILE`，例如配置 `DEEPSEEK_API_KEY_FILE` 后，JSON 仍填写 `"api_key_env":"DEEPSEEK_API_KEY"`。
 
 单模型配置示例：
 
@@ -349,7 +362,7 @@ make build-mcp-connectors
 
 | 资源 | 主要接口 |
 |---|---|
-| 运行信息 | `GET /api/health`、`GET /api/info` |
+| 运行信息与安全 | `GET /api/health`、`GET /api/info`、`GET /api/security/csrf` |
 | Prometheus | `GET /metrics`（仅启用指标时注册） |
 | 对话 | `/api/conversations`、`/api/conversations/{id}/messages` |
 | Run | `/api/runs`、`/api/runs/{id}/events`、`/api/runs/{id}/metrics` |

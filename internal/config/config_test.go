@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -22,6 +24,11 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	}
 	if cfg.OTelEnabled || cfg.PrometheusEnabled || cfg.OTelServiceName != "zora" || cfg.OTelSampleRatio != 1 {
 		t.Fatalf("unexpected observability defaults: %+v", cfg)
+	}
+	if !cfg.RateLimitEnabled || cfg.RateLimitRequestsPerSecond != 10 || cfg.RateLimitBurst != 20 ||
+		cfg.DailyRequestQuota != 10000 || cfg.DailyChatQuota != 500 || cfg.DailyUploadBytesQuota != 104857600 ||
+		!cfg.CSRFEnabled || cfg.CookieSecure || len(cfg.CORSAllowedOrigins) != 0 || len(cfg.TrustedProxyCIDRs) != 0 {
+		t.Fatalf("unexpected API security defaults: %+v", cfg)
 	}
 	if cfg.DefaultModelID != "default" || len(cfg.ModelProfiles) != 1 || cfg.ModelProfiles[0].Model != "zora-mock" {
 		t.Fatalf("unexpected model profile defaults: %+v", cfg.ModelProfiles)
@@ -83,6 +90,23 @@ func TestLoadMultipleModelProfiles(t *testing.T) {
 	thinking, ok := cfg.ModelExtraFields["thinking"].(map[string]any)
 	if !ok || thinking["type"] != "disabled" {
 		t.Fatalf("unexpected DeepSeek extra fields: %#v", cfg.ModelExtraFields)
+	}
+}
+
+func TestLoadModelProfileSupportsSecretFileConvention(t *testing.T) {
+	clearEnvironment(t)
+	secretPath := filepath.Join(t.TempDir(), "model-key")
+	if err := os.WriteFile(secretPath, []byte("file-model-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MODEL_TEST_KEY_FILE", secretPath)
+	t.Setenv("ZORA_MODELS_JSON", `[{"id":"file-model","provider":"openai","model":"example","base_url":"https://model.example/v1","api_key_env":"MODEL_TEST_KEY"}]`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKey != "file-model-key" || cfg.ModelProfiles[0].APIKey != "file-model-key" {
+		t.Fatalf("model secret file was not loaded: %+v", cfg.ModelProfiles)
 	}
 }
 
@@ -228,21 +252,26 @@ func TestLoadMCPRequiresExplicitAllowlistAndIsolatesCoreCredentials(t *testing.T
 func clearEnvironment(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
-		"ZORA_ADDR", "ZORA_DATA_DIR", "ZORA_MODEL_PROVIDER", "ZORA_MODEL", "ZORA_API_KEY",
+		"ZORA_ADDR", "ZORA_DATA_DIR", "ZORA_MODEL_PROVIDER", "ZORA_MODEL", "ZORA_API_KEY", "ZORA_API_KEY_FILE",
 		"ZORA_BASE_URL", "ZORA_MODELS_JSON", "ZORA_DEFAULT_MODEL_ID", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
 		"ZORA_OTEL_ENABLED", "ZORA_PROMETHEUS_ENABLED", "ZORA_OTEL_ENVIRONMENT", "ZORA_OTEL_SAMPLE_RATIO",
 		"OTEL_SERVICE_NAME", "OTEL_EXPORTER_OTLP_ENDPOINT",
 		"ZORA_MULTI_AGENT_ENABLED", "ZORA_MULTI_AGENT_MAX_HANDOFFS", "ZORA_MULTI_AGENT_MAX_PARALLEL",
 		"ZORA_MULTI_AGENT_SPECIALIST_TIMEOUT", "ZORA_MULTI_AGENT_RETRY_COUNT",
 		"ZORA_MULTI_AGENT_APPROVAL_MODE", "ZORA_MULTI_AGENT_APPROVAL_TIMEOUT",
-		"ZORA_STORE_PROVIDER", "ZORA_POSTGRES_DSN", "ZORA_POSTGRES_MAX_CONNS",
-		"ZORA_EMBEDDING_PROVIDER", "ZORA_EMBEDDING_MODEL", "ZORA_EMBEDDING_API_KEY",
+		"ZORA_STORE_PROVIDER", "ZORA_POSTGRES_DSN", "ZORA_POSTGRES_DSN_FILE", "ZORA_POSTGRES_MAX_CONNS",
+		"ZORA_EMBEDDING_PROVIDER", "ZORA_EMBEDDING_MODEL", "ZORA_EMBEDDING_API_KEY", "ZORA_EMBEDDING_API_KEY_FILE",
 		"ZORA_EMBEDDING_BASE_URL", "ZORA_EMBEDDING_DIMENSIONS", "ZORA_KNOWLEDGE_CHUNK_SIZE",
 		"ZORA_KNOWLEDGE_CHUNK_OVERLAP", "ZORA_KNOWLEDGE_PRINCIPAL_ID",
 		"ZORA_MEMORY_AUTO_CAPTURE", "ZORA_MEMORY_MAX_CANDIDATES",
 		"ZORA_MEMORY_RECALL_ENABLED", "ZORA_MEMORY_RECALL_LIMIT", "ZORA_MEMORY_RECALL_MIN_SCORE",
 		"ZORA_MEMORY_WORKER_POLL_INTERVAL", "ZORA_MEMORY_WORKER_TASK_TIMEOUT", "ZORA_MEMORY_WORKER_LEASE_DURATION",
 		"ZORA_MEMORY_WORKER_RETRY_BASE", "ZORA_MEMORY_WORKER_MAX_ATTEMPTS",
+		"ZORA_BACKGROUND_WORKER_POLL_INTERVAL", "ZORA_BACKGROUND_WORKER_TASK_TIMEOUT", "ZORA_BACKGROUND_WORKER_LEASE_DURATION",
+		"ZORA_BACKGROUND_WORKER_RETRY_BASE", "ZORA_BACKGROUND_WORKER_MAX_ATTEMPTS",
+		"ZORA_RATE_LIMIT_ENABLED", "ZORA_RATE_LIMIT_REQUESTS_PER_SECOND", "ZORA_RATE_LIMIT_BURST",
+		"ZORA_DAILY_REQUEST_QUOTA", "ZORA_DAILY_CHAT_QUOTA", "ZORA_DAILY_UPLOAD_BYTES_QUOTA",
+		"ZORA_CSRF_ENABLED", "ZORA_COOKIE_SECURE", "ZORA_CORS_ALLOWED_ORIGINS", "ZORA_TRUSTED_PROXY_CIDRS",
 		"ZORA_SUMMARY_ENABLED", "ZORA_SUMMARY_TRIGGER_MESSAGES", "ZORA_SUMMARY_KEEP_RECENT", "ZORA_SUMMARY_MAX_RUNES",
 		"ZORA_MCP_ENABLED", "ZORA_MCP_SERVERS_JSON", "ZORA_MCP_CONNECT_TIMEOUT", "ZORA_MCP_CALL_TIMEOUT", "ZORA_MCP_MAX_OUTPUT_RUNES",
 		"ZORA_OFFICE_EXECUTOR", "ZORA_OFFICE_EXECUTOR_COMMAND", "ZORA_OFFICE_EXECUTOR_ARGS_JSON",

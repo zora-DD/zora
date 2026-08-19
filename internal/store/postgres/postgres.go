@@ -15,6 +15,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/security"
 	"github.com/zhiruo/zora/internal/semantic"
 	"github.com/zhiruo/zora/internal/store"
 	"github.com/zhiruo/zora/internal/summary"
@@ -39,6 +40,7 @@ var (
 	_ memory.Store             = (*Postgres)(nil)
 	_ memory.CaptureJobStore   = (*Postgres)(nil)
 	_ semantic.Store           = (*Postgres)(nil)
+	_ security.QuotaStore      = (*Postgres)(nil)
 	_ office.Store             = (*Postgres)(nil)
 	_ summary.Store            = (*Postgres)(nil)
 )

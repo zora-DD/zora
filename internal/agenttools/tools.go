@@ -80,7 +80,7 @@ func Build() ([]tool.BaseTool, error) {
 		"介绍当前 Zora 项目的已实现能力与下一个里程碑。",
 		func(_ context.Context, _ *projectStatusInput) (*projectStatusOutput, error) {
 			return &projectStatusOutput{
-				Version: "0.10.0-dev",
+				Version: "0.11.0-dev",
 				Available: []string{
 					"流式对话", "持久化会话", "Eino ReAct 循环",
 					"只读工具", "执行事件审计", "TXT/Markdown/PDF 知识库摄取",
@@ -103,8 +103,10 @@ func Build() ([]tool.BaseTool, error) {
 					"可恢复 Office Operation 与 Microsoft Graph 幂等写执行器",
 					"Microsoft client credentials OAuth、Secret 文件与读写身份隔离",
 					"Agent Run 指标、真实 Token Usage、首字延迟与工具耗时",
+					"消息/长期记忆独立向量索引与文档/摘要异步 Worker",
+					"API 限流、持久化日配额、CSRF/CORS 与 Secret 文件注入",
 				},
-				NextMilestone: "V0.10 后台任务异步化；下一步完成部署前 API 安全",
+				NextMilestone: "V0.11 部署准备能力完成；下一步进行真实部署与负向验证",
 			}, nil
 		},
 	)

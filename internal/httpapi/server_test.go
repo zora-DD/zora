@@ -28,6 +28,7 @@ import (
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
+	"github.com/zhiruo/zora/internal/security"
 	"github.com/zhiruo/zora/internal/store/sqlite"
 	"github.com/zhiruo/zora/internal/summary"
 )
@@ -542,7 +543,7 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
 		t.Fatalf("info body = %s", response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"version":"0.10.0-dev"`) ||
+	if !strings.Contains(response.Body.String(), `"version":"0.11.0-dev"`) ||
 		!strings.Contains(response.Body.String(), `"tool_count":4`) ||
 		!strings.Contains(response.Body.String(), `"run-metrics"`) ||
 		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||
@@ -552,6 +553,44 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 		!strings.Contains(response.Body.String(), `"conversation_summary":true`) ||
 		!strings.Contains(response.Body.String(), `"context-compression"`) {
 		t.Fatalf("info does not report the current runtime capabilities: %s", response.Body.String())
+	}
+}
+
+func TestSecurityCSRFEndpointAndWriteProtection(t *testing.T) {
+	handler := newTestHandlerWithOptions(t, func(database *sqlite.SQLite) []Option {
+		manager, err := security.New(security.Config{CSRFEnabled: true, PrincipalID: "test"}, database)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return []Option{WithSecurity(manager)}
+	})
+
+	tokenResponse := httptest.NewRecorder()
+	handler.ServeHTTP(tokenResponse, httptest.NewRequest(http.MethodGet, "/api/security/csrf", nil))
+	if tokenResponse.Code != http.StatusOK || len(tokenResponse.Result().Cookies()) != 1 {
+		t.Fatalf("csrf token status=%d cookies=%d body=%s", tokenResponse.Code, len(tokenResponse.Result().Cookies()), tokenResponse.Body.String())
+	}
+	var tokenBody struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(tokenResponse.Body.Bytes(), &tokenBody); err != nil || tokenBody.Token == "" {
+		t.Fatalf("csrf body=%s err=%v", tokenResponse.Body.String(), err)
+	}
+
+	missing := httptest.NewRecorder()
+	handler.ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/api/conversations", strings.NewReader(`{"title":"blocked"}`)))
+	if missing.Code != http.StatusForbidden {
+		t.Fatalf("missing csrf status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	validRequest := httptest.NewRequest(http.MethodPost, "/api/conversations", strings.NewReader(`{"title":"allowed"}`))
+	validRequest.Header.Set("Content-Type", "application/json")
+	validRequest.Header.Set("X-CSRF-Token", tokenBody.Token)
+	validRequest.AddCookie(tokenResponse.Result().Cookies()[0])
+	valid := httptest.NewRecorder()
+	handler.ServeHTTP(valid, validRequest)
+	if valid.Code != http.StatusCreated {
+		t.Fatalf("valid csrf status=%d body=%s", valid.Code, valid.Body.String())
 	}
 }
 
@@ -785,6 +824,10 @@ func TestAsyncMemoryCaptureReturnsJobAndExposesStatusAPI(t *testing.T) {
 }
 
 func newTestHandler(t *testing.T) http.Handler {
+	return newTestHandlerWithOptions(t, nil)
+}
+
+func newTestHandlerWithOptions(t *testing.T, buildOptions func(*sqlite.SQLite) []Option) http.Handler {
 	t.Helper()
 	database, err := sqlite.Open(filepath.Join(t.TempDir(), "spa.db"))
 	if err != nil {
@@ -819,10 +862,14 @@ func newTestHandler(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
+	options := []Option(nil)
+	if buildOptions != nil {
+		options = buildOptions(database)
+	}
 	handler, err := New(chat.NewService(database, runtime,
 		chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService),
 		chat.WithConversationSummarizer(summaryService),
-	), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
+	), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second, options...)
 	if err != nil {
 		t.Fatal(err)
 	}

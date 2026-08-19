@@ -224,6 +224,15 @@ CREATE TABLE IF NOT EXISTS background_jobs (
 CREATE INDEX IF NOT EXISTS idx_background_jobs_kind_status_available
     ON background_jobs(kind, status, available_at, created_at);
 
+CREATE TABLE IF NOT EXISTS api_usage_daily (
+    usage_date DATE NOT NULL,
+    principal_id TEXT NOT NULL,
+    resource TEXT NOT NULL CHECK (resource IN ('requests', 'chat_runs', 'knowledge_upload_bytes')),
+    used BIGINT NOT NULL CHECK (used >= 0),
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (usage_date, principal_id, resource)
+);
+
 -- 三类向量实体使用物理隔离表；模型、维度和版本共同定义可查询的索引空间。
 CREATE TABLE IF NOT EXISTS message_embeddings (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
@@ -320,4 +329,5 @@ INSERT INTO zora_schema_versions(version) VALUES (9) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (10) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (11) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (12) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (13) ON CONFLICT DO NOTHING;
 `

@@ -103,7 +103,10 @@ PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业�
 - 请求体限制为 1 MiB，消息限制为 20,000 字符。
 - Web UI 对模型输出做 HTML 转义。
 - 默认 Content Security Policy 只允许同源资源。
-- API Key 只从环境变量读取。
+- 核心 API Key 与 PostgreSQL DSN 可从环境变量或权限为 `0400/0600` 的 Secret 文件读取；两种来源不能同时配置。
+- `/api` 默认按可信客户端 IP 执行令牌桶限流，并以 SQLite/PostgreSQL 的 `api_usage_daily` 原子扣减请求、Agent Run 和上传字节日配额。
+- 浏览器写请求使用 `HttpOnly + SameSite=Strict` Cookie 与 `X-CSRF-Token` 双提交校验；CORS 仅允许同源或显式精确白名单。
+- 默认忽略客户端提供的 Forwarded Header，只有 `ZORA_TRUSTED_PROXY_CIDRS` 内的直连代理可以声明原始 IP 和协议。
 - 外部写能力不注册为 Agent Tool；只有显式启用的审批后 OfficeExecutor 可以执行固定 Microsoft Graph 写协议。
 - 草稿工具只能从 Chat 注入的可信 Conversation/Run Context 取得来源，并固定返回 `external_effect=false`。
 - 草稿提交、批准和拒绝只能通过独立 REST/Web 操作；批准状态也不触发外部写入，避免把“确认”误当成“执行”。

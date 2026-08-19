@@ -579,9 +579,35 @@ Store 在同一个事务中保存 assistant Message 和 pending CaptureJob；`ru
 
 数据库任务表在当前规模下比引入 MQ 更容易部署，同时已经具备恢复、多实例竞争、状态查询和人工运维能力。按 kind 独立 Worker 保留资源隔离，类型化 Handler 又避免把业务逻辑塞进通用调度器。未来需要 Kafka/RabbitMQ 时，可以替换 Queue/Store 边界而不改 Knowledge 和 Summary Service。
 
+## 22. API 安全边界不是一个网关开关
+
+### 关键代码位置
+
+- [`internal/security/security.go`](../internal/security/security.go)：可信客户端 IP、令牌桶、CORS、CSRF 与配额中间件；
+- [`internal/store/sqlite/api_quota.go`](../internal/store/sqlite/api_quota.go)：SQLite 持久化配额原子扣减；
+- [`internal/store/postgres/api_quota.go`](../internal/store/postgres/api_quota.go)：PostgreSQL 条件 Upsert；
+- [`internal/secrets/secrets.go`](../internal/secrets/secrets.go)：环境变量/Secret 文件互斥加载与权限校验；
+- [`internal/httpapi/web/app.js`](../internal/httpapi/web/app.js)：CSRF Token 内存缓存和 SSE 写请求回传。
+
+### 业务场景
+
+Agent 的一次请求可能触发多次模型、Embedding 和工具调用，公网滥用的成本远高于普通 CRUD。Web 又需要 Cookie 与跨源部署，模型 Key 和数据库密码也不能留在仓库或进程参数里。
+
+### 问题分析
+
+单独加一个每秒计数器不能解决重启后额度清零、伪造 `X-Forwarded-For`、并发越过日限额、跨站写请求、CORS 通配符与 Cookie 组合风险，也不能保证 Secret 文件权限正确。安全控制必须按不同威胁分层。
+
+### 技术实现
+
+应用先做精确 Origin/CORS 校验，再按可信代理解析出的客户端 IP 使用互斥令牌桶限制突发。写请求在扣减配额前校验 256 bit 随机双提交 CSRF Token。请求、Chat Run 和上传字节按 UTC 日写入 `api_usage_daily`，SQLite/PostgreSQL 都使用条件 Upsert 原子完成“检查 + 扣减”。核心凭据支持直接环境变量或 `_FILE`，启动时拒绝双配、非普通文件、超过 64 KiB 和 group/other 可读权限。响应使用 429、`Retry-After` 与限额 Header。
+
+### 为什么这样实现
+
+进程内令牌桶成本低，适合当前单实例；数据库日配额能够跨重启并自然迁移到 PostgreSQL 多实例。双提交 Token 无需额外 Session Store，适合当前自包含 Web。精确 Origin 与可信代理白名单避免“为了能用而全放开”。代码同时明确边界：真正多租户仍需 JWT/OIDC，真正多副本瞬时限流仍应下沉到网关或 Redis，Secret 自动轮换仍交给 Vault/KMS。
+
 ## 如何向面试官总结这些亮点
 
-不要一次背完 21 项。建议根据岗位选择三条主线：
+不要一次背完 22 项。建议根据岗位选择三条主线：
 
 ### Agent 后端岗位
 
