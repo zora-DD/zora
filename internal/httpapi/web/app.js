@@ -720,19 +720,32 @@ async function uploadKnowledgeDocument(event) {
   formData.append("file", file);
   formData.append("visibility", elements.knowledgeVisibility.value);
   elements.uploadKnowledge.disabled = true;
-  elements.uploadKnowledge.textContent = "索引中…";
+  elements.uploadKnowledge.textContent = "正在提交…";
   try {
     const result = await api("/api/knowledge/documents", { method: "POST", body: formData });
+    const completed = result.job ? await waitForBackgroundJob(result.job.id) : result;
     await refreshKnowledgeDocuments();
     elements.knowledgeUpload.reset();
     elements.selectedFile.textContent = "尚未选择";
-    notify(result.deduplicated ? "文档内容已存在，未重复索引" : "文档已完成分块和索引");
+    const ingestion = completed.result || completed;
+    notify(ingestion.deduplicated ? "文档内容已存在，未重复索引" : "文档已完成分块和索引");
   } catch (error) {
     notify(error.message);
   } finally {
     elements.uploadKnowledge.disabled = false;
     elements.uploadKnowledge.textContent = "上传并索引";
   }
+}
+
+async function waitForBackgroundJob(jobID) {
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    const job = await api(`/api/background/jobs/${jobID}`);
+    if (job.status === "completed") return job;
+    if (job.status === "failed") throw new Error(job.last_error || "文档索引任务失败");
+    elements.uploadKnowledge.textContent = job.status === "executing" ? "索引中…" : "排队中…";
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error("文档索引仍在后台执行，请稍后刷新知识库");
 }
 
 async function refreshKnowledgeDocuments() {

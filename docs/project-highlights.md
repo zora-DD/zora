@@ -28,6 +28,7 @@
 | 18 | 单二进制 Web 与安全 Markdown 流式渲染 | Go Embed、前端性能、安全输出 |
 | 19 | OTel Trace 与 Prometheus 低基数指标 | 跨层排障、SLO、可观察性边界 |
 | 20 | Memory Capture 事务 Outbox 与租约 Worker | 原子提交、异步任务、退避重试、崩溃恢复 |
+| 21 | 文档摄取与会话摘要持久化后台任务 | 请求削峰、类型隔离、租约、失败重投 |
 
 ## 1. Go 原生业务内核，Eino 只负责 Agent Runtime
 
@@ -551,9 +552,36 @@ Store 在同一个事务中保存 assistant Message 和 pending CaptureJob；`ru
 
 对当前个人项目，数据库 Outbox 比引入 Kafka/RabbitMQ 更容易部署，却能展示事务一致性、幂等、租约和恢复这些真正的后端能力。消息正文不复制可降低隐私面和存储膨胀；Job Store 契约又保留了未来拆独立 Worker 或接消息中间件的空间。当前明确保留的边界是：不同 Job 在多实例下同时更新相同 `memory_key` 仍需唯一约束与冲突重试。
 
+## 21. 文档摄取和摘要不是请求尾部工作
+
+### 关键代码位置
+
+- [`internal/background/types.go`](../internal/background/types.go)：统一任务状态和 Store 契约；
+- [`internal/background/queue.go`](../internal/background/queue.go)：文档/摘要类型化入队与幂等键；
+- [`internal/background/worker.go`](../internal/background/worker.go)：按 kind 独立领取、租约、退避与恢复；
+- [`internal/background/handlers.go`](../internal/background/handlers.go)：调用 Knowledge/Summary 用例；
+- [`internal/store/postgres/background_jobs.go`](../internal/store/postgres/background_jobs.go)：`SKIP LOCKED` 多实例实现；
+- [`internal/httpapi/server.go`](../internal/httpapi/server.go)：202、任务查询与 failed 重投。
+
+### 业务场景
+
+真实 Embedding 的批量文档摄取和长对话摘要都可能受到模型延迟、限流或短暂故障影响。让浏览器连接一直等待既浪费连接，也会把已经成功的聊天回答绑定到摘要尾延迟。
+
+### 问题分析
+
+普通 goroutine 无法跨进程重启恢复；文档 Payload 如果永久留在任务表会重复保存大量甚至敏感内容；用单个 Worker 处理全部类型又会导致大文档阻塞短摘要；重复提交和租约过期还可能造成重复执行。
+
+### 技术实现
+
+`background_jobs` 复用一套状态机，但 `knowledge_ingestion` 和 `conversation_summary` 由不同 Worker 领取。内容哈希和 Run ID 分别作为幂等键；任务领取写入 owner/lease/attempt，失败按指数退避，耗尽后进入 failed 并允许人工重投。文档成功后清空原文件 Payload，只保留结构化结果；摘要任务只保存会话和 sequence，不复制消息正文。上传立即返回 202，聊天 SSE 返回 `summary_job`。
+
+### 为什么这样实现
+
+数据库任务表在当前规模下比引入 MQ 更容易部署，同时已经具备恢复、多实例竞争、状态查询和人工运维能力。按 kind 独立 Worker 保留资源隔离，类型化 Handler 又避免把业务逻辑塞进通用调度器。未来需要 Kafka/RabbitMQ 时，可以替换 Queue/Store 边界而不改 Knowledge 和 Summary Service。
+
 ## 如何向面试官总结这些亮点
 
-不要一次背完 20 项。建议根据岗位选择三条主线：
+不要一次背完 21 项。建议根据岗位选择三条主线：
 
 ### Agent 后端岗位
 

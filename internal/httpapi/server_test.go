@@ -542,7 +542,7 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
 		t.Fatalf("info body = %s", response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"version":"0.9.0-dev"`) ||
+	if !strings.Contains(response.Body.String(), `"version":"0.10.0-dev"`) ||
 		!strings.Contains(response.Body.String(), `"tool_count":4`) ||
 		!strings.Contains(response.Body.String(), `"run-metrics"`) ||
 		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||

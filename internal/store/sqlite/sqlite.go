@@ -13,6 +13,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
@@ -201,6 +202,29 @@ CREATE TABLE IF NOT EXISTS memory_capture_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_capture_jobs_status_available
     ON memory_capture_jobs(status, available_at, created_at);
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('knowledge_ingestion', 'conversation_summary')),
+    dedupe_key TEXT NOT NULL,
+    run_id TEXT REFERENCES agent_runs(id) ON DELETE CASCADE,
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'completed', 'failed')),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_until TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT '{}',
+    trace_parent TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(kind, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS idx_background_jobs_kind_status_available
+    ON background_jobs(kind, status, available_at, created_at);
 -- 消息和长期记忆使用独立索引表，避免不同生命周期与召回策略互相污染。
 CREATE TABLE IF NOT EXISTS message_embeddings (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
@@ -269,6 +293,7 @@ type SQLite struct {
 
 var (
 	_ store.Store            = (*SQLite)(nil)
+	_ background.Store       = (*SQLite)(nil)
 	_ knowledge.Store        = (*SQLite)(nil)
 	_ memory.Store           = (*SQLite)(nil)
 	_ memory.CaptureJobStore = (*SQLite)(nil)

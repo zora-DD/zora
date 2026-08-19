@@ -52,22 +52,25 @@ type Telemetry struct {
 }
 
 type metricInstruments struct {
-	httpRequests        metric.Int64Counter
-	httpDuration        metric.Float64Histogram
-	httpActive          metric.Int64UpDownCounter
-	runs                metric.Int64Counter
-	runDuration         metric.Float64Histogram
-	modelCalls          metric.Int64Counter
-	modelDuration       metric.Float64Histogram
-	modelTokens         metric.Int64Counter
-	embeddingCalls      metric.Int64Counter
-	embeddingDuration   metric.Float64Histogram
-	embeddingInputs     metric.Int64Counter
-	toolCalls           metric.Int64Counter
-	toolDuration        metric.Float64Histogram
-	memoryJobs          metric.Int64Counter
-	memoryJobDuration   metric.Float64Histogram
-	memoryJobQueueDelay metric.Float64Histogram
+	httpRequests            metric.Int64Counter
+	httpDuration            metric.Float64Histogram
+	httpActive              metric.Int64UpDownCounter
+	runs                    metric.Int64Counter
+	runDuration             metric.Float64Histogram
+	modelCalls              metric.Int64Counter
+	modelDuration           metric.Float64Histogram
+	modelTokens             metric.Int64Counter
+	embeddingCalls          metric.Int64Counter
+	embeddingDuration       metric.Float64Histogram
+	embeddingInputs         metric.Int64Counter
+	toolCalls               metric.Int64Counter
+	toolDuration            metric.Float64Histogram
+	memoryJobs              metric.Int64Counter
+	memoryJobDuration       metric.Float64Histogram
+	memoryJobQueueDelay     metric.Float64Histogram
+	backgroundJobs          metric.Int64Counter
+	backgroundJobDuration   metric.Float64Histogram
+	backgroundJobQueueDelay metric.Float64Histogram
 }
 
 // NewTelemetry 按配置创建 OTLP Trace 导出器和 Prometheus Metric Reader。
@@ -210,6 +213,15 @@ func (t *Telemetry) createInstruments() error {
 		return err
 	}
 	if t.metrics.memoryJobQueueDelay, err = t.meter.Float64Histogram("zora.memory.capture.queue_delay", metric.WithUnit("s"), metric.WithDescription("长期记忆捕获任务排队耗时"), metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return err
+	}
+	if t.metrics.backgroundJobs, err = t.meter.Int64Counter("zora.background.jobs", metric.WithUnit("{job}"), metric.WithDescription("文档摄取与会话摘要后台任务处理次数")); err != nil {
+		return err
+	}
+	if t.metrics.backgroundJobDuration, err = t.meter.Float64Histogram("zora.background.job.duration", metric.WithUnit("s"), metric.WithDescription("后台任务执行耗时"), metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return err
+	}
+	if t.metrics.backgroundJobQueueDelay, err = t.meter.Float64Histogram("zora.background.job.queue_delay", metric.WithUnit("s"), metric.WithDescription("后台任务排队耗时"), metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
 		return err
 	}
 	return nil

@@ -653,7 +653,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 | 追加式 RunEvent          | 可审计、可重算指标                 | 只打日志、只存最终 JSON          | 事件量增长，需要归档策略      |
 | OTel + Prometheus       | 标准协议、跨层 Trace、低基数聚合       | 自定义埋点平台                    | 生产还需 Collector/告警治理 |
 | 规则 + 模型双实现            | Mock 可测、真实模型可用            | 所有增强都调用 LLM             | 两种路径需要保持语义一致      |
-| 同步文档摄取                | MVP 简单、失败立即反馈             | 队列和异步 Worker            | 大文件会占用请求连接        |
+| 持久化文档摄取 Job          | HTTP 快速返回、失败可重投、重启可恢复 | 比同步流程多一套状态与运维 API | 适合真实 Embedding 延迟     |
 | 多 Agent 默认关闭          | 避免意外成本，先评测收益              | 始终开启                    | 使用者需要显式配置         |
 
 
@@ -745,7 +745,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 2. 为已经接通的 OTel/Prometheus 增加 Collector、Dashboard、SLO 与告警；
 3. 完成 JWT + principal + tenant_id 的最小多用户闭环；
 4. 写一篇真实故障复盘：例如流式闪烁、模型误选工具或引用不忠实；
-5. 将文档摄取异步化，并为 Memory 多实例同 Key 合并增加数据库唯一约束与冲突重试。
+5. 为 Memory 多实例同 Key 合并增加数据库唯一约束与冲突重试，并补后台任务积压告警。
 
 这几项比再增加一个“角色 Agent”更能体现后端和 Agent 工程深度。
 
@@ -815,7 +815,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 ### 2:45–3:00：取舍与下一步
 
-> 项目默认 Mock 加 SQLite，保证无 Key 可运行，同时提供 PostgreSQL、真实模型和真实 Embedding 路径。目前 Memory Capture 已有 Outbox Worker；不足是缺少完整认证、跨实例会话锁、通用任务平台、生产 Collector/告警和真实 Microsoft 租户验收。下一步我会优先做检索失败归因和多用户闭环，而不是继续堆角色数量。
+> 项目默认 Mock 加 SQLite，保证无 Key 可运行，同时提供 PostgreSQL、真实模型和真实 Embedding 路径。Memory Capture、文档摄取和摘要都已异步化；不足是缺少完整认证、跨实例会话锁、任务积压告警、生产 Collector 和真实 Microsoft 租户验收。下一步我会优先做检索失败归因和多用户闭环，而不是继续堆角色数量。
 
 
 
@@ -1056,4 +1056,4 @@ Zora 的核心价值不在功能数量，而在以下完整闭环：
   → 基于证据继续优化
 ```
 
-如果你能结合代码讲清这条闭环，并坦诚说明认证、跨实例同 Key 一致性、消息/记忆向量评测、通用任务平台、生产观测管道和外部租户验收仍是改进项，这个项目就不再是“Agent 空壳”，而是一个能够体现 Go 后端基本功、Agent 系统理解和工程判断力的作品。
+如果你能结合代码讲清这条闭环，并坦诚说明认证、跨实例同 Key 一致性、消息/记忆向量评测、任务积压告警、生产观测管道和外部租户验收仍是改进项，这个项目就不再是“Agent 空壳”，而是一个能够体现 Go 后端基本功、Agent 系统理解和工程判断力的作品。

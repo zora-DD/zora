@@ -16,6 +16,7 @@ import (
 
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/approval"
+	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/id"
 	"github.com/zhiruo/zora/internal/memory"
@@ -45,27 +46,30 @@ type StreamEvent struct {
 	MemoryJob      *memory.CaptureJob        `json:"memory_job,omitempty"`
 	MemoryRecalled int                       `json:"memory_recalled,omitempty"`
 	Summary        *summary.UpdateResult     `json:"summary,omitempty"`
+	SummaryJob     *background.Job           `json:"summary_job,omitempty"`
 	Approval       *approval.Approval        `json:"approval,omitempty"`
 	Metrics        *observability.RunMetrics `json:"metrics,omitempty"`
 }
 
 // Service 是会话用例边界，负责执行顺序、状态落库和同会话并发控制。
 type Service struct {
-	store                store.Store
-	runtime              *agentruntime.Runtime
-	runtimes             map[string]*agentruntime.Runtime
-	models               []ModelProfile
-	defaultModel         string
-	memory               memoryCapturer
-	memoryQueue          memoryCaptureQueue
-	memoryJobMaxAttempts int
-	memoryRecall         memoryRecaller
-	messageRecall        messageRecaller
-	summary              conversationSummarizer
-	approval             *approval.Service
-	telemetry            *observability.Telemetry
-	locksMu              sync.Mutex
-	locks                map[string]*sync.Mutex
+	store                 store.Store
+	runtime               *agentruntime.Runtime
+	runtimes              map[string]*agentruntime.Runtime
+	models                []ModelProfile
+	defaultModel          string
+	memory                memoryCapturer
+	memoryQueue           memoryCaptureQueue
+	memoryJobMaxAttempts  int
+	memoryRecall          memoryRecaller
+	messageRecall         messageRecaller
+	summary               conversationSummarizer
+	summaryQueue          summaryJobQueue
+	summaryJobMaxAttempts int
+	approval              *approval.Service
+	telemetry             *observability.Telemetry
+	locksMu               sync.Mutex
+	locks                 map[string]*sync.Mutex
 }
 
 type memoryCapturer interface {
@@ -88,6 +92,10 @@ type conversationSummarizer interface {
 	Get(ctx context.Context, conversationID string) (summary.Summary, error)
 	Update(ctx context.Context, conversationID string, latestSequence int64) (summary.UpdateResult, error)
 	HistoryLimit() int
+}
+
+type summaryJobQueue interface {
+	EnqueueSummary(ctx context.Context, input background.EnqueueSummaryInput) (background.Job, bool, error)
 }
 
 type Option func(*Service)
@@ -129,6 +137,13 @@ func WithMessageRecaller(recaller messageRecaller) Option {
 
 func WithConversationSummarizer(summarizer conversationSummarizer) Option {
 	return func(service *Service) { service.summary = summarizer }
+}
+
+func WithSummaryQueue(queue summaryJobQueue, maxAttempts int) Option {
+	return func(service *Service) {
+		service.summaryQueue = queue
+		service.summaryJobMaxAttempts = maxAttempts
+	}
 }
 
 func WithApprovalGate(gate *approval.Service) Option {
@@ -615,7 +630,23 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 		}
 	}
 	var summaryResult *summary.UpdateResult
-	if s.summary != nil {
+	var summaryJob *background.Job
+	if s.summaryQueue != nil {
+		traceParent := ""
+		if s.telemetry != nil {
+			traceParent = s.telemetry.TraceParent(ctx)
+		}
+		job, created, summaryErr := s.summaryQueue.EnqueueSummary(ctx, background.EnqueueSummaryInput{
+			RunID: run.ID, ConversationID: conversationID, LatestSequence: assistantMessage.Sequence,
+			TraceParent: traceParent, MaxAttempts: s.summaryJobMaxAttempts,
+		})
+		if summaryErr != nil {
+			_ = s.appendEvent(ctx, run.ID, "conversation_summary_queue_failed", s.runtime.AgentName(), "", map[string]any{"error": summaryErr.Error()})
+		} else {
+			summaryJob = &job
+			_ = s.appendEvent(ctx, run.ID, "conversation_summary_queued", s.runtime.AgentName(), "", map[string]any{"job_id": job.ID, "created": created, "status": job.Status})
+		}
+	} else if s.summary != nil {
 		result, summaryErr := s.summary.Update(ctx, conversationID, assistantMessage.Sequence)
 		if summaryErr != nil {
 			// 摘要生成失败不能推翻已经成功生成并保存的回答。
@@ -643,6 +674,7 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 	return emit(StreamEvent{
 		Type: "done", RunID: run.ID, Message: &assistantMessage,
 		Memory: captureResult, MemoryJob: memoryJob, MemoryRecalled: recalledCount, Summary: summaryResult, Metrics: runMetrics,
+		SummaryJob: summaryJob,
 	})
 }
 

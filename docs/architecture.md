@@ -184,7 +184,9 @@ SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_
 
 自动提取的 Memory 关联来源用户消息，并按 Kind + Memory Key 跳过重复或更新冲突；用户手动修正会阻止后续自动覆盖。召回默认排除过期/无关记忆，正文按不可信 JSON 数据注入，最多 6,000 字符；RunEvent 只记录 ID 和可解释分数。
 
-长对话按当前会话实际未摘要消息数量触发，保留最近窗口，把较早消息增量写入 `conversation_summaries`。摘要读取/生成失败只记录审计并继续回答。
+长对话按当前会话实际未摘要消息数量触发，保留最近窗口，把较早消息增量写入 `conversation_summaries`。Chat 只创建 `conversation_summary` Job，独立 Worker 读取消息并生成摘要；失败只记录任务和审计，不阻塞已经完成的回答。
+
+文档上传同样先持久化 `knowledge_ingestion` Job 并立即返回 202。文档 Worker 与摘要 Worker 按 kind 独立领取，复用 pending/executing/completed/failed、租约、退避和人工重投协议；文档成功后清空任务中的原始文件 Payload。
 
 消息、长期记忆和知识库分别写入 `message_embeddings`、`memory_embeddings` 与 `knowledge_chunks`。前两者额外保存索引版本；模型或维度不匹配的记录不会参与查询。跨会话消息召回排除当前会话且只注入用户原话，助手消息虽然建索引但默认不回灌模型。`POST /api/semantic/reindex` 可从原始业务表幂等重建派生索引。
 

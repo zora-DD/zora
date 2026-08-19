@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/zhiruo/zora/internal/approval"
+	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
@@ -39,6 +40,7 @@ type Server struct {
 	memory         *memory.Service
 	memoryQueue    *memory.CaptureQueue
 	semantic       *semantic.Service
+	background     *background.Queue
 	approval       *approval.Service
 	office         *office.Service
 	telemetry      *observability.Telemetry
@@ -68,6 +70,10 @@ func WithMemoryCaptureQueue(queue *memory.CaptureQueue) Option {
 
 func WithSemanticService(service *semantic.Service) Option {
 	return func(server *Server) { server.semantic = service }
+}
+
+func WithBackgroundQueue(queue *background.Queue) Option {
+	return func(server *Server) { server.background = queue }
 }
 
 // WithMCPInfo 只向展示层暴露启用状态和已通过门禁的工具数，不泄露命令、参数或环境变量。
@@ -136,6 +142,11 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 		mux.HandleFunc("POST /api/semantic/messages/search", server.searchSemanticMessages)
 		mux.HandleFunc("POST /api/semantic/reindex", server.reindexSemanticData)
 	}
+	if server.background != nil {
+		mux.HandleFunc("GET /api/background/jobs", server.listBackgroundJobs)
+		mux.HandleFunc("GET /api/background/jobs/{jobID}", server.getBackgroundJob)
+		mux.HandleFunc("POST /api/background/jobs/{jobID}/retry", server.retryBackgroundJob)
+	}
 
 	// 前端资源编译进 Go 二进制，部署时不需要额外静态文件服务器。
 	assets, err := fs.Sub(webFiles, "web")
@@ -180,6 +191,9 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.chat.SummaryEnabled() {
 		capabilities = append(capabilities, "conversation-summary", "context-compression")
 	}
+	if s.background != nil {
+		capabilities = append(capabilities, "knowledge-ingestion-worker", "conversation-summary-worker")
+	}
 	if s.chat.MultiAgentEnabled() {
 		capabilities = append(capabilities, "supervisor", "specialist-agents", "agent-handoff-audit")
 	}
@@ -200,7 +214,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.9.0-dev",
+		"name": "Zora", "version": "0.10.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"models": s.chat.ModelProfiles(), "default_model_id": s.chat.DefaultModelID(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
@@ -456,10 +470,20 @@ func (s *Server) uploadKnowledgeDocument(w http.ResponseWriter, r *http.Request)
 			mimeType = "text/plain"
 		}
 	}
-	result, err := s.knowledge.Ingest(r.Context(), knowledge.IngestInput{
+	ingestInput := knowledge.IngestInput{
 		Name: name, SourceType: "upload", MIMEType: mimeType,
 		Visibility: r.FormValue("visibility"), Content: contents,
-	})
+	}
+	if s.background != nil {
+		job, _, err := s.background.EnqueueKnowledge(r.Context(), background.EnqueueKnowledgeInput{Input: ingestInput, MaxAttempts: 5})
+		if err != nil {
+			s.problem(w, err)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]any{"job": job})
+		return
+	}
+	result, err := s.knowledge.Ingest(r.Context(), ingestInput)
 	if err != nil {
 		s.problem(w, err)
 		return
@@ -635,6 +659,34 @@ func (s *Server) reindexSemanticData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) listBackgroundJobs(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit")))
+	items, err := s.background.List(r.Context(), background.Filter{Kind: strings.TrimSpace(r.URL.Query().Get("kind")), Status: strings.TrimSpace(r.URL.Query().Get("status")), Limit: limit})
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": items})
+}
+
+func (s *Server) getBackgroundJob(w http.ResponseWriter, r *http.Request) {
+	job, err := s.background.Get(r.Context(), r.PathValue("jobID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
+func (s *Server) retryBackgroundJob(w http.ResponseWriter, r *http.Request) {
+	job, err := s.background.Retry(r.Context(), r.PathValue("jobID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, job)
 }
 
 func (s *Server) listOfficeDrafts(w http.ResponseWriter, r *http.Request) {
@@ -828,7 +880,7 @@ func decodeMemoryInput(w http.ResponseWriter, r *http.Request) (memoryRequest, e
 
 func (s *Server) problem(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
-	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) || errors.Is(err, memory.ErrJobNotFound) || errors.Is(err, summary.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) || errors.Is(err, memory.ErrJobNotFound) || errors.Is(err, background.ErrNotFound) || errors.Is(err, summary.ErrNotFound) {
 		status = http.StatusNotFound
 	} else if errors.Is(err, knowledge.ErrAccessDenied) {
 		status = http.StatusForbidden

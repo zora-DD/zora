@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/memory"
 )
 
@@ -239,6 +240,41 @@ func (t *Telemetry) BeginMemoryCaptureJob(ctx context.Context, job memory.Captur
 		attrs := metric.WithAttributes(attribute.String("zora.memory.job.status", status))
 		t.metrics.memoryJobs.Add(ctx, 1, attrs)
 		t.metrics.memoryJobDuration.Record(ctx, time.Since(started).Seconds(), attrs)
+		span.End()
+	}
+}
+
+// BeginBackgroundJob 为文档摄取、会话摘要创建 Consumer Span。
+// kind 是固定枚举，可安全用于 Prometheus Label；任务 ID 仅进入 Trace，避免指标基数爆炸。
+func (t *Telemetry) BeginBackgroundJob(ctx context.Context, job background.Job) (context.Context, func(status string, err error)) {
+	if t == nil {
+		return ctx, func(string, error) {}
+	}
+	if job.TraceParent != "" {
+		ctx = t.propagator.Extract(ctx, propagation.MapCarrier{"traceparent": job.TraceParent})
+	}
+	ctx, span := t.tracer.Start(ctx, "background."+job.Kind, trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(
+		attribute.String("zora.background.job.id", job.ID),
+		attribute.String("zora.background.job.kind", job.Kind),
+		attribute.String("zora.run.id", job.RunID),
+		attribute.String("zora.conversation.id", job.ConversationID),
+		attribute.Int("zora.background.job.attempt", job.Attempt),
+	))
+	started := time.Now()
+	if !job.CreatedAt.IsZero() {
+		t.metrics.backgroundJobQueueDelay.Record(ctx, time.Since(job.CreatedAt).Seconds(), metric.WithAttributes(
+			attribute.String("zora.background.job.kind", job.Kind),
+		))
+	}
+	return ctx, func(status string, jobErr error) {
+		span.SetAttributes(attribute.String("zora.background.job.status", status))
+		setSpanError(span, jobErr)
+		attrs := metric.WithAttributes(
+			attribute.String("zora.background.job.kind", job.Kind),
+			attribute.String("zora.background.job.status", status),
+		)
+		t.metrics.backgroundJobs.Add(ctx, 1, attrs)
+		t.metrics.backgroundJobDuration.Record(ctx, time.Since(started).Seconds(), attrs)
 		span.End()
 	}
 }

@@ -200,6 +200,30 @@ CREATE TABLE IF NOT EXISTS memory_capture_jobs (
 CREATE INDEX IF NOT EXISTS idx_memory_capture_jobs_status_available
     ON memory_capture_jobs(status, available_at, created_at);
 
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('knowledge_ingestion', 'conversation_summary')),
+    dedupe_key TEXT NOT NULL,
+    run_id TEXT REFERENCES agent_runs(id) ON DELETE CASCADE,
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'completed', 'failed')),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    available_at TIMESTAMPTZ NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_until TIMESTAMPTZ,
+    last_error TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL,
+    result JSONB NOT NULL DEFAULT '{}'::jsonb,
+    trace_parent TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    UNIQUE(kind, dedupe_key)
+);
+CREATE INDEX IF NOT EXISTS idx_background_jobs_kind_status_available
+    ON background_jobs(kind, status, available_at, created_at);
+
 -- 三类向量实体使用物理隔离表；模型、维度和版本共同定义可查询的索引空间。
 CREATE TABLE IF NOT EXISTS message_embeddings (
     message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
@@ -295,4 +319,5 @@ INSERT INTO zora_schema_versions(version) VALUES (8) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (9) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (10) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (11) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (12) ON CONFLICT DO NOTHING;
 `

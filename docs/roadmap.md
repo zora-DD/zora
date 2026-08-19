@@ -147,8 +147,8 @@
 ## 后续技术待办
 
 - [ ] 为不同 Job 并发更新同一 `kind + memory_key` 增加数据库唯一约束、冲突重读与合并重试。
-- [ ] 把同步文档摄取改成 Ingestion Outbox + 批量 Embedding Worker，并提供失败重投/死信管理面。
-- [ ] 把同步会话摘要迁入异步 Job，确保 sequence 边界和重复执行幂等。
+- [x] 文档摄取改为持久化 `knowledge_ingestion` Job + 独立 Worker，并提供状态查询与 failed 人工重投。
+- [x] 会话摘要迁入 `conversation_summary` Job；按 Run 幂等，保持 sequence 边界和失败隔离。
 - [x] 普通对话消息向量化与跨会话用户原话语义召回。
 - [x] 长期记忆向量化，并与词项相关性、重要性和时效性联合召回。
 - [x] 使用 `message_embeddings`、`memory_embeddings`、`knowledge_chunks` 物理隔离三类向量，并记录模型、维度与索引版本。

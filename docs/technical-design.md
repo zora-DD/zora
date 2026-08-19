@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.9 独立消息/长期记忆向量索引阶段
+> 适用版本：V0.10 文档摄取与会话摘要异步化阶段
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -206,6 +206,11 @@ flowchart TD
 | `ZORA_MEMORY_WORKER_LEASE_DURATION` | 任务超时 + 30s | 否 | 任务处理租约，必须严格大于任务超时 |
 | `ZORA_MEMORY_WORKER_RETRY_BASE` | `2s` | 否 | 指数退避基础间隔，实际上限 1 分钟 |
 | `ZORA_MEMORY_WORKER_MAX_ATTEMPTS` | `5` | 否 | 包含首次执行的最大尝试次数，范围 1–20 |
+| `ZORA_BACKGROUND_WORKER_POLL_INTERVAL` | `1s` | 否 | 文档摄取/摘要 Worker 兜底轮询间隔 |
+| `ZORA_BACKGROUND_WORKER_TASK_TIMEOUT` | 跟随请求超时 | 否 | 单个文档摄取或摘要任务超时 |
+| `ZORA_BACKGROUND_WORKER_LEASE_DURATION` | 任务超时 + 30s | 否 | 必须严格大于任务超时 |
+| `ZORA_BACKGROUND_WORKER_RETRY_BASE` | `2s` | 否 | 指数退避基数 |
+| `ZORA_BACKGROUND_WORKER_MAX_ATTEMPTS` | `5` | 否 | 包含首次执行的最大尝试次数 |
 | `ZORA_SUMMARY_ENABLED` | `true` | 否 | 是否启用会话增量摘要与上下文压缩 |
 | `ZORA_SUMMARY_TRIGGER_MESSAGES` | `20` | 否 | 未摘要消息触发阈值，范围 4–500 |
 | `ZORA_SUMMARY_KEEP_RECENT` | `12` | 否 | 保留原文的最近消息数，至少 2 且小于触发阈值 |
@@ -1068,6 +1073,8 @@ Content-Type: application/json
 ```
 
 `top_k` 默认 5，HTTP 调试接口最大 20。库中存在 Chunk 但没有与当前 Embedder 兼容的向量时返回 409，提示重建索引。
+
+上传文档默认返回 `202 Accepted` 和 `{"job":{...}}`，前端轮询 `/api/background/jobs/{jobID}`，完成后从 `job.result.document` 读取文档。任务失败可调用 `POST /api/background/jobs/{jobID}/retry`；成功任务会清空原始文件 Payload。
 
 ### 10.12.1 消息与长期记忆语义索引
 

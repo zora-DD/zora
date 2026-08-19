@@ -17,6 +17,7 @@ import (
 	"github.com/zhiruo/zora/internal/agentruntime"
 	"github.com/zhiruo/zora/internal/agenttools"
 	"github.com/zhiruo/zora/internal/approval"
+	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/domain"
@@ -40,6 +41,7 @@ type applicationStore interface {
 	memory.Store
 	memory.CaptureJobStore
 	semantic.Store
+	background.Store
 	approval.Store
 	office.Store
 	summary.Store
@@ -71,7 +73,7 @@ func run(logger *slog.Logger) error {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancelStartup()
 	telemetry, err := observability.NewTelemetry(startupCtx, observability.TelemetryConfig{
-		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.9.0-dev",
+		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.10.0-dev",
 		Environment: cfg.OTelEnvironment, TracingEnabled: cfg.OTelEnabled,
 		OTLPEndpoint: cfg.OTelEndpoint, TraceSampleRatio: cfg.OTelSampleRatio,
 		PrometheusEnabled: cfg.PrometheusEnabled,
@@ -206,6 +208,10 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	backgroundQueue, err := background.NewQueue(database)
+	if err != nil {
+		return err
+	}
 	// 知识库检索和时间、计算器一样走统一 Tool 协议，便于后续加入多 Agent 调度。
 	knowledgeTool, err := knowledge.NewSearchTool(knowledgeService)
 	if err != nil {
@@ -310,6 +316,7 @@ func run(logger *slog.Logger) error {
 	if cfg.MessageRecallEnabled {
 		chatOptions = append(chatOptions, chat.WithMessageRecaller(semanticService))
 	}
+	var summaryService *summary.Service
 	if cfg.SummaryEnabled {
 		var summarizer summary.Summarizer
 		if cfg.Provider == "mock" {
@@ -320,7 +327,7 @@ func run(logger *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-		summaryService, err := summary.NewService(database, summarizer, summary.Options{
+		summaryService, err = summary.NewService(database, summarizer, summary.Options{
 			TriggerMessages: cfg.SummaryTriggerMessages,
 			KeepRecent:      cfg.SummaryKeepRecent,
 			MaxRunes:        cfg.SummaryMaxRunes,
@@ -330,6 +337,7 @@ func run(logger *slog.Logger) error {
 			return err
 		}
 		chatOptions = append(chatOptions, chat.WithConversationSummarizer(summaryService))
+		chatOptions = append(chatOptions, chat.WithSummaryQueue(backgroundQueue, cfg.BackgroundWorkerMaxAttempts))
 	}
 	chatService := chat.NewService(database, defaultRuntime, chatOptions...)
 	var memoryWorker *memory.CaptureWorker
@@ -377,6 +385,59 @@ func run(logger *slog.Logger) error {
 			}
 		}()
 	}
+	backgroundWorkers := make([]*background.Worker, 0, 2)
+	workerOptions := background.WorkerOptions{
+		PollInterval: cfg.BackgroundWorkerPollInterval, LeaseDuration: cfg.BackgroundWorkerLeaseDuration,
+		TaskTimeout: cfg.BackgroundWorkerTaskTimeout, RetryBase: cfg.BackgroundWorkerRetryBase,
+		Instrumentation: telemetry,
+	}
+	ingestionWorker, err := background.NewWorker(backgroundQueue, background.KindKnowledgeIngestion, background.KnowledgeHandler(knowledgeService), logger, workerOptions)
+	if err != nil {
+		return err
+	}
+	backgroundWorkers = append(backgroundWorkers, ingestionWorker)
+	if summaryService != nil {
+		summaryOptions := workerOptions
+		summaryOptions.Observer = func(ctx context.Context, job background.Job, jobErr error) {
+			if job.RunID == "" {
+				return
+			}
+			eventType := "conversation_summary_completed"
+			payload := map[string]any{"job_id": job.ID, "status": job.Status, "attempt": job.Attempt}
+			if jobErr != nil {
+				eventType = "conversation_summary_failed"
+				payload["error"] = job.LastError
+			}
+			_, appendErr := database.AppendRunEvent(ctx, domain.RunEvent{ID: id.New("evt"), RunID: job.RunID, Type: eventType, AgentName: defaultRuntime.AgentName(), Payload: payload, CreatedAt: time.Now().UTC()})
+			if appendErr != nil {
+				logger.Warn("记录会话摘要后台任务审计事件失败", "任务ID", job.ID, "错误", appendErr)
+			}
+		}
+		summaryWorker, workerErr := background.NewWorker(backgroundQueue, background.KindConversationSummary, background.SummaryHandler(summaryService), logger, summaryOptions)
+		if workerErr != nil {
+			return workerErr
+		}
+		backgroundWorkers = append(backgroundWorkers, summaryWorker)
+	}
+	for index, worker := range backgroundWorkers {
+		if err := worker.Start(context.Background()); err != nil {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			for _, started := range backgroundWorkers[:index] {
+				_ = started.Stop(stopCtx)
+			}
+			cancel()
+			return err
+		}
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		for _, worker := range backgroundWorkers {
+			if stopErr := worker.Stop(stopCtx); stopErr != nil {
+				logger.Warn("关闭后台任务 Worker 失败", "错误", stopErr)
+			}
+		}
+	}()
 	httpOptions := make([]httpapi.Option, 0, 3)
 	if approvalService != nil {
 		httpOptions = append(httpOptions, httpapi.WithApprovalService(approvalService))
@@ -392,6 +453,7 @@ func run(logger *slog.Logger) error {
 		httpOptions = append(httpOptions, httpapi.WithMemoryCaptureQueue(memoryQueue))
 	}
 	httpOptions = append(httpOptions, httpapi.WithSemanticService(semanticService))
+	httpOptions = append(httpOptions, httpapi.WithBackgroundQueue(backgroundQueue))
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout, httpOptions...)
 	if err != nil {
 		return err

@@ -4,7 +4,7 @@ Zora 是一个使用 Go 与 Eino 实现的可观察 Agent 工作台：支持流�
 
 这个项目的重点不是复刻一个聊天页面，而是实践 Agent 产品从“模型能回答”走向“系统可控制、可追踪、可评估、可扩展”的核心工程问题。
 
-> 当前版本：V0.9。除 Agent、RAG、Memory、Multi-Agent、MCP、运行审计和 OTel/Prometheus 外，消息、长期记忆与知识库已经具有物理隔离的向量索引；Microsoft Graph 写执行器已实现但尚未使用真实 Microsoft 365 租户在线验收。
+> 当前版本：V0.10。文档摄取和会话摘要已迁移到可恢复后台 Worker；消息、长期记忆与知识库具有物理隔离的向量索引。Microsoft Graph 写执行器已实现但尚未使用真实 Microsoft 365 租户在线验收。
 
 ## 为什么做 Zora
 
@@ -25,9 +25,9 @@ Zora 围绕这些问题实现了一套可以本地运行、阅读和继续扩展
 |---|---|
 | Agent Core | Eino ReAct、流式输出、ToolCall、取消、超时、会话级并发控制 |
 | 多模型 | OpenAI-compatible Provider、Mock、环境变量注册多个模型、Web 按请求切换 |
-| 知识库 | TXT/Markdown/PDF 摄取、版本、ACL、分块、Embedding、向量与关键词混合检索、引用 |
+| 知识库 | TXT/Markdown/PDF 异步摄取、版本、ACL、分块、Embedding、向量与关键词混合检索、引用 |
 | 长期记忆 | Semantic/Episodic、自动提取、同 Key 合并、人工修正保护、词项/向量联合召回、过期时间、Outbox 异步捕获与失败重试 |
-| 上下文管理 | 跨会话消息语义召回、会话增量摘要、最近消息窗口、记忆/消息/摘要安全注入 |
+| 上下文管理 | 跨会话消息语义召回、异步增量摘要、最近消息窗口、记忆/消息/摘要安全注入 |
 | 多 Agent | Supervisor、Research/Document/Writer、串并行交接、预算、超时、重试、父子 Run |
 | 人工审批 | 高影响意图识别、持久化审批、SSE 等待与恢复、拒绝和超时终态 |
 | MCP | 官方 Go SDK、stdio Server、工具白名单、只读声明校验、环境变量最小透传 |
@@ -54,6 +54,9 @@ flowchart LR
     Outbox --> Worker["Lease Worker"]
     Worker --> Memory["Memory Service"]
     Worker --> Semantic["Message / Memory Semantic Index"]
+    Chat --> Jobs["Background Jobs"]
+    Jobs --> Ingestion["Knowledge Worker"]
+    Jobs --> SummaryWorker["Summary Worker"]
     Chat --> Summary["Summary"]
     Chat --> Store["SQLite / PostgreSQL"]
     Memory --> Store
@@ -354,6 +357,7 @@ make build-mcp-connectors
 | 知识库 | `/api/knowledge/documents`、`/api/knowledge/search` |
 | 长期记忆 | `/api/memories`、`/api/memories/recall` |
 | 语义索引 | `/api/semantic/messages/search`、`/api/semantic/reindex` |
+| 后台任务 | `/api/background/jobs`、`/api/background/jobs/{id}`、`/api/background/jobs/{id}/retry` |
 | 记忆捕获任务 | `/api/memory-capture/jobs`、`/api/memory-capture/jobs/{id}` |
 | 会话摘要 | `/api/conversations/{id}/summary` |
 | 办公草稿 | `/api/office/drafts`、`/api/office/drafts/{id}/decision` |
@@ -463,12 +467,12 @@ CGO_ENABLED=0 go build ./cmd/zora
 - 当前是单用户可信主体，没有完整登录、租户和 RBAC；
 - Hash Embedding 仅用于本地链路测试，不能代表生产语义检索；
 - SQLite 检索采用进程内精确扫描，不适合大规模知识库；
-- 文档摄取为同步流程，PDF 不包含 OCR；
+- PDF 只支持文本层，不包含 OCR；
 - 消息和长期记忆已使用独立向量索引，但尚未建立专门的离线召回数据集与重排模型；
 - 多 Agent 收益只在固定小样本中验证，真实业务必须重新评测；
 - Microsoft Graph 真实写链路等待测试租户验收；
 - OTel 当前直接导出到单个 OTLP Endpoint，尚未提供生产 Collector 管道、Grafana 仪表盘和告警规则；
-- Memory Capture 已有 PostgreSQL `SKIP LOCKED` 租约 Worker，但文档摄取、摘要和 Office 尚未统一到通用任务平台，也没有跨实例会话锁；
+- Memory Capture、文档摄取和摘要已有持久化租约 Worker；Office 仍使用自身 Operation 状态机，系统也没有跨实例会话锁；
 - 多实例同时合并相同 `memory_key` 的数据库级唯一约束仍需补齐。
 
 这些限制不会包装成“已完成能力”。详细优先级见[项目分析文档](docs/project-analysis.md)和 [Roadmap](docs/roadmap.md)。
@@ -487,6 +491,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 | [真实 Embedding 与 RAG 基线](docs/phase-1-real-embedding.md) | 第一阶段配置、无历史污染测试、64 题评测和指标记录 |
 | [OTel 与 Prometheus](docs/phase-2-observability.md) | 第二阶段 Trace/Metric 链路、启动方式、指标和排障 |
 | [Memory Capture Outbox](docs/phase-3-memory-outbox.md) | 第三阶段事务入队、租约领取、退避重试、状态 API 与 Trace 续接 |
+| [后台任务异步化](docs/phase-4-background-jobs.md) | 文档摄取、会话摘要、租约 Worker、失败重投与运维 API |
 | [Roadmap](docs/roadmap.md) | 版本状态和验收条件 |
 
 ## License

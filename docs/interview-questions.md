@@ -10,7 +10,7 @@
 
 #### 面试简答
 
-Zora 当前采用同步摄取流程。用户上传 TXT、Markdown 或带文本层的 PDF 后，服务先校验文件并按 `owner + 文件内容` 计算 SHA-256 去重，再提取纯文本。文本按 Unicode 字符切分，默认每块最多 800 个字符、相邻块重叠 120 个字符；切分时依次优先选择 Markdown 标题、段落、换行、句末和空格，实在找不到边界才硬切。
+Zora 当前采用持久化异步摄取流程。用户上传 TXT、Markdown 或带文本层的 PDF 后，HTTP 层先校验并把文件写入 `knowledge_ingestion` Job，立即返回 202。独立 Worker 领取任务后按 `owner + 文件内容` 计算 SHA-256 去重并提取纯文本。文本按 Unicode 字符切分，默认每块最多 800 个字符、相邻块重叠 120 个字符；切分时依次优先选择 Markdown 标题、段落、换行、句末和空格，实在找不到边界才硬切。
 
 每个分块批量调用 Embedding Provider 生成向量，同时计算关键词词频。最后在一个数据库事务中写入文档元数据和全部分块。SQLite 将向量序列化为 JSON 文本，检索时在 Go 进程内做精确余弦计算；PostgreSQL 使用 `pgvector vector(n)` 保存向量，并建立 HNSW 索引，同时用 FTS/GIN 支持关键词召回。
 
@@ -19,7 +19,9 @@ Zora 当前采用同步摄取流程。用户上传 TXT、Markdown 或带文本�
 ```mermaid
 flowchart TD
     Upload["上传 TXT / Markdown / PDF"] --> Validate["校验扩展名、大小和 MIME Type"]
-    Validate --> Hash["owner + 内容计算 SHA-256"]
+    Validate --> Job["持久化 Job，返回 202"]
+    Job --> Worker["Worker 租约领取"]
+    Worker --> Hash["owner + 内容计算 SHA-256"]
     Hash --> Dedup{"是否已存在相同内容"}
     Dedup -- 是 --> Existing["返回已有文档，不重复向量化"]
     Dedup -- 否 --> Extract["提取 UTF-8 文本或 PDF 文本层"]
@@ -37,7 +39,7 @@ flowchart TD
 
 1. **接收与校验文件**
 
-   HTTP 层接收 `multipart/form-data` 的 `file` 字段，仅允许 `.txt`、`.md`、`.markdown` 和 `.pdf`，单文件最大 5 MiB，然后调用知识库的 `Ingest` 用例。
+   HTTP 层接收 `multipart/form-data` 的 `file` 字段，仅允许 `.txt`、`.md`、`.markdown` 和 `.pdf`，单文件最大 5 MiB，然后创建持久化摄取任务。内容哈希吸收入队重试，Worker 成功后清空任务中的原文件 Payload。
 
 2. **内容去重与权限隔离**
 
@@ -107,7 +109,7 @@ flowchart TD
 
 | 场景 | 是否写持久化向量 | 说明 |
 |---|---:|---|
-| 上传一份新知识库文档 | 是 | 解析并分块后，一次生成全部 Chunk 向量并事务写入 |
+| 上传一份新知识库文档 | 异步写 | HTTP 返回 Job；Worker 解析分块后生成全部 Chunk 向量并事务写入 |
 | 上传内容完全相同的文档 | 否 | 命中 `content_hash` 去重，直接返回已有文档 |
 | 上传同名但内容不同的文档 | 是 | 创建新版本，新 Chunk 使用当前 Embedding 重新生成 |
 | 服务启动 | 否 | 当前不会在启动时自动重建全部索引 |

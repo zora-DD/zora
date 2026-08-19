@@ -75,7 +75,7 @@ type SearchResult struct {
 	KeywordScore float64 `json:"keyword_score"`
 }
 
-// IngestInput 是同步文档摄取请求。
+// IngestInput 是文档摄取任务的输入；HTTP 层可将它持久化到后台队列异步执行。
 type IngestInput struct {
 	Name       string
 	SourceType string

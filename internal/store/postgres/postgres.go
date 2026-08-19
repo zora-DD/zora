@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	pgxvector "github.com/pgvector/pgvector-go/pgx"
 
+	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
@@ -32,6 +33,7 @@ type Postgres struct {
 
 var (
 	_ store.Store              = (*Postgres)(nil)
+	_ background.Store         = (*Postgres)(nil)
 	_ knowledge.Store          = (*Postgres)(nil)
 	_ knowledge.CandidateStore = (*Postgres)(nil)
 	_ memory.Store             = (*Postgres)(nil)

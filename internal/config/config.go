@@ -83,16 +83,21 @@ type Config struct {
 	MessageRecallLimit    int     // 单轮最多注入的历史消息数量。
 	MessageRecallMinScore float64 // 消息向量相似度门槛。
 
-	MemoryAutoCapture         bool          // 是否在回答完成后自动提取长期记忆候选。
-	MemoryMaxCandidates       int           // 单轮最多接纳的候选数，限制额外成本和错误放大。
-	MemoryRecallEnabled       bool          // 是否在模型执行前召回并注入相关长期记忆。
-	MemoryRecallLimit         int           // 单轮最多注入的长期记忆数量。
-	MemoryRecallMinScore      float64       // 联合分数低于该阈值的记忆不得注入。
-	MemoryWorkerPollInterval  time.Duration // Outbox 无通知时的兜底轮询间隔。
-	MemoryWorkerTaskTimeout   time.Duration // 单次长期记忆提取的超时上限。
-	MemoryWorkerLeaseDuration time.Duration // Worker 处理租约，必须大于任务超时。
-	MemoryWorkerRetryBase     time.Duration // 失败指数退避的基础间隔。
-	MemoryWorkerMaxAttempts   int           // 包含首次执行在内的最大尝试次数。
+	MemoryAutoCapture             bool          // 是否在回答完成后自动提取长期记忆候选。
+	MemoryMaxCandidates           int           // 单轮最多接纳的候选数，限制额外成本和错误放大。
+	MemoryRecallEnabled           bool          // 是否在模型执行前召回并注入相关长期记忆。
+	MemoryRecallLimit             int           // 单轮最多注入的长期记忆数量。
+	MemoryRecallMinScore          float64       // 联合分数低于该阈值的记忆不得注入。
+	MemoryWorkerPollInterval      time.Duration // Outbox 无通知时的兜底轮询间隔。
+	MemoryWorkerTaskTimeout       time.Duration // 单次长期记忆提取的超时上限。
+	MemoryWorkerLeaseDuration     time.Duration // Worker 处理租约，必须大于任务超时。
+	MemoryWorkerRetryBase         time.Duration // 失败指数退避的基础间隔。
+	MemoryWorkerMaxAttempts       int           // 包含首次执行在内的最大尝试次数。
+	BackgroundWorkerPollInterval  time.Duration // 文档摄取和摘要 Worker 的轮询间隔。
+	BackgroundWorkerTaskTimeout   time.Duration // 单个通用后台任务超时。
+	BackgroundWorkerLeaseDuration time.Duration // 通用后台任务租约。
+	BackgroundWorkerRetryBase     time.Duration // 通用后台任务失败退避基数。
+	BackgroundWorkerMaxAttempts   int           // 通用后台任务最大尝试次数。
 
 	SummaryEnabled         bool // 是否启用长对话增量摘要与上下文压缩。
 	SummaryTriggerMessages int  // 尚未摘要的消息达到该数量后触发增量摘要。
@@ -237,6 +242,26 @@ func Load() (Config, error) {
 	if err != nil || memoryWorkerMaxAttempts > 20 {
 		return Config{}, fmt.Errorf("ZORA_MEMORY_WORKER_MAX_ATTEMPTS 必须在 1 到 20 之间")
 	}
+	backgroundWorkerPollInterval, err := time.ParseDuration(env("ZORA_BACKGROUND_WORKER_POLL_INTERVAL", "1s"))
+	if err != nil || backgroundWorkerPollInterval <= 0 {
+		return Config{}, fmt.Errorf("ZORA_BACKGROUND_WORKER_POLL_INTERVAL 必须是大于 0 的时间长度")
+	}
+	backgroundWorkerTaskTimeout, err := time.ParseDuration(env("ZORA_BACKGROUND_WORKER_TASK_TIMEOUT", timeout.String()))
+	if err != nil || backgroundWorkerTaskTimeout <= 0 {
+		return Config{}, fmt.Errorf("ZORA_BACKGROUND_WORKER_TASK_TIMEOUT 必须是大于 0 的时间长度")
+	}
+	backgroundWorkerLeaseDuration, err := time.ParseDuration(env("ZORA_BACKGROUND_WORKER_LEASE_DURATION", (backgroundWorkerTaskTimeout + 30*time.Second).String()))
+	if err != nil || backgroundWorkerLeaseDuration <= backgroundWorkerTaskTimeout {
+		return Config{}, fmt.Errorf("ZORA_BACKGROUND_WORKER_LEASE_DURATION 必须大于任务超时")
+	}
+	backgroundWorkerRetryBase, err := time.ParseDuration(env("ZORA_BACKGROUND_WORKER_RETRY_BASE", "2s"))
+	if err != nil || backgroundWorkerRetryBase <= 0 {
+		return Config{}, fmt.Errorf("ZORA_BACKGROUND_WORKER_RETRY_BASE 必须是大于 0 的时间长度")
+	}
+	backgroundWorkerMaxAttempts, err := positiveInt("ZORA_BACKGROUND_WORKER_MAX_ATTEMPTS", "5")
+	if err != nil || backgroundWorkerMaxAttempts > 20 {
+		return Config{}, fmt.Errorf("ZORA_BACKGROUND_WORKER_MAX_ATTEMPTS 必须在 1 到 20 之间")
+	}
 	summaryEnabled, err := strconv.ParseBool(env("ZORA_SUMMARY_ENABLED", "true"))
 	if err != nil {
 		return Config{}, fmt.Errorf("ZORA_SUMMARY_ENABLED 必须是 true 或 false")
@@ -335,16 +360,21 @@ func Load() (Config, error) {
 		MessageRecallLimit:    messageRecallLimit,
 		MessageRecallMinScore: messageRecallMinScore,
 
-		MemoryAutoCapture:         memoryAutoCapture,
-		MemoryMaxCandidates:       memoryMaxCandidates,
-		MemoryRecallEnabled:       memoryRecallEnabled,
-		MemoryRecallLimit:         memoryRecallLimit,
-		MemoryRecallMinScore:      memoryRecallMinScore,
-		MemoryWorkerPollInterval:  memoryWorkerPollInterval,
-		MemoryWorkerTaskTimeout:   memoryWorkerTaskTimeout,
-		MemoryWorkerLeaseDuration: memoryWorkerLeaseDuration,
-		MemoryWorkerRetryBase:     memoryWorkerRetryBase,
-		MemoryWorkerMaxAttempts:   memoryWorkerMaxAttempts,
+		MemoryAutoCapture:             memoryAutoCapture,
+		MemoryMaxCandidates:           memoryMaxCandidates,
+		MemoryRecallEnabled:           memoryRecallEnabled,
+		MemoryRecallLimit:             memoryRecallLimit,
+		MemoryRecallMinScore:          memoryRecallMinScore,
+		MemoryWorkerPollInterval:      memoryWorkerPollInterval,
+		MemoryWorkerTaskTimeout:       memoryWorkerTaskTimeout,
+		MemoryWorkerLeaseDuration:     memoryWorkerLeaseDuration,
+		MemoryWorkerRetryBase:         memoryWorkerRetryBase,
+		MemoryWorkerMaxAttempts:       memoryWorkerMaxAttempts,
+		BackgroundWorkerPollInterval:  backgroundWorkerPollInterval,
+		BackgroundWorkerTaskTimeout:   backgroundWorkerTaskTimeout,
+		BackgroundWorkerLeaseDuration: backgroundWorkerLeaseDuration,
+		BackgroundWorkerRetryBase:     backgroundWorkerRetryBase,
+		BackgroundWorkerMaxAttempts:   backgroundWorkerMaxAttempts,
 
 		SummaryEnabled:         summaryEnabled,
 		SummaryTriggerMessages: summaryTriggerMessages,
