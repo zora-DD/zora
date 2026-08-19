@@ -178,6 +178,28 @@ CREATE INDEX IF NOT EXISTS idx_memories_kind_key
 CREATE INDEX IF NOT EXISTS idx_memories_expiry
     ON memories(expires_at);
 
+CREATE TABLE IF NOT EXISTS memory_capture_jobs (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    assistant_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'completed', 'failed')),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    available_at TIMESTAMPTZ NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_until TIMESTAMPTZ,
+    last_error TEXT NOT NULL DEFAULT '',
+    result JSONB NOT NULL DEFAULT '{}'::jsonb,
+    trace_parent TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_memory_capture_jobs_status_available
+    ON memory_capture_jobs(status, available_at, created_at);
+
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
     version_group_id TEXT NOT NULL,
@@ -241,4 +263,5 @@ INSERT INTO zora_schema_versions(version) VALUES (6) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (7) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (8) ON CONFLICT DO NOTHING;
 INSERT INTO zora_schema_versions(version) VALUES (9) ON CONFLICT DO NOTHING;
+INSERT INTO zora_schema_versions(version) VALUES (10) ON CONFLICT DO NOTHING;
 `

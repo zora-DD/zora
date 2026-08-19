@@ -80,11 +80,16 @@ type Config struct {
 	KnowledgeOverlap     int    // 相邻分块的重叠字符数，避免语义在边界断开。
 	KnowledgePrincipalID string // 当前部署经过认证的知识库主体；单用户模式使用固定值。
 
-	MemoryAutoCapture    bool    // 是否在回答完成后自动提取长期记忆候选。
-	MemoryMaxCandidates  int     // 单轮最多接纳的候选数，限制额外成本和错误放大。
-	MemoryRecallEnabled  bool    // 是否在模型执行前召回并注入相关长期记忆。
-	MemoryRecallLimit    int     // 单轮最多注入的长期记忆数量。
-	MemoryRecallMinScore float64 // 联合分数低于该阈值的记忆不得注入。
+	MemoryAutoCapture         bool          // 是否在回答完成后自动提取长期记忆候选。
+	MemoryMaxCandidates       int           // 单轮最多接纳的候选数，限制额外成本和错误放大。
+	MemoryRecallEnabled       bool          // 是否在模型执行前召回并注入相关长期记忆。
+	MemoryRecallLimit         int           // 单轮最多注入的长期记忆数量。
+	MemoryRecallMinScore      float64       // 联合分数低于该阈值的记忆不得注入。
+	MemoryWorkerPollInterval  time.Duration // Outbox 无通知时的兜底轮询间隔。
+	MemoryWorkerTaskTimeout   time.Duration // 单次长期记忆提取的超时上限。
+	MemoryWorkerLeaseDuration time.Duration // Worker 处理租约，必须大于任务超时。
+	MemoryWorkerRetryBase     time.Duration // 失败指数退避的基础间隔。
+	MemoryWorkerMaxAttempts   int           // 包含首次执行在内的最大尝试次数。
 
 	SummaryEnabled         bool // 是否启用长对话增量摘要与上下文压缩。
 	SummaryTriggerMessages int  // 尚未摘要的消息达到该数量后触发增量摘要。
@@ -196,6 +201,27 @@ func Load() (Config, error) {
 	if err != nil || math.IsNaN(memoryRecallMinScore) || math.IsInf(memoryRecallMinScore, 0) || memoryRecallMinScore < 0 || memoryRecallMinScore > 1 {
 		return Config{}, fmt.Errorf("ZORA_MEMORY_RECALL_MIN_SCORE 必须在 0 到 1 之间")
 	}
+	memoryWorkerPollInterval, err := time.ParseDuration(env("ZORA_MEMORY_WORKER_POLL_INTERVAL", "1s"))
+	if err != nil || memoryWorkerPollInterval <= 0 {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_WORKER_POLL_INTERVAL 必须是大于 0 的时间长度，例如 1s")
+	}
+	memoryWorkerTaskTimeout, err := time.ParseDuration(env("ZORA_MEMORY_WORKER_TASK_TIMEOUT", timeout.String()))
+	if err != nil || memoryWorkerTaskTimeout <= 0 {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_WORKER_TASK_TIMEOUT 必须是大于 0 的时间长度，例如 90s")
+	}
+	defaultMemoryLease := (memoryWorkerTaskTimeout + 30*time.Second).String()
+	memoryWorkerLeaseDuration, err := time.ParseDuration(env("ZORA_MEMORY_WORKER_LEASE_DURATION", defaultMemoryLease))
+	if err != nil || memoryWorkerLeaseDuration <= memoryWorkerTaskTimeout {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_WORKER_LEASE_DURATION 必须大于 ZORA_MEMORY_WORKER_TASK_TIMEOUT")
+	}
+	memoryWorkerRetryBase, err := time.ParseDuration(env("ZORA_MEMORY_WORKER_RETRY_BASE", "2s"))
+	if err != nil || memoryWorkerRetryBase <= 0 {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_WORKER_RETRY_BASE 必须是大于 0 的时间长度，例如 2s")
+	}
+	memoryWorkerMaxAttempts, err := positiveInt("ZORA_MEMORY_WORKER_MAX_ATTEMPTS", "5")
+	if err != nil || memoryWorkerMaxAttempts > 20 {
+		return Config{}, fmt.Errorf("ZORA_MEMORY_WORKER_MAX_ATTEMPTS 必须在 1 到 20 之间")
+	}
 	summaryEnabled, err := strconv.ParseBool(env("ZORA_SUMMARY_ENABLED", "true"))
 	if err != nil {
 		return Config{}, fmt.Errorf("ZORA_SUMMARY_ENABLED 必须是 true 或 false")
@@ -291,11 +317,16 @@ func Load() (Config, error) {
 		KnowledgeOverlap:     chunkOverlap,
 		KnowledgePrincipalID: env("ZORA_KNOWLEDGE_PRINCIPAL_ID", "local-user"),
 
-		MemoryAutoCapture:    memoryAutoCapture,
-		MemoryMaxCandidates:  memoryMaxCandidates,
-		MemoryRecallEnabled:  memoryRecallEnabled,
-		MemoryRecallLimit:    memoryRecallLimit,
-		MemoryRecallMinScore: memoryRecallMinScore,
+		MemoryAutoCapture:         memoryAutoCapture,
+		MemoryMaxCandidates:       memoryMaxCandidates,
+		MemoryRecallEnabled:       memoryRecallEnabled,
+		MemoryRecallLimit:         memoryRecallLimit,
+		MemoryRecallMinScore:      memoryRecallMinScore,
+		MemoryWorkerPollInterval:  memoryWorkerPollInterval,
+		MemoryWorkerTaskTimeout:   memoryWorkerTaskTimeout,
+		MemoryWorkerLeaseDuration: memoryWorkerLeaseDuration,
+		MemoryWorkerRetryBase:     memoryWorkerRetryBase,
+		MemoryWorkerMaxAttempts:   memoryWorkerMaxAttempts,
 
 		SummaryEnabled:         summaryEnabled,
 		SummaryTriggerMessages: summaryTriggerMessages,

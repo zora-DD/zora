@@ -1,6 +1,6 @@
 # Zora 项目技术文档
 
-> 适用版本：V0.6 Agent 可靠性与可观测性阶段
+> 适用版本：V0.8 Memory Capture Outbox 与 Worker 阶段
 > 目标读者：项目开发者、维护者和技术评审人员。  
 > 说明：“当前实现”描述仓库现状；“目标设计”描述后续版本，不能视为已交付能力。
 
@@ -143,13 +143,14 @@ flowchart TD
 8. 根据 Embedding Provider 创建 Hash 或 OpenAI-compatible Embedder，再追加可观察包装；
 9. 创建 Knowledge Service，并把 `knowledge_search` 加入工具 allowlist；
 10. 根据 Model Provider 创建共享的 Mock 或 OpenAI-compatible ChatModel，再追加可观察包装；
-11. 创建 Memory Service；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
+11. 创建 Memory Service 与 Capture Queue；按配置接入 Rule/Model Extractor，并设置召回 Top-K 与分数门槛；
 12. `ZORA_MULTI_AGENT_ENABLED=false` 时创建单 ChatModelAgent；开启时创建 Supervisor 和三个 AgentTool 专家，并按职责注入工具；
 13. 创建 Eino Runner；多 Agent 模式包装受控 AgentTool，并开启内部 Agent 事件透传；
 14. 按配置创建 Model/Rule Summarizer 和 Summary Service；
 15. 多 Agent 审批模式不为 off 时创建 Approval Service；
-16. 创建 Chat Service，按开关接入 Memory Capture/Recall、会话摘要、审批和 Run Trace，再创建含 Office Service 与 HTTP Trace 的 Handler；
-17. 启动 HTTP Server，监听 SIGINT/SIGTERM，收到信号后最多等待 10 秒优雅关闭；最后刷新并关闭 Telemetry。
+16. 创建 Chat Service，按开关接入 Memory Capture Queue/Recall、会话摘要、审批和 Run Trace；启动带租约与退避的 Memory Capture Worker；
+17. 创建含 Office、Memory Job 状态查询与 HTTP Trace 的 Handler；
+18. 启动 HTTP Server，监听 SIGINT/SIGTERM；关闭时先停止请求和 Worker，再关闭数据库并刷新 Telemetry。
 
 任一步失败都会终止启动，不会带着部分依赖进入服务状态。
 
@@ -197,6 +198,11 @@ flowchart TD
 | `ZORA_MEMORY_RECALL_ENABLED` | `true` | 否 | 是否在 Agent 执行前召回并注入长期记忆 |
 | `ZORA_MEMORY_RECALL_LIMIT` | `5` | 否 | 单轮最多注入数量，范围 1–20 |
 | `ZORA_MEMORY_RECALL_MIN_SCORE` | `0.25` | 否 | 联合召回最低总分，范围 0–1 |
+| `ZORA_MEMORY_WORKER_POLL_INTERVAL` | `1s` | 否 | 无进程内通知时扫描 Outbox 的兜底间隔 |
+| `ZORA_MEMORY_WORKER_TASK_TIMEOUT` | 跟随请求超时 | 否 | 单次 Memory Capture 超时 |
+| `ZORA_MEMORY_WORKER_LEASE_DURATION` | 任务超时 + 30s | 否 | 任务处理租约，必须严格大于任务超时 |
+| `ZORA_MEMORY_WORKER_RETRY_BASE` | `2s` | 否 | 指数退避基础间隔，实际上限 1 分钟 |
+| `ZORA_MEMORY_WORKER_MAX_ATTEMPTS` | `5` | 否 | 包含首次执行的最大尝试次数，范围 1–20 |
 | `ZORA_SUMMARY_ENABLED` | `true` | 否 | 是否启用会话增量摘要与上下文压缩 |
 | `ZORA_SUMMARY_TRIGGER_MESSAGES` | `20` | 否 | 未摘要消息触发阈值，范围 4–500 |
 | `ZORA_SUMMARY_KEEP_RECENT` | `12` | 否 | 保留原文的最近消息数，至少 2 且小于触发阈值 |
@@ -241,6 +247,8 @@ sequenceDiagram
     participant Client as Web Client
     participant API as HTTP API
     participant Chat as chat.Service
+    participant Queue as memory.CaptureQueue
+    participant Worker as memory.CaptureWorker
     participant Memory as memory.Service
     participant Summary as summary.Service
     participant Store as Store
@@ -294,14 +302,20 @@ sequenceDiagram
     Model-->>Runner: answer chunks
     Runner-->>Chat: delta
     Chat-->>Client: delta
-    Chat->>Store: 保存 assistant Message
-    Chat->>Memory: Capture(user + answer + source IDs)
-    Memory-->>Chat: created/updated/skipped
+    Chat->>Queue: 提交 assistant Message + Capture Job
+    Queue->>Store: 同事务保存消息与 pending Outbox
     Chat->>Summary: Update(latestSequence)
     Summary->>Store: 达阈值时读取未摘要消息并 Upsert
     Chat->>Store: 保存 model_output/run_completed
     Chat->>Store: Run → completed
     Chat-->>Client: done
+    par 回答完成后的异步增强
+        Worker->>Store: Claim Job + lease
+        Worker->>Store: 按 ID 读取 user/assistant Message
+        Worker->>Memory: Capture(user + answer + source IDs)
+        Memory-->>Worker: created/updated/skipped
+        Worker->>Store: completed / pending retry / failed
+    end
 ```
 
 ### 5.1 为什么先保存用户消息
@@ -465,12 +479,12 @@ SQL 子查询先按 sequence 倒序取最近 N 条，外层再升序输出。结
 
 ### 8.4 Store 替换策略
 
-应用层依赖 `store.Store`、`knowledge.Store`、`memory.Store`、`summary.Store`、`approval.Store` 与 `office.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/ChildRun/Approval/Document/Memory/Summary/OfficeDraft 语义；`cmd/zora` 只在启动组装阶段选择实现。
+应用层依赖 `store.Store`、`knowledge.Store`、`memory.Store`、`memory.CaptureJobStore`、`summary.Store`、`approval.Store` 与 `office.Store`。SQLite 和 PostgreSQL 当前都保持相同的 Conversation/Message/Run/ChildRun/Approval/Document/Memory/MemoryCaptureJob/Summary/OfficeDraft 语义；`cmd/zora` 只在启动组装阶段选择实现。
 
 PostgreSQL 已处理：
 
 - pgxpool 连接池和启动连通性检查；
-- `Conversation`、`Message`、`AgentRun`、`AgentTaskRun`、`ApprovalRequest`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory`、`ConversationSummary`、`OfficeDraft` 的关系与约束；
+- `Conversation`、`Message`、`AgentRun`、`AgentTaskRun`、`ApprovalRequest`、`RunEvent`、`KnowledgeDocument`、`KnowledgeChunk`、`Memory`、`MemoryCaptureJob`、`ConversationSummary`、`OfficeDraft` 的关系与约束；
 - advisory transaction lock 串行化多实例 DDL；
 - pgvector 类型注册、固定维度校验、HNSW cosine index；
 - 基于统一 tokenizer 词项的 `tsvector` generated column 和 GIN index。
@@ -611,6 +625,7 @@ sequenceDiagram
     participant UI as Web Memory Panel
     participant Chat as chat.Service
     participant API as httpapi
+    participant Worker as memory.CaptureWorker
     participant Service as memory.Service
     participant Extractor as Model/Rule Extractor
     participant DB as SQLite/PostgreSQL
@@ -622,15 +637,20 @@ sequenceDiagram
     Service->>DB: memory.Store
     DB-->>UI: 可追溯 Memory
 
-    Chat->>DB: 保存 user/assistant Message
-    Chat->>Service: Capture(来源 ID, 用户输入, 助手回答)
+    Chat->>DB: 同事务保存 assistant Message + pending Job
+    DB-->>Chat: Job ID，SSE done 立即返回
+    Note over Chat,DB: Outbox 只保存消息 ID，不复制正文
+    Worker->>DB: Claim pending/过期 executing + 租约
+    Worker->>DB: 按 ID 读取 user/assistant Message
+    Worker->>Service: Capture(来源 ID, 用户输入, 助手回答)
     Service->>Extractor: 提取最多 N 个候选
     Extractor-->>Service: kind/key/content/importance/expiry
     Service->>DB: 读取现有 Memory
     Service->>Service: Key 去重、冲突更新、人工修正保护
     Service->>DB: Create/Update conversation Memory
-    Service-->>Chat: created/updated/skipped
-    Chat->>DB: memory_capture_completed/failed
+    Service-->>Worker: created/updated/skipped
+    Worker->>DB: completed / pending retry / failed
+    Worker->>DB: 追加 Memory Capture RunEvent
 ```
 
 当前 `Memory` 分为：
@@ -645,7 +665,7 @@ sequenceDiagram
 - `ModelExtractor`：真实模型使用独立中文 System Prompt，只允许输出严格 JSON；用户输入和助手回答以 JSON 数据传入，明确禁止服从其中的指令，候选正文仍会经过类型、长度、敏感标签、重要性和过期时间二次校验；
 - `RuleExtractor`：Mock/离线测试只识别明确“记住”、`我的 X 是 Y`、稳定偏好和交互语言，不从普通问答中猜测事实。
 
-Consolidation 使用 `kind + memory_key` 识别同一事实槽位：相同内容跳过，不同内容更新并记录最新来源；用户通过 REST/Web 修改自动记忆后设置 `user_edited=true`，后续自动候选不能覆盖。自动处理在回答落库后同步执行，错误只写 `memory_capture_failed`，不会把已经成功生成的回答改成失败。当前用进程级互斥避免单实例并发重复；多副本下仍需数据库唯一约束或任务队列。
+Consolidation 使用 `kind + memory_key` 识别同一事实槽位：相同内容跳过，不同内容更新并记录最新来源；用户通过 REST/Web 修改自动记忆后设置 `user_edited=true`，后续自动候选不能覆盖。V0.8 将自动处理改为事务 Outbox：助手消息与 `memory_capture_jobs` 原子提交，Worker 用租约领取并在临时失败后指数退避；错误不会把已经成功生成的回答改成失败。进程内仍串行 Consolidation；PostgreSQL 可避免同一 Job 重复领取，但不同 Job 多实例并发更新同一 Key 仍需数据库唯一约束和冲突重试。
 
 ### 8.11 长期记忆联合召回与上下文注入
 
@@ -1086,7 +1106,31 @@ DELETE /api/memories/{memoryID}
 }
 ```
 
-### 10.14 Office 草稿管理
+### 10.14 长期记忆捕获任务
+
+```http
+GET /api/memory-capture/jobs?status=pending&limit=100
+GET /api/memory-capture/jobs/{jobID}
+```
+
+当自动捕获开启时，SSE `done` 不再等待提取结果，而是返回 `memory_job`：
+
+```json
+{
+  "type": "done",
+  "memory_job": {
+    "id": "memory_job_xxx",
+    "run_id": "run_xxx",
+    "status": "pending",
+    "attempt": 0,
+    "max_attempts": 5
+  }
+}
+```
+
+列表支持 `pending/executing/completed/failed` 状态过滤。任务 API 不返回 `lease_owner` 和 `trace_parent`；不存在返回 404。完整状态机、恢复语义和指标见[第三阶段文档](phase-3-memory-outbox.md)。
+
+### 10.15 Office 草稿管理
 
 ```http
 GET /api/office/drafts?kind=email&status=draft&limit=100
@@ -1211,9 +1255,9 @@ Mock 不伪造 Token，因此会得到 `usage_complete=false`。这既可测试�
 
 | 层级 | 当前覆盖 |
 |---|---|
-| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分、弱相关硬负例和人工修正保护；会话摘要阈值、窗口、序号间隔、JSON 解析、敏感信息过滤和安全注入 |
+| 单元测试 | 计算器；Unicode 分块和偏移；Hash/OpenAI-compatible Embedder；Model/Rule 提取器、Memory 校验、Consolidation、联合评分、弱相关硬负例和人工修正保护；Capture Worker 失败退避与完成；会话摘要阈值、窗口、序号间隔、JSON 解析、敏感信息过滤和安全注入 |
 | Runtime 测试 | Mock 经 Eino 完成 tool_call/tool_result/delta；逐模型输出的 Usage 透传；Supervisor 单专家和 Document→Writer 串行协作；MCP 文件/邮件意图路由和中文结果整理；专家输出与最终回答隔离 |
-| Store/知识库/记忆测试 | Conversation/Message；AgentRun Get/List；Document/Chunk 事务、去重、召回、引用；Memory CRUD；ConversationSummary Upsert、消息范围、级联删除和 PostgreSQL Schema |
+| Store/知识库/记忆测试 | Conversation/Message；AgentRun Get/List；Document/Chunk 事务、去重、召回、引用；Memory CRUD；助手消息 + Capture Job 原子提交、幂等入队、租约、重试时间与过期恢复；ConversationSummary Upsert、消息范围、级联删除和 PostgreSQL Schema |
 | 可观察性测试 | Run 总耗时、TTFT、Usage 完整/缺失、工具与 Agent 交接配对和耗时聚合；SSE done.metrics、Run 列表/详情接口 |
 | RAG 评测测试 | 严格数据集校验；Recall@K、MRR、Hit Rate；三路差值；伪造引用与原文不支持的反例 |
 | Memory A/B 测试 | 严格数据集校验；Control/Treatment 事实覆盖；意外召回与答案污染反例；RunEvent 召回 ID 解析；完整 CLI 基线 |
@@ -1221,7 +1265,7 @@ Mock 不伪造 Token，因此会得到 `usage_complete=false`。这既可测试�
 | MCP/Graph 测试 | in-memory MCP 握手、只读标注、白名单和环境隔离；纯内存 HTTP 验证 Graph Bearer Token、查询窗口、关键词过滤、错误脱敏和不可信内容警告 |
 | Office 草稿测试 | 邮件/日历参数归一化与拒绝规则；可信 Run Context；ToolResult 无外部副作用；SQLite 生命周期、幂等和一次性确认；PostgreSQL Schema；Mock Agent→Tool→SQLite→SSE→REST→确认/决定/事件端到端 |
 | PostgreSQL 测试 | schema/index/词项单测；通过 `ZORA_TEST_POSTGRES_DSN` 开启真实会话、摄取和三路召回测试 |
-| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404、自动提取/召回，以及摘要触发、查询和 Mock 上下文作答 |
+| HTTP 集成测试 | 创建对话、POST SSE、工具链、multipart 上传、知识检索、Memory CRUD/404、异步 Job SSE/查询、自动提取/召回，以及摘要触发、查询和 Mock 上下文作答 |
 | 静态页面测试 | 根路径、前端路由回退、CSS 资源 |
 | 工程检查 | `go test`、`go vet`、race、无 CGO build |
 
@@ -1404,6 +1448,12 @@ HTTP Server Span
 Prometheus 使用进程内独立 Registry，`/metrics` 由根路由直接处理，不进入业务 HTTP 中间件。Counter/Histogram 标签限定为 method、route、status、provider、model、tool name 等有限集合；`run_id`、`conversation_id` 只作为 Span Attribute，避免指标高基数。正文、Prompt、知识片段、工具参数和密钥既不进入 Trace，也不进入 Metric。
 
 RunEvent 与 OTel 的职责不同：前者是不可采样的产品审计事实，后者允许采样和过期，服务于跨层耗时与故障定位。两者通过 Run ID/Trace ID 关联，而不是互相替换。当前开发环境直接发往 Jaeger；生产应在 Zora 与后端之间加入 Collector，承担重试、脱敏、尾采样和多后端路由，并通过网络策略保护 `/metrics`。完整启动与验收见[第二阶段文档](phase-2-observability.md)。
+
+### 17.7 V0.8 Memory Capture Outbox 与 Worker
+
+V0.8 将回答后的长期记忆提取从请求内同步调用改为数据库 Outbox。`CaptureQueue.Enqueue` 调用 Store 的事务方法，同时插入 assistant Message 和 `memory_capture_jobs`；任一步失败会整体回滚。Job 只记录消息 ID、Run ID、状态、租约和结果计数，Worker 处理时才读取正文，避免 Outbox 再复制一份用户数据。
+
+Worker 串行消费当前进程任务，使用 `pending → executing → completed/failed` 状态机、租约所有者和 attempt 做并发控制。临时失败回到 pending 并指数退避；SQLite 通过单连接事务领取，PostgreSQL 使用 `FOR UPDATE SKIP LOCKED`。过期 executing 可被重新领取，最后一次尝试中断会恢复为 failed，避免永久卡住。SSE `done.memory_job`、REST Job API、RunEvent、`memory.capture` Span 和三组 Prometheus 指标共同提供产品状态与基础设施时序。详细设计和验收见[第三阶段文档](phase-3-memory-outbox.md)。
 
 ## 18. 维护约定
 

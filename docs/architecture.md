@@ -11,11 +11,11 @@ Zora 将系统划分为十六个边界：
 3. `agentruntime`：Eino ADK 适配，输出与传输协议无关的事件。
 4. `agenttools`：工具 Schema、输入校验和执行代码。
 5. `knowledge`：文档摄取、Embedding、混合检索、引用和 `knowledge_search` Tool。
-6. `memory`：Semantic/Episodic Memory、候选提取、Consolidation、生命周期校验和用户控制。
+6. `memory`：Semantic/Episodic Memory、候选提取、Consolidation、Capture Outbox/Worker、生命周期校验和用户控制。
 7. `summary`：会话增量摘要、最近消息窗口、Model/Rule Summarizer 和持久化契约。
 8. `memoryeval`：长期记忆 Control/Treatment、召回/事实/污染指标和质量门禁。
 9. `agentseval`：多 Agent 路由准确率、意外专家调用、答案完成和质量门禁。
-10. `store`：对话、知识库、长期记忆与摘要的持久化边界，由 SQLite 或 PostgreSQL 实现。
+10. `store`：对话、知识库、长期记忆、Capture Job 与摘要的持久化边界，由 SQLite 或 PostgreSQL 实现。
 11. `rageval`：固定数据集校验、检索指标、答案引用/忠实度和联合门禁。
 12. `mcpbridge`：官方 MCP Client、stdio 生命周期、工具发现/白名单和 Eino 适配。
 13. `mcpfiles`：独立文件连接器的授权目录、路径校验和只读工具实现。
@@ -68,6 +68,10 @@ RunMetrics 不是独立事实表，而是 `AgentRun + RunEvent` 的查询时投�
 
 Memory 独立于原始 Message，区分 `semantic` 稳定事实/偏好与 `episodic` 经历/事件。每条记录包含稳定 Key、来源、重要性、人工修正标记、创建/更新时间和可选过期时间。当前支持用户完整 CRUD、回答后的自动提取/Consolidation，以及回答前的联合召回和安全上下文注入。
 
+### MemoryCaptureJob
+
+回答完成时，assistant Message 与 pending CaptureJob 在同一事务提交；Job 只保存 Run/会话/消息 ID、状态、attempt、available_at、租约和计数结果。后台 Worker 按租约领取、超时控制、指数退避和过期恢复执行 Capture，SSE/REST/RunEvent/OTel 可追踪后续状态。PostgreSQL 使用 `FOR UPDATE SKIP LOCKED` 避免同一任务被多个实例领取。
+
 ### ConversationSummary
 
 每个 Conversation 最多一份增量摘要，记录正文、已覆盖的 Message sequence、累计消息数、模型和更新时间。达到阈值时合并旧摘要与较早消息，最近窗口继续保留原文；原始 Message 不删除。下一轮上下文由“摘要 + 相关长期记忆 + 最近原始消息”组成。
@@ -88,6 +92,7 @@ OfficeOperation 是 approved 草稿对应的唯一持久化执行任务，保存
 - 模型客户端和整个消息请求都有超时。
 - 草稿状态迁移使用数据库 compare-and-swap；状态与审计事件在同一事务提交，重复或并发人工决定只有一个成功。
 - Operation 使用数据库唯一约束和租约防止重复创建/领取；任务、草稿和双审计原子迁移，启动时回收过期执行租约。
+- Memory Capture 使用消息 + Job 事务 Outbox、Run 唯一幂等键和数据库租约；Worker 停止时取消当前任务并将失败持久化为可重试或终态。
 
 PostgreSQL Store 已对 schema migration 使用 advisory transaction lock；业务对话锁仍是进程内 Mutex，多实例部署前还应升级为数据库 advisory lock 或带租约的分布式锁。
 
@@ -148,7 +153,9 @@ SQLite 候选召回在 Go 内最多精确扫描 10,000 个 Chunk。PostgreSQL �
 
 ```text
 internal/memory/
-├── types.go          Memory/Store 契约
+├── types.go          Memory/CaptureJob/Store 契约
+├── capture_queue.go  助手消息 + Job 事务入队与状态查询
+├── capture_worker.go 租约领取、退避重试和恢复
 ├── extractor.go      真实模型结构化提取与本地保守规则
 ├── retriever.go      相关性、重要性、时效性联合评分
 └── service.go        CRUD、候选校验、Key Consolidation 和人工修正保护
@@ -162,6 +169,7 @@ internal/store/postgres/summaries.go
 
 GET/POST /api/memories
 GET/PUT/DELETE /api/memories/{memoryID}
+GET /api/memory-capture/jobs[/{jobID}]
 GET /api/conversations/{conversationID}/summary
 ```
 
@@ -170,7 +178,7 @@ SQLite 与 PostgreSQL 都保存 kind、memory_key、content、importance、user_
 长期记忆当前按两条失败隔离链路运行，而不是把所有聊天记录向量化：
 
 ```text
-对话结束 → 候选事实提取 → 校验 → Key 去重/冲突合并 → 持久化
+对话结束 → 消息 + Job 原子入队 → Worker 租约领取 → 候选提取 → 校验 → Key 合并 → 持久化
 新请求   → 最低主题相关性 → 相关性 65% + 重要性 20% + 时效性 15% → Top-K → 安全 System 上下文
 ```
 

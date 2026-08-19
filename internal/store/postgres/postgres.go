@@ -34,6 +34,7 @@ var (
 	_ knowledge.Store          = (*Postgres)(nil)
 	_ knowledge.CandidateStore = (*Postgres)(nil)
 	_ memory.Store             = (*Postgres)(nil)
+	_ memory.CaptureJobStore   = (*Postgres)(nil)
 	_ office.Store             = (*Postgres)(nil)
 	_ summary.Store            = (*Postgres)(nil)
 )

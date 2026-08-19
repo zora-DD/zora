@@ -38,6 +38,10 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if !cfg.MemoryRecallEnabled || cfg.MemoryRecallLimit != 5 || cfg.MemoryRecallMinScore != 0.25 {
 		t.Fatalf("unexpected memory recall defaults: %+v", cfg)
 	}
+	if cfg.MemoryWorkerPollInterval != time.Second || cfg.MemoryWorkerTaskTimeout != 90*time.Second ||
+		cfg.MemoryWorkerLeaseDuration != 2*time.Minute || cfg.MemoryWorkerRetryBase != 2*time.Second || cfg.MemoryWorkerMaxAttempts != 5 {
+		t.Fatalf("unexpected memory worker defaults: %+v", cfg)
+	}
 	if !cfg.SummaryEnabled || cfg.SummaryTriggerMessages != 20 || cfg.SummaryKeepRecent != 12 || cfg.SummaryMaxRunes != 4000 {
 		t.Fatalf("unexpected summary defaults: %+v", cfg)
 	}
@@ -237,6 +241,8 @@ func clearEnvironment(t *testing.T) {
 		"ZORA_KNOWLEDGE_CHUNK_OVERLAP", "ZORA_KNOWLEDGE_PRINCIPAL_ID",
 		"ZORA_MEMORY_AUTO_CAPTURE", "ZORA_MEMORY_MAX_CANDIDATES",
 		"ZORA_MEMORY_RECALL_ENABLED", "ZORA_MEMORY_RECALL_LIMIT", "ZORA_MEMORY_RECALL_MIN_SCORE",
+		"ZORA_MEMORY_WORKER_POLL_INTERVAL", "ZORA_MEMORY_WORKER_TASK_TIMEOUT", "ZORA_MEMORY_WORKER_LEASE_DURATION",
+		"ZORA_MEMORY_WORKER_RETRY_BASE", "ZORA_MEMORY_WORKER_MAX_ATTEMPTS",
 		"ZORA_SUMMARY_ENABLED", "ZORA_SUMMARY_TRIGGER_MESSAGES", "ZORA_SUMMARY_KEEP_RECENT", "ZORA_SUMMARY_MAX_RUNES",
 		"ZORA_MCP_ENABLED", "ZORA_MCP_SERVERS_JSON", "ZORA_MCP_CONNECT_TIMEOUT", "ZORA_MCP_CALL_TIMEOUT", "ZORA_MCP_MAX_OUTPUT_RUNES",
 		"ZORA_OFFICE_EXECUTOR", "ZORA_OFFICE_EXECUTOR_COMMAND", "ZORA_OFFICE_EXECUTOR_ARGS_JSON",

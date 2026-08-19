@@ -542,7 +542,7 @@ func TestInfoReportsSQLiteRetrievalBackend(t *testing.T) {
 	if !strings.Contains(response.Body.String(), `"retrieval_backend":"sqlite-exact-scan"`) {
 		t.Fatalf("info body = %s", response.Body.String())
 	}
-	if !strings.Contains(response.Body.String(), `"version":"0.7.0-dev"`) ||
+	if !strings.Contains(response.Body.String(), `"version":"0.8.0-dev"`) ||
 		!strings.Contains(response.Body.String(), `"tool_count":4`) ||
 		!strings.Contains(response.Body.String(), `"run-metrics"`) ||
 		!strings.Contains(response.Body.String(), `"memory-auto-capture"`) ||
@@ -711,6 +711,76 @@ func TestConversationAutomaticallyCapturesAndConsolidatesMemory(t *testing.T) {
 	handler.ServeHTTP(listed, list)
 	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), "用户的主要编程语言是Java。") || strings.Contains(listed.Body.String(), "用户的主要编程语言是Go。") {
 		t.Fatalf("consolidated memories status = %d, body = %s", listed.Code, listed.Body.String())
+	}
+}
+
+func TestAsyncMemoryCaptureReturnsJobAndExposesStatusAPI(t *testing.T) {
+	t.Parallel()
+	database, err := sqlite.Open(filepath.Join(t.TempDir(), "async-memory-api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	registeredTools, err := agenttools.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	knowledgeService := newTestKnowledgeService(t, database)
+	runtime, err := agentruntime.New(context.Background(), config.Config{
+		Provider: "mock", Model: "zora-mock", Instruction: "Be helpful.",
+		RequestTimeout: time.Second, MaxIterations: 5,
+	}, registeredTools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	memoryService := newTestMemoryService(t, database)
+	queue, err := memory.NewCaptureQueue(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := New(chat.NewService(database, runtime,
+		chat.WithMemoryCaptureQueue(queue, 3),
+	), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second,
+		WithMemoryCaptureQueue(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	create := httptest.NewRequest(http.MethodPost, "/api/conversations", strings.NewReader(`{"title":"Async memory"}`))
+	create.Header.Set("Content-Type", "application/json")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	var conversation struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &conversation); err != nil {
+		t.Fatal(err)
+	}
+	send := httptest.NewRequest(http.MethodPost, "/api/conversations/"+conversation.ID+"/messages",
+		strings.NewReader(`{"content":"我的主要编程语言是 Go。"}`))
+	send.Header.Set("Content-Type", "application/json")
+	stream := httptest.NewRecorder()
+	handler.ServeHTTP(stream, send)
+	if stream.Code != http.StatusOK || !strings.Contains(stream.Body.String(), `"memory_job":{"id":"memory_job_`) ||
+		!strings.Contains(stream.Body.String(), `"status":"pending"`) {
+		t.Fatalf("async memory SSE = %d, %s", stream.Code, stream.Body.String())
+	}
+
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/memory-capture/jobs?status=pending", nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"status":"pending"`) {
+		t.Fatalf("capture jobs = %d, %s", list.Code, list.Body.String())
+	}
+	var jobs struct {
+		Jobs []memory.CaptureJob `json:"jobs"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &jobs); err != nil || len(jobs.Jobs) != 1 {
+		t.Fatalf("decoded jobs = %+v, %v", jobs, err)
+	}
+	get := httptest.NewRecorder()
+	handler.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/api/memory-capture/jobs/"+jobs.Jobs[0].ID, nil))
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), jobs.Jobs[0].RunID) {
+		t.Fatalf("capture job = %d, %s", get.Code, get.Body.String())
 	}
 }
 

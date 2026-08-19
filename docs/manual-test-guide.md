@@ -52,6 +52,15 @@
 
 预期：同一事实槽位最终为 Java；回答偏好可召回；普通的“Go 并发模型是什么”不应错误召回个人编程语言。还需在长期记忆面板验证来源、重要性、编辑保护、过期和删除。
 
+自动捕获已异步化。每次回答的 SSE `done.memory_job.status` 应先为 `pending`，随后查询：
+
+```http
+GET /api/memory-capture/jobs?limit=20
+GET /api/memory-capture/jobs/{jobID}
+```
+
+正常情况下任务最终为 `completed`，`result.created/updated/skipped` 与记忆面板变化一致。临时关闭模型服务后发送一条明确记忆，再恢复模型服务，应能观察到 attempt 增加、任务经过 pending 重试后完成；重启 Zora 不应丢失尚未完成的任务。
+
 ## 6. 多模型切换
 
 1. 在模型选择器中选择 Mock，发送 T02，记录 Run 模型和结果。

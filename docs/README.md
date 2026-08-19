@@ -10,6 +10,7 @@
 | [Roadmap](roadmap.md) | 项目维护者 | 版本任务、完成状态和验收条件 |
 | [第一阶段：真实 Embedding 与 RAG 基线](phase-1-real-embedding.md) | 项目作者、评测维护者 | 配置、索引隔离、64 题真实向量评测和指标记录 |
 | [第二阶段：OTel 与 Prometheus](phase-2-observability.md) | 开发者、运维、面试复习 | HTTP/Run/模型/Tool/Embedding Trace、指标、本地启动与排障 |
+| [第三阶段：Memory Capture Outbox](phase-3-memory-outbox.md) | 后端开发者、面试复习 | 事务入队、租约 Worker、退避重试、状态 API 与异步 Trace |
 
 ## 文档维护原则
 

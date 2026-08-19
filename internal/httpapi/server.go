@@ -36,6 +36,7 @@ type Server struct {
 	chat           *chat.Service
 	knowledge      *knowledge.Service
 	memory         *memory.Service
+	memoryQueue    *memory.CaptureQueue
 	approval       *approval.Service
 	office         *office.Service
 	telemetry      *observability.Telemetry
@@ -57,6 +58,10 @@ func WithOfficeService(service *office.Service) Option {
 
 func WithTelemetry(telemetry *observability.Telemetry) Option {
 	return func(server *Server) { server.telemetry = telemetry }
+}
+
+func WithMemoryCaptureQueue(queue *memory.CaptureQueue) Option {
+	return func(server *Server) { server.memoryQueue = queue }
 }
 
 // WithMCPInfo 只向展示层暴露启用状态和已通过门禁的工具数，不泄露命令、参数或环境变量。
@@ -117,6 +122,10 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	mux.HandleFunc("GET /api/memories/{memoryID}", server.getMemory)
 	mux.HandleFunc("PUT /api/memories/{memoryID}", server.replaceMemory)
 	mux.HandleFunc("DELETE /api/memories/{memoryID}", server.deleteMemory)
+	if server.memoryQueue != nil {
+		mux.HandleFunc("GET /api/memory-capture/jobs", server.listMemoryCaptureJobs)
+		mux.HandleFunc("GET /api/memory-capture/jobs/{jobID}", server.getMemoryCaptureJob)
+	}
 
 	// 前端资源编译进 Go 二进制，部署时不需要额外静态文件服务器。
 	assets, err := fs.Sub(webFiles, "web")
@@ -150,7 +159,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "multi-model-selection")
 	}
 	if s.memory.AutoCaptureEnabled() {
-		capabilities = append(capabilities, "memory-auto-capture", "memory-consolidation")
+		capabilities = append(capabilities, "memory-auto-capture", "memory-consolidation", "memory-capture-outbox")
 	}
 	if s.chat.MemoryRecallEnabled() {
 		capabilities = append(capabilities, "memory-recall", "memory-context-injection")
@@ -178,7 +187,7 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		capabilities = append(capabilities, "pgvector-hnsw", "postgresql-fts")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"name": "Zora", "version": "0.7.0-dev",
+		"name": "Zora", "version": "0.8.0-dev",
 		"provider": s.chat.Provider(), "model": s.chat.Model(),
 		"models": s.chat.ModelProfiles(), "default_model_id": s.chat.DefaultModelID(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
@@ -561,6 +570,27 @@ func (s *Server) deleteMemory(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) listMemoryCaptureJobs(w http.ResponseWriter, r *http.Request) {
+	limit, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("limit")))
+	items, err := s.memoryQueue.List(r.Context(), memory.CaptureJobFilter{
+		Status: strings.TrimSpace(r.URL.Query().Get("status")), Limit: limit,
+	})
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"jobs": items})
+}
+
+func (s *Server) getMemoryCaptureJob(w http.ResponseWriter, r *http.Request) {
+	job, err := s.memoryQueue.Get(r.Context(), r.PathValue("jobID"))
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
+}
+
 func (s *Server) listOfficeDrafts(w http.ResponseWriter, r *http.Request) {
 	limit := 100
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
@@ -752,7 +782,7 @@ func decodeMemoryInput(w http.ResponseWriter, r *http.Request) (memoryRequest, e
 
 func (s *Server) problem(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
-	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) || errors.Is(err, summary.ErrNotFound) {
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, knowledge.ErrNotFound) || errors.Is(err, memory.ErrNotFound) || errors.Is(err, memory.ErrJobNotFound) || errors.Is(err, summary.ErrNotFound) {
 		status = http.StatusNotFound
 	} else if errors.Is(err, knowledge.ErrAccessDenied) {
 		status = http.StatusForbidden

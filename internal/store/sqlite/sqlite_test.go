@@ -101,6 +101,141 @@ CREATE TABLE memories (
 	}
 }
 
+func TestMemoryCaptureOutboxLifecycleAndAtomicity(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "memory-outbox.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	conversation := domain.Conversation{ID: "conv_outbox", Title: "outbox", CreatedAt: now, UpdatedAt: now}
+	if err := database.CreateConversation(ctx, conversation); err != nil {
+		t.Fatal(err)
+	}
+	userMessage, err := database.AddMessage(ctx, domain.Message{
+		ID: "msg_outbox_user", ConversationID: conversation.ID, Role: domain.RoleUser,
+		Content: "我主要使用 Go。", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := domain.AgentRun{
+		ID: "run_outbox", ConversationID: conversation.ID, UserMessageID: userMessage.ID,
+		Status: domain.RunRunning, Model: "mock", StartedAt: now,
+	}
+	if err := database.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	assistant := domain.Message{
+		ID: "msg_outbox_assistant", ConversationID: conversation.ID,
+		Role: domain.RoleAssistant, Content: "我会记住。", CreatedAt: now.Add(time.Second),
+	}
+	job := memory.CaptureJob{
+		ID: "memory_job_1", RunID: run.ID, ConversationID: conversation.ID,
+		UserMessageID: userMessage.ID, AssistantMessageID: assistant.ID,
+		Status: memory.JobPending, MaxAttempts: 3, AvailableAt: now,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	savedMessage, savedJob, created, err := database.EnqueueCaptureJob(ctx, assistant, job)
+	if err != nil || !created || savedMessage.Sequence == 0 || savedJob.ID != job.ID {
+		t.Fatalf("enqueue = message:%+v job:%+v created:%v err:%v", savedMessage, savedJob, created, err)
+	}
+	// 同一 Run 再次提交必须返回原任务，不创建第二条助手消息。
+	_, duplicate, created, err := database.EnqueueCaptureJob(ctx, assistant, memory.CaptureJob{RunID: run.ID})
+	if err != nil || created || duplicate.ID != job.ID {
+		t.Fatalf("idempotent enqueue = %+v, created=%v, err=%v", duplicate, created, err)
+	}
+	messages, err := database.ListMessages(ctx, conversation.ID, 10)
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("messages = %+v, %v", messages, err)
+	}
+
+	claimed, err := database.ClaimCaptureJob(ctx, "worker_1", now.Add(time.Second), now.Add(time.Minute))
+	if err != nil || claimed.Status != memory.JobExecuting || claimed.Attempt != 1 || claimed.LeaseOwner != "worker_1" {
+		t.Fatalf("claimed = %+v, %v", claimed, err)
+	}
+	retryAt := now.Add(2 * time.Minute)
+	retried, err := database.FailCaptureJob(ctx, claimed.ID, claimed.LeaseOwner, "临时失败", retryAt, now.Add(2*time.Second), false)
+	if err != nil || retried.Status != memory.JobPending || retried.LastError == "" {
+		t.Fatalf("retried = %+v, %v", retried, err)
+	}
+	if _, err := database.ClaimCaptureJob(ctx, "worker_2", retryAt.Add(-time.Second), retryAt.Add(time.Minute)); !errors.Is(err, memory.ErrJobNotFound) {
+		t.Fatalf("job should respect retry time, got %v", err)
+	}
+	claimed, err = database.ClaimCaptureJob(ctx, "worker_2", retryAt, retryAt.Add(time.Minute))
+	if err != nil || claimed.Attempt != 2 {
+		t.Fatalf("second claim = %+v, %v", claimed, err)
+	}
+	result := memory.CaptureResult{Enabled: true, Candidates: 1, Created: 1}
+	completed, err := database.CompleteCaptureJob(ctx, claimed.ID, claimed.LeaseOwner, result, retryAt.Add(time.Second))
+	if err != nil || completed.Status != memory.JobCompleted || completed.Result == nil || completed.Result.Created != 1 {
+		t.Fatalf("completed = %+v, %v", completed, err)
+	}
+
+	// 任务外键失败时，助手消息也必须随事务回滚。
+	badAssistant := domain.Message{
+		ID: "msg_should_rollback", ConversationID: conversation.ID,
+		Role: domain.RoleAssistant, Content: "不应落库", CreatedAt: now,
+	}
+	_, _, _, err = database.EnqueueCaptureJob(ctx, badAssistant, memory.CaptureJob{
+		ID: "memory_job_bad", RunID: "run_missing", ConversationID: conversation.ID,
+		UserMessageID: userMessage.ID, AssistantMessageID: badAssistant.ID,
+		Status: memory.JobPending, MaxAttempts: 1, AvailableAt: now, CreatedAt: now, UpdatedAt: now,
+	})
+	if err == nil {
+		t.Fatal("expected foreign-key failure")
+	}
+	if _, err := database.GetMessage(ctx, badAssistant.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("assistant message should roll back, got %v", err)
+	}
+}
+
+func TestMemoryCaptureOutboxRecoversExpiredFinalLease(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "memory-outbox-recovery.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	conversation := domain.Conversation{ID: "conv_recovery", Title: "recovery", CreatedAt: now, UpdatedAt: now}
+	if err := database.CreateConversation(ctx, conversation); err != nil {
+		t.Fatal(err)
+	}
+	userMessage, err := database.AddMessage(ctx, domain.Message{
+		ID: "msg_recovery_user", ConversationID: conversation.ID, Role: domain.RoleUser, Content: "记住", CreatedAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := domain.AgentRun{ID: "run_recovery", ConversationID: conversation.ID, UserMessageID: userMessage.ID, Status: domain.RunRunning, Model: "mock", StartedAt: now}
+	if err := database.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	assistant := domain.Message{ID: "msg_recovery_assistant", ConversationID: conversation.ID, Role: domain.RoleAssistant, Content: "好", CreatedAt: now}
+	job := memory.CaptureJob{
+		ID: "memory_job_recovery", RunID: run.ID, ConversationID: conversation.ID,
+		UserMessageID: userMessage.ID, AssistantMessageID: assistant.ID,
+		Status: memory.JobPending, MaxAttempts: 1, AvailableAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if _, _, _, err := database.EnqueueCaptureJob(ctx, assistant, job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ClaimCaptureJob(ctx, "worker_crashed", now, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ClaimCaptureJob(ctx, "worker_recovery", now.Add(2*time.Second), now.Add(time.Minute)); !errors.Is(err, memory.ErrJobNotFound) {
+		t.Fatalf("expected no claimable job after terminal recovery, got %v", err)
+	}
+	recovered, err := database.GetCaptureJob(ctx, job.ID)
+	if err != nil || recovered.Status != memory.JobFailed || recovered.CompletedAt == nil {
+		t.Fatalf("recovered = %+v, %v", recovered, err)
+	}
+}
+
 func TestConversationLifecycle(t *testing.T) {
 	t.Parallel()
 	database, err := Open(filepath.Join(t.TempDir(), "test.db"))

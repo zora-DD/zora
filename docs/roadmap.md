@@ -128,8 +128,27 @@
 
 当前验证结果：自动化测试构造完整调用链并验证 `HTTP → Run → model/tool → embedding` 的父子 Span 与同一 Trace ID，Prometheus Handler 可导出 Run Counter 和延迟 Histogram。业务 Run 的 `trace_id`、`span_id` 同时进入 SSE `start` 和持久化 `run_started`，可从产品审计跳转到 Jaeger。当前是本地直接导出到 Jaeger 的开发方案，生产仍需 Collector、Grafana Dashboard 与告警规则。
 
+## V0.8 Memory Capture Outbox & Worker — 已完成
+
+- [x] assistant Message 与 Capture Job 同事务提交，失败整体回滚
+- [x] `run_id` 幂等入队，Outbox 只保存消息 ID、不复制正文
+- [x] SQLite/PostgreSQL 的 pending/executing/completed/failed 状态机
+- [x] PostgreSQL `FOR UPDATE SKIP LOCKED`、租约所有者和过期恢复
+- [x] 单任务超时、指数退避、最大尝试次数和终态失败
+- [x] SSE `done.memory_job` 与 Job 列表/详情 REST API
+- [x] queued/retry/completed/failed RunEvent 审计
+- [x] `memory.capture` Consumer Span、队列延迟/执行耗时/状态指标
+- [x] 事务原子性、幂等、重试、租约恢复、HTTP 和 Trace 自动化测试
+
+验收条件：HTTP 返回 `done` 前必须已经持久化助手消息和 pending Job；临时失败可在退避后完成；进程退出遗留租约不会永久卡住；异步 Span 可通过持久化 TraceContext 与原 Run 关联；任何 Trace/Metric 不包含对话正文。
+
+当前验证结果：SQLite 自动化测试覆盖消息与 Job 原子提交及回滚、同 Run 重复入队、available_at、租约和最后尝试恢复；Worker 测试注入一次失败后在第二次完成；HTTP 测试验证 SSE Job 和状态查询；OTel 测试验证后台 `memory.capture` 的父 Span 是原 `agent.run`。PostgreSQL Schema 和领取 SQL 已进入自动化检查，真实 PostgreSQL 并发集成仍应在 Docker 可用环境执行 `make test-postgres`。
+
 ## 后续技术待办
 
+- [ ] 为不同 Job 并发更新同一 `kind + memory_key` 增加数据库唯一约束、冲突重读与合并重试。
+- [ ] 把同步文档摄取改成 Ingestion Outbox + 批量 Embedding Worker，并提供失败重投/死信管理面。
+- [ ] 把同步会话摘要迁入异步 Job，确保 sequence 边界和重复执行幂等。
 - [ ] 普通对话消息向量化与语义历史召回；当前 `messages` 只持久化原文，不持久化向量。
 - [ ] 长期记忆向量化与混合召回；当前 `memories` 使用词项相关性、重要性和时效性，不持久化向量。
 - [ ] 为消息向量、记忆向量和知识库 Chunk 向量增加明确的集合/实体类型、模型名、维度与索引版本边界；当前只有知识库 `knowledge_chunks` 持久化向量。

@@ -116,6 +116,19 @@ RETURNING sequence`,
 	return message, nil
 }
 
+func (p *Postgres) GetMessage(ctx context.Context, id string) (domain.Message, error) {
+	message, err := scanMessage(p.pool.QueryRow(ctx, `
+SELECT id, conversation_id, role, content, tool_name, tool_call_id, sequence, created_at
+FROM messages WHERE id = $1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.Message{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("查询消息失败：%w", err)
+	}
+	return message, nil
+}
+
 func (p *Postgres) ListMessages(ctx context.Context, conversationID string, limit int) ([]domain.Message, error) {
 	rows, err := p.pool.Query(ctx, `
 SELECT id, conversation_id, role, content, tool_name, tool_call_id, sequence, created_at
@@ -146,6 +159,18 @@ ORDER BY sequence ASC`, conversationID, limit)
 		return nil, fmt.Errorf("遍历消息数据失败：%w", err)
 	}
 	return messages, nil
+}
+
+func scanMessage(scanner pgx.Row) (domain.Message, error) {
+	var message domain.Message
+	if err := scanner.Scan(
+		&message.ID, &message.ConversationID, &message.Role, &message.Content,
+		&message.ToolName, &message.ToolCallID, &message.Sequence, &message.CreatedAt,
+	); err != nil {
+		return domain.Message{}, err
+	}
+	message.CreatedAt = normalizeTime(message.CreatedAt)
+	return message, nil
 }
 
 func (p *Postgres) CreateRun(ctx context.Context, run domain.AgentRun) error {

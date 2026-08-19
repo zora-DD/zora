@@ -14,6 +14,8 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/zhiruo/zora/internal/memory"
 )
 
 func (t *Telemetry) StartHTTP(r *http.Request) (*http.Request, trace.Span, time.Time) {
@@ -201,6 +203,44 @@ func (t *Telemetry) EndTool(ctx context.Context, span trace.Span, started time.T
 	t.metrics.toolCalls.Add(ctx, 1, attrs)
 	t.metrics.toolDuration.Record(ctx, time.Since(started).Seconds(), attrs)
 	span.End()
+}
+
+// TraceParent 序列化当前 Trace 上下文供事务 Outbox 持久化。
+// 只保存标准 traceparent，不保存用户内容、密钥或 Baggage。
+func (t *Telemetry) TraceParent(ctx context.Context) string {
+	if t == nil || t.propagator == nil {
+		return ""
+	}
+	carrier := propagation.MapCarrier{}
+	t.propagator.Inject(ctx, carrier)
+	return carrier.Get("traceparent")
+}
+
+// BeginMemoryCaptureJob 将后台 Worker Span 接回产生任务的原 Trace。
+func (t *Telemetry) BeginMemoryCaptureJob(ctx context.Context, job memory.CaptureJob) (context.Context, func(status string, err error)) {
+	if t == nil {
+		return ctx, func(string, error) {}
+	}
+	if job.TraceParent != "" {
+		ctx = t.propagator.Extract(ctx, propagation.MapCarrier{"traceparent": job.TraceParent})
+	}
+	ctx, span := t.tracer.Start(ctx, "memory.capture", trace.WithSpanKind(trace.SpanKindConsumer), trace.WithAttributes(
+		attribute.String("zora.memory.job.id", job.ID),
+		attribute.String("zora.run.id", job.RunID),
+		attribute.Int("zora.memory.job.attempt", job.Attempt),
+	))
+	started := time.Now()
+	if !job.CreatedAt.IsZero() {
+		t.metrics.memoryJobQueueDelay.Record(ctx, time.Since(job.CreatedAt).Seconds())
+	}
+	return ctx, func(status string, jobErr error) {
+		span.SetAttributes(attribute.String("zora.memory.job.status", status))
+		setSpanError(span, jobErr)
+		attrs := metric.WithAttributes(attribute.String("zora.memory.job.status", status))
+		t.metrics.memoryJobs.Add(ctx, 1, attrs)
+		t.metrics.memoryJobDuration.Record(ctx, time.Since(started).Seconds(), attrs)
+		span.End()
+	}
 }
 
 func TraceIDs(ctx context.Context) (traceID, spanID string) {

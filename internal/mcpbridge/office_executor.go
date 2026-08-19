@@ -56,7 +56,7 @@ func ConnectOfficeExecutor(ctx context.Context, config OfficeExecutorConfig, opt
 	transport := &mcp.CommandTransport{Command: command, TerminateDuration: 2 * time.Second}
 	connectCtx, cancel := context.WithTimeout(ctx, options.ConnectTimeout)
 	defer cancel()
-	client := mcp.NewClient(&mcp.Implementation{Name: "zora-office-executor", Version: "0.7.0-dev"}, nil)
+	client := mcp.NewClient(&mcp.Implementation{Name: "zora-office-executor", Version: "0.8.0-dev"}, nil)
 	session, err := client.Connect(connectCtx, transport, nil)
 	if err != nil {
 		return nil, fmt.Errorf("连接 Microsoft 办公执行器失败：%w", err)

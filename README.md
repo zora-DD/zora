@@ -4,7 +4,7 @@ Zora 是一个使用 Go 与 Eino 实现的可观察 Agent 工作台：支持流�
 
 这个项目的重点不是复刻一个聊天页面，而是实践 Agent 产品从“模型能回答”走向“系统可控制、可追踪、可评估、可扩展”的核心工程问题。
 
-> 当前版本：V0.7。Agent、RAG、Memory、Multi-Agent、MCP、运行审计与 OTel/Prometheus 可观察链路已经完成；Microsoft Graph 写执行器已实现但尚未使用真实 Microsoft 365 租户在线验收。
+> 当前版本：V0.8。Agent、RAG、Memory、Multi-Agent、MCP、运行审计、OTel/Prometheus 和长期记忆事务 Outbox Worker 已完成；Microsoft Graph 写执行器已实现但尚未使用真实 Microsoft 365 租户在线验收。
 
 ## 为什么做 Zora
 
@@ -26,7 +26,7 @@ Zora 围绕这些问题实现了一套可以本地运行、阅读和继续扩展
 | Agent Core | Eino ReAct、流式输出、ToolCall、取消、超时、会话级并发控制 |
 | 多模型 | OpenAI-compatible Provider、Mock、环境变量注册多个模型、Web 按请求切换 |
 | 知识库 | TXT/Markdown/PDF 摄取、版本、ACL、分块、Embedding、向量与关键词混合检索、引用 |
-| 长期记忆 | Semantic/Episodic、自动提取、同 Key 合并、人工修正保护、相关性召回、过期时间 |
+| 长期记忆 | Semantic/Episodic、自动提取、同 Key 合并、人工修正保护、相关性召回、过期时间、Outbox 异步捕获与失败重试 |
 | 上下文管理 | 会话增量摘要、最近消息窗口、记忆与摘要安全注入 |
 | 多 Agent | Supervisor、Research/Document/Writer、串并行交接、预算、超时、重试、父子 Run |
 | 人工审批 | 高影响意图识别、持久化审批、SSE 等待与恢复、拒绝和超时终态 |
@@ -50,9 +50,13 @@ flowchart LR
     Runtime --> Supervisor["可选 Supervisor"]
     Supervisor --> Specialists["Research / Document / Writer"]
     Tools --> MCP["MCP 只读连接器"]
-    Chat --> Memory["Memory + Summary"]
+    Chat --> Outbox["Memory Capture Outbox"]
+    Outbox --> Worker["Lease Worker"]
+    Worker --> Memory["Memory Service"]
+    Chat --> Summary["Summary"]
     Chat --> Store["SQLite / PostgreSQL"]
     Memory --> Store
+    Outbox --> Store
     Tools --> Store
     Store --> Metrics["RunEvent + Metrics"]
     Metrics --> API
@@ -64,7 +68,7 @@ flowchart LR
 主要边界：
 
 - Eino 管理模型、ReAct 与 Tool 调度；Zora 管理业务状态、数据、审计、安全和评测。
-- `Message` 保存用户可见历史；`AgentRun` 保存一次执行终态；`RunEvent` 保存内部不可变轨迹。
+- `Message` 保存用户可见历史；`AgentRun` 保存一次执行终态；`RunEvent` 保存内部不可变轨迹；`memory_capture_jobs` 保存回答后的可恢复增强任务。
 - Agent 只能生成内部草稿。外部写操作必须经过确认、Operation 和专用执行器。
 - SQLite 强调零依赖体验；PostgreSQL 将向量和全文候选召回下推数据库。
 
@@ -239,7 +243,7 @@ make run
 - Prometheus：[http://localhost:9090](http://localhost:9090)
 - 原始指标：[http://localhost:8088/metrics](http://localhost:8088/metrics)
 
-一次 Agent 请求会形成 `HTTP → agent.run → gen_ai.chat / tool.* → embedding.generate` 父子链路。SSE `start` 事件会返回 `trace_id` 和 `span_id`，便于从产品 Run 定位 Trace。详细说明见[第二阶段：OTel 与 Prometheus](docs/phase-2-observability.md)。
+一次 Agent 请求会形成 `HTTP → agent.run → gen_ai.chat / tool.* → embedding.generate` 父子链路；异步捕获通过持久化 `traceparent` 把后续 `memory.capture` Span 接回原 Run。SSE `start` 事件会返回 `trace_id` 和 `span_id`，便于从产品 Run 定位 Trace。详细说明见[第二阶段：OTel 与 Prometheus](docs/phase-2-observability.md)和[第三阶段：Memory Capture Outbox](docs/phase-3-memory-outbox.md)。
 
 ## Web 功能入口
 
@@ -303,6 +307,8 @@ sequenceDiagram
 | `ZORA_EMBEDDING_PROVIDER` | `hash` | `hash` 或 `openai` |
 | `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 成功回答后自动提取长期记忆 |
 | `ZORA_MEMORY_RECALL_ENABLED` | `true` | 回答前召回相关记忆 |
+| `ZORA_MEMORY_WORKER_MAX_ATTEMPTS` | `5` | 异步捕获最大尝试次数 |
+| `ZORA_MEMORY_WORKER_TASK_TIMEOUT` | 跟随请求超时 | 单个捕获任务的超时上限 |
 | `ZORA_SUMMARY_ENABLED` | `true` | 启用增量会话摘要 |
 | `ZORA_MCP_ENABLED` | `false` | 启用配置的 MCP Server |
 | `ZORA_OFFICE_EXECUTOR` | `disabled` | 外部办公写执行器，默认禁用 |
@@ -346,6 +352,7 @@ make build-mcp-connectors
 | 审批 | `/api/approvals`、`/api/approvals/{id}/decision` |
 | 知识库 | `/api/knowledge/documents`、`/api/knowledge/search` |
 | 长期记忆 | `/api/memories`、`/api/memories/recall` |
+| 记忆捕获任务 | `/api/memory-capture/jobs`、`/api/memory-capture/jobs/{id}` |
 | 会话摘要 | `/api/conversations/{id}/summary` |
 | 办公草稿 | `/api/office/drafts`、`/api/office/drafts/{id}/decision` |
 | 办公任务 | `/api/office/operations`、`/api/office/operations/{id}/execute` |
@@ -373,7 +380,7 @@ zora/
 │   ├── agentruntime/            # Eino Runtime、ReAct、多模型和多 Agent 调度
 │   ├── agenttools/              # 计算器、时间、项目状态等内置工具
 │   ├── knowledge/               # 文档解析、分块、Embedding、检索与引用
-│   ├── memory/                  # 长期记忆提取、合并、召回与管理
+│   ├── memory/                  # 长期记忆提取、合并、召回及 Outbox Worker
 │   ├── summary/                 # 增量摘要与长上下文压缩
 │   ├── approval/                # Human-in-the-loop 审批状态机
 │   ├── office/                  # 办公草稿、确认、Operation 与幂等执行
@@ -414,9 +421,9 @@ zora/
 ```text
 cmd/zora
    ├──组装──> httpapi ──> chat ──> agentruntime
-   │                       ├──> memory / summary / approval / observability
+   │                       ├──> memory queue / summary / approval / observability
    │                       └──> store（共享接口）
-   ├──组装──> knowledge / memory / summary / approval / office
+   ├──组装──> knowledge / memory service + capture worker / summary / approval / office
    ├──注册工具──> agenttools / knowledge tool / office tool / mcpbridge adapter
    ├──埋点──> observability ──> OTLP/HTTP + /metrics
    └──注入──> applicationStore
@@ -459,7 +466,8 @@ CGO_ENABLED=0 go build ./cmd/zora
 - 多 Agent 收益只在固定小样本中验证，真实业务必须重新评测；
 - Microsoft Graph 真实写链路等待测试租户验收；
 - OTel 当前直接导出到单个 OTLP Endpoint，尚未提供生产 Collector 管道、Grafana 仪表盘和告警规则；
-- 当前没有分布式任务队列和跨实例会话锁。
+- Memory Capture 已有 PostgreSQL `SKIP LOCKED` 租约 Worker，但文档摄取、摘要和 Office 尚未统一到通用任务平台，也没有跨实例会话锁；
+- 多实例同时合并相同 `memory_key` 的数据库级唯一约束仍需补齐。
 
 这些限制不会包装成“已完成能力”。详细优先级见[项目分析文档](docs/project-analysis.md)和 [Roadmap](docs/roadmap.md)。
 
@@ -476,6 +484,7 @@ CGO_ENABLED=0 go build ./cmd/zora
 | [资源准备清单](docs/resource-preparation.md) | 模型、Embedding、数据库和 Microsoft 365 资源说明 |
 | [真实 Embedding 与 RAG 基线](docs/phase-1-real-embedding.md) | 第一阶段配置、无历史污染测试、64 题评测和指标记录 |
 | [OTel 与 Prometheus](docs/phase-2-observability.md) | 第二阶段 Trace/Metric 链路、启动方式、指标和排障 |
+| [Memory Capture Outbox](docs/phase-3-memory-outbox.md) | 第三阶段事务入队、租约领取、退避重试、状态 API 与 Trace 续接 |
 | [Roadmap](docs/roadmap.md) | 版本状态和验收条件 |
 
 ## License

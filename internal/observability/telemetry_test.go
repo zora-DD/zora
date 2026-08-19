@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
@@ -15,6 +16,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	"github.com/zhiruo/zora/internal/memory"
 )
 
 func TestTraceConnectsHTTPRunModelToolAndEmbedding(t *testing.T) {
@@ -52,6 +55,12 @@ func TestTraceConnectsHTTPRunModelToolAndEmbedding(t *testing.T) {
 	if _, err := observedTool.(tool.InvokableTool).InvokableRun(runCtx, `{"query":"测试"}`); err != nil {
 		t.Fatalf("调用测试工具失败：%v", err)
 	}
+	jobCtx, finishJob := telemetry.BeginMemoryCaptureJob(context.Background(), memory.CaptureJob{
+		ID: "memory_job_1", RunID: "run_1", Attempt: 1,
+		TraceParent: telemetry.TraceParent(runCtx), CreatedAt: time.Now().UTC(),
+	})
+	_ = jobCtx
+	finishJob(memory.JobCompleted, nil)
 
 	telemetry.EndRun(runCtx, runSpan, runStarted, "openai", "deepseek-chat", "completed", nil)
 	telemetry.EndHTTP(request.Context(), httpSpan, httpStarted, "POST", "POST /api/conversations/{conversationID}/messages", 200)
@@ -63,7 +72,7 @@ func TestTraceConnectsHTTPRunModelToolAndEmbedding(t *testing.T) {
 	}
 	for _, name := range []string{
 		"HTTP POST /api/conversations/{conversationID}/messages",
-		"agent.run", "gen_ai.chat", "tool.knowledge_search", "embedding.generate",
+		"agent.run", "gen_ai.chat", "tool.knowledge_search", "embedding.generate", "memory.capture",
 	} {
 		if _, ok := byName[name]; !ok {
 			t.Fatalf("缺少 Span %q，实际为：%v", name, spanNames(spans))
@@ -75,6 +84,7 @@ func TestTraceConnectsHTTPRunModelToolAndEmbedding(t *testing.T) {
 	modelRecorded := byName["gen_ai.chat"]
 	toolRecorded := byName["tool.knowledge_search"]
 	embeddingRecorded := byName["embedding.generate"]
+	memoryRecorded := byName["memory.capture"]
 	if runRecorded.Parent.SpanID() != httpRecorded.SpanContext.SpanID() {
 		t.Fatal("Run Span 没有挂在 HTTP Span 下")
 	}
@@ -86,6 +96,9 @@ func TestTraceConnectsHTTPRunModelToolAndEmbedding(t *testing.T) {
 	}
 	if embeddingRecorded.Parent.SpanID() != toolRecorded.SpanContext.SpanID() {
 		t.Fatal("Embedding Span 没有挂在知识库工具 Span 下")
+	}
+	if memoryRecorded.Parent.SpanID() != runRecorded.SpanContext.SpanID() {
+		t.Fatal("异步 Memory Span 没有通过持久化 traceparent 接回 Run Span")
 	}
 	if httpRecorded.SpanContext.TraceID() != embeddingRecorded.SpanContext.TraceID() {
 		t.Fatal("HTTP 与 Embedding 没有进入同一条 Trace")

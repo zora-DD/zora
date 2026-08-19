@@ -5,9 +5,15 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/zhiruo/zora/internal/domain"
 )
 
-var ErrNotFound = errors.New("长期记忆不存在")
+var (
+	ErrNotFound     = errors.New("长期记忆不存在")
+	ErrJobNotFound  = errors.New("长期记忆捕获任务不存在")
+	ErrJobLeaseLost = errors.New("长期记忆捕获任务租约已失效")
+)
 
 const (
 	KindSemantic = "semantic"
@@ -15,6 +21,11 @@ const (
 
 	SourceManual       = "manual"
 	SourceConversation = "conversation"
+
+	JobPending   = "pending"
+	JobExecuting = "executing"
+	JobCompleted = "completed"
+	JobFailed    = "failed"
 )
 
 // Memory 是经过筛选后的长期信息，不等同于原始聊天消息。
@@ -97,4 +108,43 @@ type CaptureResult struct {
 	Created    int  `json:"created"`
 	Updated    int  `json:"updated"`
 	Skipped    int  `json:"skipped"`
+}
+
+// CaptureJob 是一轮对话的长期记忆异步捕获任务。
+// Outbox 只保存消息 ID，不复制用户与助手正文，Worker 处理时再读取原始消息。
+type CaptureJob struct {
+	ID                 string         `json:"id"`
+	RunID              string         `json:"run_id"`
+	ConversationID     string         `json:"conversation_id"`
+	UserMessageID      string         `json:"user_message_id"`
+	AssistantMessageID string         `json:"assistant_message_id"`
+	Status             string         `json:"status"`
+	Attempt            int            `json:"attempt"`
+	MaxAttempts        int            `json:"max_attempts"`
+	AvailableAt        time.Time      `json:"available_at"`
+	LeaseOwner         string         `json:"-"`
+	LeaseUntil         *time.Time     `json:"lease_until,omitempty"`
+	LastError          string         `json:"last_error,omitempty"`
+	Result             *CaptureResult `json:"result,omitempty"`
+	TraceParent        string         `json:"-"`
+	CreatedAt          time.Time      `json:"created_at"`
+	UpdatedAt          time.Time      `json:"updated_at"`
+	CompletedAt        *time.Time     `json:"completed_at,omitempty"`
+}
+
+type CaptureJobFilter struct {
+	Status string
+	Limit  int
+}
+
+// CaptureJobStore 定义事务 Outbox 与租约 Worker 所需的最小持久化能力。
+// EnqueueCaptureJob 必须在同一事务内保存助手消息和任务，避免进程中断造成任务丢失。
+type CaptureJobStore interface {
+	EnqueueCaptureJob(ctx context.Context, assistant domain.Message, job CaptureJob) (savedMessage domain.Message, savedJob CaptureJob, created bool, err error)
+	GetCaptureJob(ctx context.Context, id string) (CaptureJob, error)
+	ListCaptureJobs(ctx context.Context, filter CaptureJobFilter) ([]CaptureJob, error)
+	ClaimCaptureJob(ctx context.Context, workerID string, now, leaseUntil time.Time) (CaptureJob, error)
+	CompleteCaptureJob(ctx context.Context, id, leaseOwner string, result CaptureResult, now time.Time) (CaptureJob, error)
+	FailCaptureJob(ctx context.Context, id, leaseOwner, lastError string, retryAt, now time.Time, terminal bool) (CaptureJob, error)
+	GetMessage(ctx context.Context, id string) (domain.Message, error)
 }

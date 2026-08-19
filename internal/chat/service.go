@@ -41,6 +41,7 @@ type StreamEvent struct {
 	Arguments      string                    `json:"arguments,omitempty"`
 	Message        *domain.Message           `json:"message,omitempty"`
 	Memory         *memory.CaptureResult     `json:"memory,omitempty"`
+	MemoryJob      *memory.CaptureJob        `json:"memory_job,omitempty"`
 	MemoryRecalled int                       `json:"memory_recalled,omitempty"`
 	Summary        *summary.UpdateResult     `json:"summary,omitempty"`
 	Approval       *approval.Approval        `json:"approval,omitempty"`
@@ -49,22 +50,28 @@ type StreamEvent struct {
 
 // Service 是会话用例边界，负责执行顺序、状态落库和同会话并发控制。
 type Service struct {
-	store        store.Store
-	runtime      *agentruntime.Runtime
-	runtimes     map[string]*agentruntime.Runtime
-	models       []ModelProfile
-	defaultModel string
-	memory       memoryCapturer
-	memoryRecall memoryRecaller
-	summary      conversationSummarizer
-	approval     *approval.Service
-	telemetry    *observability.Telemetry
-	locksMu      sync.Mutex
-	locks        map[string]*sync.Mutex
+	store                store.Store
+	runtime              *agentruntime.Runtime
+	runtimes             map[string]*agentruntime.Runtime
+	models               []ModelProfile
+	defaultModel         string
+	memory               memoryCapturer
+	memoryQueue          memoryCaptureQueue
+	memoryJobMaxAttempts int
+	memoryRecall         memoryRecaller
+	summary              conversationSummarizer
+	approval             *approval.Service
+	telemetry            *observability.Telemetry
+	locksMu              sync.Mutex
+	locks                map[string]*sync.Mutex
 }
 
 type memoryCapturer interface {
 	Capture(ctx context.Context, input memory.CaptureInput) (memory.CaptureResult, error)
+}
+
+type memoryCaptureQueue interface {
+	Enqueue(ctx context.Context, input memory.CaptureEnqueueInput) (domain.Message, memory.CaptureJob, bool, error)
 }
 
 type memoryRecaller interface {
@@ -96,6 +103,14 @@ type RuntimeProfile struct {
 
 func WithMemoryCapturer(capturer memoryCapturer) Option {
 	return func(service *Service) { service.memory = capturer }
+}
+
+// WithMemoryCaptureQueue 启用持久化异步捕获；配置后它优先于同步 Capturer。
+func WithMemoryCaptureQueue(queue memoryCaptureQueue, maxAttempts int) Option {
+	return func(service *Service) {
+		service.memoryQueue = queue
+		service.memoryJobMaxAttempts = maxAttempts
+	}
 }
 
 func WithMemoryRecaller(recaller memoryRecaller) Option {
@@ -524,10 +539,32 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 		return s.failRun(ctx, run.ID, err)
 	}
 
-	assistantMessage, err := s.store.AddMessage(ctx, domain.Message{
+	assistantMessageInput := domain.Message{
 		ID: id.New("msg"), ConversationID: conversationID,
 		Role: domain.RoleAssistant, Content: answer, CreatedAt: time.Now().UTC(),
-	})
+	}
+	var memoryJob *memory.CaptureJob
+	var assistantMessage domain.Message
+	if s.memoryQueue != nil {
+		traceParent := ""
+		if s.telemetry != nil {
+			traceParent = s.telemetry.TraceParent(ctx)
+		}
+		var job memory.CaptureJob
+		var created bool
+		assistantMessage, job, created, err = s.memoryQueue.Enqueue(ctx, memory.CaptureEnqueueInput{
+			RunID: run.ID, ConversationID: conversationID, UserMessageID: userMessage.ID,
+			Assistant: assistantMessageInput, TraceParent: traceParent, MaxAttempts: s.memoryJobMaxAttempts,
+		})
+		if err == nil {
+			memoryJob = &job
+			_ = s.appendEvent(ctx, run.ID, "memory_capture_queued", s.runtime.AgentName(), "", map[string]any{
+				"job_id": job.ID, "status": job.Status, "created": created,
+			})
+		}
+	} else {
+		assistantMessage, err = s.store.AddMessage(ctx, assistantMessageInput)
+	}
 	if err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
@@ -538,7 +575,7 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 		return s.failRun(ctx, run.ID, err)
 	}
 	var captureResult *memory.CaptureResult
-	if s.memory != nil {
+	if s.memoryQueue == nil && s.memory != nil {
 		result, captureErr := s.memory.Capture(ctx, memory.CaptureInput{
 			ConversationID: conversationID, UserMessageID: userMessage.ID,
 			UserContent: content, AssistantContent: answer,
@@ -584,7 +621,7 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 	runMetrics := s.completedRunMetrics(ctx, run, domain.RunCompleted, assistantMessage.ID, completedAt)
 	return emit(StreamEvent{
 		Type: "done", RunID: run.ID, Message: &assistantMessage,
-		Memory: captureResult, MemoryRecalled: recalledCount, Summary: summaryResult, Metrics: runMetrics,
+		Memory: captureResult, MemoryJob: memoryJob, MemoryRecalled: recalledCount, Summary: summaryResult, Metrics: runMetrics,
 	})
 }
 

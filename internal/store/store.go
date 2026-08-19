@@ -23,6 +23,7 @@ type Store interface {
 	DeleteConversation(ctx context.Context, id string) error
 
 	AddMessage(ctx context.Context, message domain.Message) (domain.Message, error)
+	GetMessage(ctx context.Context, id string) (domain.Message, error)
 	ListMessages(ctx context.Context, conversationID string, limit int) ([]domain.Message, error)
 
 	CreateRun(ctx context.Context, run domain.AgentRun) error

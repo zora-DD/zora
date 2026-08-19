@@ -179,6 +179,27 @@ CREATE INDEX IF NOT EXISTS idx_memories_kind_updated
     ON memories(kind, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_expiry
     ON memories(expires_at);
+CREATE TABLE IF NOT EXISTS memory_capture_jobs (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs(id) ON DELETE CASCADE,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    assistant_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'executing', 'completed', 'failed')),
+    attempt INTEGER NOT NULL DEFAULT 0 CHECK (attempt >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_until TEXT,
+    last_error TEXT NOT NULL DEFAULT '',
+    result TEXT NOT NULL DEFAULT '{}',
+    trace_parent TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_memory_capture_jobs_status_available
+    ON memory_capture_jobs(status, available_at, created_at);
 CREATE TABLE IF NOT EXISTS knowledge_documents (
     id TEXT PRIMARY KEY,
     version_group_id TEXT NOT NULL,
@@ -222,11 +243,12 @@ type SQLite struct {
 }
 
 var (
-	_ store.Store     = (*SQLite)(nil)
-	_ knowledge.Store = (*SQLite)(nil)
-	_ memory.Store    = (*SQLite)(nil)
-	_ office.Store    = (*SQLite)(nil)
-	_ summary.Store   = (*SQLite)(nil)
+	_ store.Store            = (*SQLite)(nil)
+	_ knowledge.Store        = (*SQLite)(nil)
+	_ memory.Store           = (*SQLite)(nil)
+	_ memory.CaptureJobStore = (*SQLite)(nil)
+	_ office.Store           = (*SQLite)(nil)
+	_ summary.Store          = (*SQLite)(nil)
 )
 
 // Open 创建数据库文件，并执行可重复运行的建表语句。
@@ -462,6 +484,19 @@ VALUES(?, ?, ?, ?, ?, ?, ?)`,
 	return m, nil
 }
 
+func (s *SQLite) GetMessage(ctx context.Context, id string) (domain.Message, error) {
+	message, err := scanMessage(s.db.QueryRowContext(ctx, `
+SELECT id, conversation_id, role, content, tool_name, tool_call_id, sequence, created_at
+FROM messages WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Message{}, store.ErrNotFound
+	}
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("查询消息失败：%w", err)
+	}
+	return message, nil
+}
+
 func (s *SQLite) ListMessages(ctx context.Context, conversationID string, limit int) ([]domain.Message, error) {
 	// 子查询先取“最近 N 条”，外层再恢复为正序，确保送给模型的上下文时间顺序正确。
 	rows, err := s.db.QueryContext(ctx, `
@@ -490,6 +525,23 @@ ORDER BY sequence ASC`, conversationID, limit)
 		messages = append(messages, m)
 	}
 	return messages, rows.Err()
+}
+
+func scanMessage(scanner rowScanner) (domain.Message, error) {
+	var message domain.Message
+	var createdAt string
+	if err := scanner.Scan(
+		&message.ID, &message.ConversationID, &message.Role, &message.Content,
+		&message.ToolName, &message.ToolCallID, &message.Sequence, &createdAt,
+	); err != nil {
+		return domain.Message{}, err
+	}
+	parsed, err := parseTime(createdAt)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	message.CreatedAt = parsed
+	return message, nil
 }
 
 func (s *SQLite) CreateRun(ctx context.Context, run domain.AgentRun) error {

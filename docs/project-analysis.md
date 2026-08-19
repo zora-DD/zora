@@ -210,6 +210,8 @@ erDiagram
     AGENT_RUN ||--o{ AGENT_TASK_RUN : delegates
     AGENT_RUN ||--o| APPROVAL_REQUEST : may_wait_for
     MESSAGE ||--o| AGENT_RUN : triggers
+    AGENT_RUN ||--o| MEMORY_CAPTURE_JOB : enqueues
+    MESSAGE ||--o{ MEMORY_CAPTURE_JOB : supplies_content
     CONVERSATION ||--o{ MEMORY : sources
     MESSAGE ||--o{ MEMORY : sources
     KNOWLEDGE_DOCUMENT ||--o{ KNOWLEDGE_CHUNK : contains
@@ -321,6 +323,18 @@ erDiagram
 | source_conversation_id / source_message_id | 来源追踪                  |
 | expires_at                                 | 可选过期时间                |
 
+#### memory_capture_jobs
+
+| 字段组 | 含义 |
+|---|---|
+| run_id、conversation_id | 原 Run 与会话关联；run_id 唯一保证幂等入队 |
+| user_message_id、assistant_message_id | Worker 延迟读取正文，Outbox 不复制消息内容 |
+| status、attempt、max_attempts | pending/executing/completed/failed 状态与尝试预算 |
+| available_at | 失败指数退避后的下次可领取时间 |
+| lease_owner、lease_until | 多 Worker 并发领取和崩溃恢复 |
+| result、last_error | 捕获计数结果和最近错误，不保存候选正文 |
+| trace_parent | 把后台 Span 接回原 Agent Run；API 不暴露 |
+
 
 
 
@@ -414,10 +428,11 @@ sequenceDiagram
     end
     M-->>R: streamed chunks
     R-->>H: delta
-    C->>S: 保存 assistant Message
+    C->>S: 同事务保存 assistant Message + Memory Capture Job
     C->>S: Run completed + events
-    C->>S: 成功后 Capture Memory / Update Summary
-    C-->>H: done + metrics
+    C->>S: 成功后同步 Update Summary
+    C-->>H: done + metrics + pending memory_job
+    Note over C,S: Worker 稍后按租约异步 Capture Memory
 ```
 
 
@@ -427,7 +442,7 @@ sequenceDiagram
 - 用户消息先保存，失败请求也有可追踪输入；
 - Context 从 HTTP 传到模型与工具；
 - Run 必须进入明确终态；
-- Memory 和 Summary 属于回答后的增强任务，失败不推翻已成功回答；
+- Memory Capture 通过 Outbox 异步执行，Summary 当前仍同步；两类增强失败都不推翻已成功回答；
 - 内部 ToolCall 不反复写进下一轮用户历史。
 
 
@@ -460,7 +475,9 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    Success["回答成功"] --> Extract["规则/模型提取候选"]
+    Success["回答成功"] --> Outbox["助手消息 + Job 同事务提交"]
+    Outbox --> Claim["Worker 租约领取"]
+    Claim --> Extract["规则/模型提取候选"]
     Extract --> Validate["类型、Key、重要性校验"]
     Validate --> Existing{"同 kind + key 已存在?"}
     Existing -- 否 --> Create["创建 Memory"]
@@ -644,13 +661,14 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 ## 10. 项目亮点结论
 
-完整 18 项分析见[项目亮点全面分析](project-highlights.md)。最值得面试展开的五项是：
+完整 20 项分析见[项目亮点全面分析](project-highlights.md)。最值得面试展开的六项是：
 
 1. **执行模型清晰**：Message、Run、RunEvent 分离；
 2. **RAG 有治理和评测**：版本、ACL、引用、混合检索和回归指标；
 3. **Memory 可控**：独立模型、同 Key 合并、人工修正保护；
 4. **多 Agent 有治理**：权限、预算、并发、超时、父子 Run 和对照评测；
 5. **副作用安全**：Draft、确认、Operation、幂等、租约和远端检查点。
+6. **异步可靠性**：助手消息与 Memory Job 原子入队、租约领取、退避重试和崩溃恢复。
 
 这五项能体现 Go 后端能力与 Agent 工程能力的结合。
 
@@ -678,9 +696,9 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 | 缺陷                 | 当前影响               | 建议方案                                  |
 | ------------------ | ------------------ | ------------------------------------- |
 | 会话锁只在单进程内          | 多实例可能并发处理同一会话      | PostgreSQL advisory lock 或 Redis 分布式锁 |
-| Memory/摘要为回答后同步执行  | 增加尾延迟              | Outbox + Worker，done 先返回，增强异步完成       |
+| Summary 仍在回答后同步执行  | 长对话触发时增加尾延迟       | 复用 Outbox Worker 模式异步更新，并保留序号幂等边界       |
 | 文档摄取同步             | 大文件占用 HTTP 连接      | Ingestion Job、状态表、队列、批量 Embedding     |
-| 没有统一任务队列           | Office 仍由请求触发执行    | 持久化队列、Worker、退避重试和死信                  |
+| 没有统一任务平台           | Memory 有专用 Worker，但文档摄取和 Office 仍由请求触发 | 抽象通用 Job、Worker、退避、死信和管理面              |
 | 迁移方式偏内嵌            | Schema 演进与回滚能力有限   | golang-migrate/Atlas，版本化 SQL 和回滚策略    |
 | RunEvent 无归档策略     | 长期数据量持续增长          | 分区、TTL、冷热分层和聚合表                       |
 | 可观察性仍是开发环境直连 | 尚无 Collector、Dashboard 和告警 | Collector 管道、Grafana、SLO 和告警规则           |
@@ -725,9 +743,9 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 1. 基于现有 64 题真实 Embedding 结果分析失败 Case，调整混合检索；
 2. 为已经接通的 OTel/Prometheus 增加 Collector、Dashboard、SLO 与告警；
-3. 将文档摄取或 Memory Capture 改成 Outbox + Worker；
-4. 完成 JWT + principal + tenant_id 的最小多用户闭环；
-5. 写一篇真实故障复盘：例如流式闪烁、模型误选工具或引用不忠实。
+3. 完成 JWT + principal + tenant_id 的最小多用户闭环；
+4. 写一篇真实故障复盘：例如流式闪烁、模型误选工具或引用不忠实；
+5. 将文档摄取异步化，并为 Memory 多实例同 Key 合并增加数据库唯一约束与冲突重试。
 
 这几项比再增加一个“角色 Agent”更能体现后端和 Agent 工程深度。
 
@@ -779,7 +797,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 ### 1:10–1:45：RAG 与 Memory
 
-> RAG 支持文档去重、版本、private/public 权限、Unicode 重叠分块和引用。检索同时使用向量和关键词，PostgreSQL 下推到 pgvector HNSW 与 FTS，再通过 RRF 融合。长期记忆不是简单存聊天向量，而是独立的 Semantic/Episodic 模型，有稳定 Key、重要性、来源和过期时间；同 Key 会合并，用户手工修改后自动流程不再覆盖。
+> RAG 支持文档去重、版本、private/public 权限、Unicode 重叠分块和引用。检索同时使用向量和关键词，PostgreSQL 下推到 pgvector HNSW 与 FTS，再通过 RRF 融合。长期记忆是独立的 Semantic/Episodic 模型，有稳定 Key、重要性、来源和过期时间；自动提取通过事务 Outbox 异步执行，助手消息和 Job 原子提交，Worker 用租约和指数退避处理失败。
 
 
 
@@ -797,7 +815,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 ### 2:45–3:00：取舍与下一步
 
-> 项目默认 Mock 加 SQLite，保证无 Key 可运行，同时提供 PostgreSQL、真实模型和真实 Embedding 路径。目前不足是缺少完整认证、多实例锁、异步任务、生产 Collector/告警和真实 Microsoft 租户验收。下一步我会优先做检索失败归因和 Outbox Worker，而不是继续堆角色数量。
+> 项目默认 Mock 加 SQLite，保证无 Key 可运行，同时提供 PostgreSQL、真实模型和真实 Embedding 路径。目前 Memory Capture 已有 Outbox Worker；不足是缺少完整认证、跨实例会话锁、通用任务平台、生产 Collector/告警和真实 Microsoft 租户验收。下一步我会优先做检索失败归因和多用户闭环，而不是继续堆角色数量。
 
 
 
@@ -939,7 +957,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 - 基于 Go + Eino 实现流式 ReAct Agent，设计 Message/AgentRun/RunEvent 分层模型，支持多模型请求级路由、Context 取消、会话并发控制，并从持久事件聚合 TTFT、Provider Token 与工具耗时。
 - 实现带版本和 ACL 的 RAG：Unicode 重叠分块、可替换 Embedding、pgvector HNSW + PostgreSQL FTS 双路召回与 RRF 融合，并建立 Recall@K/MRR、事实覆盖和引用忠实度评测。
-- 构建长期记忆与多 Agent 治理：Semantic/Episodic 提取合并、增量摘要、Supervisor 专业工具隔离、预算/超时/重试、人工审批，以及 Draft → Operation → 幂等 Executor 的外部副作用安全链路。
+- 构建长期记忆与多 Agent 治理：Semantic/Episodic 提取合并、事务 Outbox 与租约 Worker、增量摘要、Supervisor 专业工具隔离、预算/超时/重试、人工审批，以及 Draft → Operation → 幂等 Executor 的外部副作用安全链路。
 
 
 
@@ -947,7 +965,7 @@ HTTP 依赖 Application Service；Application 依赖 Runtime 和 Store 接口；
 
 1. 使用 Eino ChatModelAgent 统一 Mock 与 OpenAI-compatible 模型，Mock 仍经过真实 ToolCall 链路，使无外部 Key 的单元与集成测试可稳定复现；
 2. 使用 SQLite 提供零依赖运行，并基于 pgx、pgvector HNSW 和 FTS GIN 实现 PostgreSQL 生产检索路径，通过 Store 接口保持上层无感；
-3. 设计可编辑、可过期、可追溯的长期记忆模型，支持稳定 Key 冲突合并、人工修正保护、相关性/重要性/时效性联合召回及 Control/Treatment A/B；
+3. 设计可编辑、可过期、可追溯的长期记忆模型，支持稳定 Key 冲突合并、人工修正保护、事务 Outbox 异步捕获、租约/退避恢复、联合召回及 Control/Treatment A/B；
 4. 实现 Supervisor、Research/Document/Writer AgentTool 的职责隔离与串并行调度，并对交接次数、并发、超时、重试、取消和父子 Run 进行治理；
 5. 将办公写入拆分为内部草稿、人工确认、持久化 Operation 和专用 Executor，使用内容哈希、幂等键、租约、远端检查点与恢复机制控制重复副作用。
 
@@ -1038,4 +1056,4 @@ Zora 的核心价值不在功能数量，而在以下完整闭环：
   → 基于证据继续优化
 ```
 
-如果你能结合代码讲清这条闭环，并坦诚说明认证、多实例、异步任务、消息/记忆向量化、生产观测管道和外部租户验收仍是改进项，这个项目就不再是“Agent 空壳”，而是一个能够体现 Go 后端基本功、Agent 系统理解和工程判断力的作品。
+如果你能结合代码讲清这条闭环，并坦诚说明认证、跨实例同 Key 一致性、通用任务平台、消息/记忆向量化、生产观测管道和外部租户验收仍是改进项，这个项目就不再是“Agent 空壳”，而是一个能够体现 Go 后端基本功、Agent 系统理解和工程判断力的作品。

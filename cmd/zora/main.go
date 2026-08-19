@@ -19,7 +19,9 @@ import (
 	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
+	"github.com/zhiruo/zora/internal/domain"
 	"github.com/zhiruo/zora/internal/httpapi"
+	"github.com/zhiruo/zora/internal/id"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/mcpbridge"
 	"github.com/zhiruo/zora/internal/memory"
@@ -35,6 +37,7 @@ type applicationStore interface {
 	store.Store
 	knowledge.Store
 	memory.Store
+	memory.CaptureJobStore
 	approval.Store
 	office.Store
 	summary.Store
@@ -66,7 +69,7 @@ func run(logger *slog.Logger) error {
 	startupCtx, cancelStartup := context.WithTimeout(context.Background(), cfg.RequestTimeout)
 	defer cancelStartup()
 	telemetry, err := observability.NewTelemetry(startupCtx, observability.TelemetryConfig{
-		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.7.0-dev",
+		ServiceName: cfg.OTelServiceName, ServiceVersion: "0.8.0-dev",
 		Environment: cfg.OTelEnvironment, TracingEnabled: cfg.OTelEnabled,
 		OTLPEndpoint: cfg.OTelEndpoint, TraceSampleRatio: cfg.OTelSampleRatio,
 		PrometheusEnabled: cfg.PrometheusEnabled,
@@ -227,6 +230,13 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	var memoryQueue *memory.CaptureQueue
+	if cfg.MemoryAutoCapture {
+		memoryQueue, err = memory.NewCaptureQueue(database)
+		if err != nil {
+			return err
+		}
+	}
 	runtimeProfiles := make([]chat.RuntimeProfile, 0, len(cfg.ModelProfiles))
 	var defaultRuntime *agentruntime.Runtime
 	for _, profile := range cfg.ModelProfiles {
@@ -271,9 +281,11 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("默认模型配置 %q 未完成 Runtime 装配", cfg.DefaultModelID)
 	}
 	chatOptions := []chat.Option{
-		chat.WithMemoryCapturer(memoryService),
 		chat.WithRuntimeProfiles(cfg.DefaultModelID, runtimeProfiles),
 		chat.WithTelemetry(telemetry),
+	}
+	if memoryQueue != nil {
+		chatOptions = append(chatOptions, chat.WithMemoryCaptureQueue(memoryQueue, cfg.MemoryWorkerMaxAttempts))
 	}
 	var approvalService *approval.Service
 	if cfg.MultiAgentEnabled && cfg.MultiAgentApprovalMode != approval.ModeOff {
@@ -310,6 +322,50 @@ func run(logger *slog.Logger) error {
 		chatOptions = append(chatOptions, chat.WithConversationSummarizer(summaryService))
 	}
 	chatService := chat.NewService(database, defaultRuntime, chatOptions...)
+	var memoryWorker *memory.CaptureWorker
+	if memoryQueue != nil {
+		memoryWorker, err = memory.NewCaptureWorker(memoryQueue, memoryService, logger, memory.CaptureWorkerOptions{
+			PollInterval:    cfg.MemoryWorkerPollInterval,
+			LeaseDuration:   cfg.MemoryWorkerLeaseDuration,
+			TaskTimeout:     cfg.MemoryWorkerTaskTimeout,
+			RetryBase:       cfg.MemoryWorkerRetryBase,
+			Instrumentation: telemetry,
+			Observer: func(ctx context.Context, job memory.CaptureJob, result *memory.CaptureResult, _ error) {
+				eventType := "memory_capture_completed"
+				payload := map[string]any{"job_id": job.ID, "attempt": job.Attempt, "status": job.Status}
+				if result != nil {
+					payload["candidates"], payload["created"] = result.Candidates, result.Created
+					payload["updated"], payload["skipped"] = result.Updated, result.Skipped
+				} else if job.Status == memory.JobPending {
+					eventType = "memory_capture_retry_scheduled"
+					payload["available_at"], payload["error"] = job.AvailableAt, job.LastError
+				} else {
+					eventType = "memory_capture_failed"
+					payload["error"] = job.LastError
+				}
+				_, appendErr := database.AppendRunEvent(ctx, domain.RunEvent{
+					ID: id.New("evt"), RunID: job.RunID, Type: eventType,
+					AgentName: defaultRuntime.AgentName(), Payload: payload, CreatedAt: time.Now().UTC(),
+				})
+				if appendErr != nil {
+					logger.Warn("记录长期记忆捕获任务审计事件失败", "任务ID", job.ID, "错误", appendErr)
+				}
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if err = memoryWorker.Start(context.Background()); err != nil {
+			return err
+		}
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if stopErr := memoryWorker.Stop(stopCtx); stopErr != nil {
+				logger.Warn("关闭长期记忆 Capture Worker 失败", "错误", stopErr)
+			}
+		}()
+	}
 	httpOptions := make([]httpapi.Option, 0, 3)
 	if approvalService != nil {
 		httpOptions = append(httpOptions, httpapi.WithApprovalService(approvalService))
@@ -321,6 +377,9 @@ func run(logger *slog.Logger) error {
 	httpOptions = append(httpOptions, httpapi.WithMCPInfo(cfg.MCPEnabled, mcpToolCount))
 	httpOptions = append(httpOptions, httpapi.WithOfficeService(officeService))
 	httpOptions = append(httpOptions, httpapi.WithTelemetry(telemetry))
+	if memoryQueue != nil {
+		httpOptions = append(httpOptions, httpapi.WithMemoryCaptureQueue(memoryQueue))
+	}
 	handler, err := httpapi.New(chatService, knowledgeService, memoryService, logger, cfg.RequestTimeout, httpOptions...)
 	if err != nil {
 		return err

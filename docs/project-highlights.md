@@ -27,6 +27,7 @@
 | 17 | 固定数据集的 Control/Treatment 评测 | 实验设计、质量/成本权衡 |
 | 18 | 单二进制 Web 与安全 Markdown 流式渲染 | Go Embed、前端性能、安全输出 |
 | 19 | OTel Trace 与 Prometheus 低基数指标 | 跨层排障、SLO、可观察性边界 |
+| 20 | Memory Capture 事务 Outbox 与租约 Worker | 原子提交、异步任务、退避重试、崩溃恢复 |
 
 ## 1. Go 原生业务内核，Eino 只负责 Agent Runtime
 
@@ -520,9 +521,37 @@ Agent 架构不是越复杂越高级。Control/Treatment 迫使开发者用收�
 
 装饰器让可观察性与 Eino/业务逻辑解耦，也覆盖内置、MCP、办公和专业 Agent Tool。产品审计与基础设施 Trace 分层后，既能保证用户侧事实完整，又能按采样和保留成本运维 Trace。低基数 Metric 能稳定用于 SLO；敏感正文不出业务边界。当前开发环境可直连 Jaeger，生产再增加 Collector、尾采样和多后端，不需要修改业务调用链。
 
+## 20. Memory Capture 使用事务 Outbox，而不是请求尾部 goroutine
+
+### 关键代码位置
+
+- [`internal/memory/capture_queue.go`](../internal/memory/capture_queue.go)：入队、幂等返回和 Worker Wake；
+- [`internal/memory/capture_worker.go`](../internal/memory/capture_worker.go)：任务超时、租约、指数退避、恢复与优雅停止；
+- [`internal/memory/types.go`](../internal/memory/types.go)：CaptureJob 状态与 Store 契约；
+- [`internal/store/sqlite/memory_capture_jobs.go`](../internal/store/sqlite/memory_capture_jobs.go)：本地事务实现；
+- [`internal/store/postgres/memory_capture_jobs.go`](../internal/store/postgres/memory_capture_jobs.go)：`FOR UPDATE SKIP LOCKED` 多实例领取；
+- [`internal/chat/service.go`](../internal/chat/service.go)：回答保存、任务入队与 SSE `memory_job`；
+- [`internal/observability/spans.go`](../internal/observability/spans.go)：异步 TraceContext 续接和 Worker 指标。
+
+### 业务场景
+
+模型完成回答后，系统还要提取用户长期偏好。如果继续在 HTTP 请求中调用第二次模型，用户必须等待额外尾延迟；如果简单启动 goroutine，发布重启或进程异常会静默丢任务。
+
+### 问题分析
+
+异步化不是把代码放进 goroutine 就结束。必须回答：回答已经落库但任务没创建怎么办、客户端重试会不会产生重复任务、两个实例会不会同时处理、模型限流如何退避、Worker 崩溃后谁回收、后台调用如何关联原 Trace，以及是否为了排队又复制一份用户正文。
+
+### 技术实现
+
+Store 在同一个事务中保存 assistant Message 和 pending CaptureJob；`run_id` 唯一吸收入队重试。Job 只引用用户/助手消息 ID，Worker 领取后再读取正文。领取会原子写入 worker ID、lease deadline 和 attempt；PostgreSQL 用 `SKIP LOCKED` 隔离并发消费者。失败且仍有预算时回到 pending，`available_at` 使用指数退避；租约过期可再次领取，最大尝试耗尽进入 failed。SSE 先返回 pending Job，REST、RunEvent、Prometheus 和 `memory.capture` Span 提供后续状态。进程内 Channel 只是低延迟通知，数据库轮询负责可靠性。
+
+### 为什么这样实现
+
+对当前个人项目，数据库 Outbox 比引入 Kafka/RabbitMQ 更容易部署，却能展示事务一致性、幂等、租约和恢复这些真正的后端能力。消息正文不复制可降低隐私面和存储膨胀；Job Store 契约又保留了未来拆独立 Worker 或接消息中间件的空间。当前明确保留的边界是：不同 Job 在多实例下同时更新相同 `memory_key` 仍需唯一约束与冲突重试。
+
 ## 如何向面试官总结这些亮点
 
-不要一次背完 19 项。建议根据岗位选择三条主线：
+不要一次背完 20 项。建议根据岗位选择三条主线：
 
 ### Agent 后端岗位
 
@@ -539,8 +568,8 @@ Agent 架构不是越复杂越高级。Control/Treatment 迫使开发者用收�
 ### Agent 平台/可靠性岗位
 
 1. RunEvent 产品审计 + OTel/Prometheus 基础设施观测；
-2. Human-in-the-loop 持久化审批；
-3. Office Operation 的幂等、租约、检查点和恢复。
+2. Memory Capture Outbox 的事务、租约、退避和恢复；
+3. Human-in-the-loop 与 Office Operation 的幂等、检查点和副作用边界。
 
 ### 两年 Go 经验最适合强调的部分
 
