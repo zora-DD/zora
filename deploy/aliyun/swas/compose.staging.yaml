@@ -59,12 +59,18 @@ services:
       ZORA_TRUSTED_PROXY_CIDRS: 172.28.0.0/24
 
       # 模型与 Embedding 参数从仓库外的只读文件加载；文件内只能引用 Key，不能保存 Key。
+      # 镜像为本地 Mock 提供了默认 provider；这里显式清空，避免与动态 AI 配置文件冲突。
+      ZORA_MODEL_PROVIDER: ""
       ZORA_AI_CONFIG_FILE: /run/zora-config/ai-config.json
       ZORA_LLM_API_KEY_FILE: /run/zora-secrets/llm_api_key
       ZORA_EMBEDDING_API_KEY_FILE: /run/zora-secrets/embedding_api_key
       ZORA_REQUEST_TIMEOUT: ${ZORA_REQUEST_TIMEOUT:-120s}
       ZORA_MAX_ITERATIONS: ${ZORA_MAX_ITERATIONS:-8}
       ZORA_MULTI_AGENT_ENABLED: ${ZORA_MULTI_AGENT_ENABLED:-false}
+      ZORA_REFLECTION_ENABLED: ${ZORA_REFLECTION_ENABLED:-true}
+      ZORA_INPUT_GUARD_ENABLED: ${ZORA_INPUT_GUARD_ENABLED:-true}
+      ZORA_TOPIC_RELEVANCE_THRESHOLD: ${ZORA_TOPIC_RELEVANCE_THRESHOLD:-0.08}
+      ZORA_IMPLICIT_FEEDBACK_ENABLED: ${ZORA_IMPLICIT_FEEDBACK_ENABLED:-true}
 
       # 轻量服务器不额外运行 Jaeger/Prometheus，避免占满内存；指标端点仍可供验收抓取。
       ZORA_OTEL_ENVIRONMENT: staging

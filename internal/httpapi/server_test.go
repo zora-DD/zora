@@ -25,6 +25,7 @@ import (
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/domain"
+	"github.com/zhiruo/zora/internal/feedback"
 	"github.com/zhiruo/zora/internal/knowledge"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/office"
@@ -65,6 +66,10 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		t.Fatal(err)
 	}
 	memoryService := newTestMemoryService(t, database)
+	feedbackService, err := feedback.NewService(database)
+	if err != nil {
+		t.Fatal(err)
+	}
 	handler, err := New(chat.NewService(database, runtime,
 		chat.WithRuntimeProfiles("primary", []chat.RuntimeProfile{
 			{ModelProfile: chat.ModelProfile{ID: "primary", Name: "主模型", Provider: "mock", Model: "zora-mock-primary"}, Runtime: runtime},
@@ -72,6 +77,7 @@ func TestConversationAndAgentSSE(t *testing.T) {
 		}),
 		chat.WithMemoryCapturer(memoryService), chat.WithMemoryRecaller(memoryService),
 		chat.WithConversationSummarizer(failingSummaryService{}),
+		chat.WithFeedback(feedbackService, true),
 	), knowledgeService, memoryService, slog.New(slog.NewTextHandler(io.Discard, nil)), 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -109,6 +115,23 @@ func TestConversationAndAgentSSE(t *testing.T) {
 	}
 	if !strings.Contains(events, `"metrics":`) || !strings.Contains(events, `"model_calls":2`) {
 		t.Fatalf("done event does not include run metrics:\n%s", events)
+	}
+	messages, err := database.ListMessages(context.Background(), conversation.ID, 10)
+	if err != nil || len(messages) != 2 {
+		t.Fatalf("messages=%+v err=%v", messages, err)
+	}
+	assistantMessage := messages[len(messages)-1]
+	feedbackRequest := httptest.NewRequest(http.MethodPut, "/api/messages/"+assistantMessage.ID+"/feedback", strings.NewReader(`{"rating":-1,"reason":"缺少依据"}`))
+	feedbackRequest.Header.Set("Content-Type", "application/json")
+	feedbackResponse := httptest.NewRecorder()
+	handler.ServeHTTP(feedbackResponse, feedbackRequest)
+	if feedbackResponse.Code != http.StatusOK || !strings.Contains(feedbackResponse.Body.String(), `"rating":-1`) {
+		t.Fatalf("feedback status=%d body=%s", feedbackResponse.Code, feedbackResponse.Body.String())
+	}
+	messageListResponse := httptest.NewRecorder()
+	handler.ServeHTTP(messageListResponse, httptest.NewRequest(http.MethodGet, "/api/conversations/"+conversation.ID+"/messages", nil))
+	if messageListResponse.Code != http.StatusOK || !strings.Contains(messageListResponse.Body.String(), `"feedback":`) {
+		t.Fatalf("message list status=%d body=%s", messageListResponse.Code, messageListResponse.Body.String())
 	}
 	if !strings.Contains(events, `"model_id":"alternate"`) {
 		t.Fatalf("start event does not include selected model:\n%s", events)

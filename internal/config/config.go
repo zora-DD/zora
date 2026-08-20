@@ -63,6 +63,10 @@ type Config struct {
 	Instruction                 string         // Agent 的系统指令。
 	RequestTimeout              time.Duration  // 单次模型请求和整条消息链路的超时上限。
 	MaxIterations               int            // ReAct 最大循环次数，防止模型无限调用工具。
+	ReflectionEnabled           bool           // 是否启用最终答案审查，并在不通过时最多定向重写一次。
+	InputGuardEnabled           bool           // 是否在消息持久化前执行敏感信息、危险意图与话题偏移分析。
+	TopicRelevanceThreshold     float64        // 当前输入与会话中心主题的最低词项关联度。
+	ImplicitFeedbackEnabled     bool           // 是否从明确纠错、负面情绪与重复追问中提取隐式反馈。
 	OTelEnabled                 bool           // 是否通过 OTLP/HTTP 导出 Trace。
 	OTelServiceName             string         // Trace Resource 中的稳定服务名。
 	OTelEnvironment             string         // deployment.environment.name，例如 development。
@@ -155,6 +159,22 @@ func Load() (Config, error) {
 	maxIterations, err := strconv.Atoi(env("ZORA_MAX_ITERATIONS", "8"))
 	if err != nil || maxIterations < 1 || maxIterations > 50 {
 		return Config{}, fmt.Errorf("ZORA_MAX_ITERATIONS 必须在 1 到 50 之间")
+	}
+	reflectionEnabled, err := strconv.ParseBool(env("ZORA_REFLECTION_ENABLED", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_REFLECTION_ENABLED 必须是 true 或 false")
+	}
+	inputGuardEnabled, err := strconv.ParseBool(env("ZORA_INPUT_GUARD_ENABLED", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_INPUT_GUARD_ENABLED 必须是 true 或 false")
+	}
+	topicRelevanceThreshold, err := strconv.ParseFloat(env("ZORA_TOPIC_RELEVANCE_THRESHOLD", "0.08"), 64)
+	if err != nil || math.IsNaN(topicRelevanceThreshold) || math.IsInf(topicRelevanceThreshold, 0) || topicRelevanceThreshold < 0 || topicRelevanceThreshold > 1 {
+		return Config{}, fmt.Errorf("ZORA_TOPIC_RELEVANCE_THRESHOLD 必须在 0 到 1 之间")
+	}
+	implicitFeedbackEnabled, err := strconv.ParseBool(env("ZORA_IMPLICIT_FEEDBACK_ENABLED", "true"))
+	if err != nil {
+		return Config{}, fmt.Errorf("ZORA_IMPLICIT_FEEDBACK_ENABLED 必须是 true 或 false")
 	}
 	otelEnabled, err := strconv.ParseBool(env("ZORA_OTEL_ENABLED", "false"))
 	if err != nil {
@@ -429,6 +449,10 @@ func Load() (Config, error) {
 		Instruction:                 env("ZORA_SYSTEM_PROMPT", defaultInstruction),
 		RequestTimeout:              timeout,
 		MaxIterations:               maxIterations,
+		ReflectionEnabled:           reflectionEnabled,
+		InputGuardEnabled:           inputGuardEnabled,
+		TopicRelevanceThreshold:     topicRelevanceThreshold,
+		ImplicitFeedbackEnabled:     implicitFeedbackEnabled,
 		OTelEnabled:                 otelEnabled,
 		OTelServiceName:             env("OTEL_SERVICE_NAME", "zora"),
 		OTelEnvironment:             env("ZORA_OTEL_ENVIRONMENT", "development"),

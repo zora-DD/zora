@@ -28,6 +28,9 @@ Zora 围绕这些问题实现了一套可以本地运行、阅读和继续扩展
 | 知识库 | TXT/Markdown/PDF 异步摄取、版本、ACL、分块、Embedding、向量与关键词混合检索、引用 |
 | 长期记忆 | Semantic/Episodic、自动提取、同 Key 合并、人工修正保护、词项/向量联合召回、过期时间、Outbox 异步捕获与失败重试 |
 | 上下文管理 | 跨会话消息语义召回、异步增量摘要、最近消息窗口、记忆/消息/摘要安全注入 |
+| 质量闭环 | 专用 Answer Reviewer、相关性/正确性/完整性/安全性/清晰度评估、最多一次定向重写 |
+| 用户反馈 | Assistant Message 级点赞/点踩、可选原因、明确纠错与重复追问信号、下一轮定向调整 |
+| 输入治理 | 落库前敏感凭据/Prompt Injection/高危指令拦截、话题偏移提示、向量污染防护 |
 | 多 Agent | Supervisor、Research/Document/Writer、串并行交接、预算、超时、重试、父子 Run |
 | 人工审批 | 高影响意图识别、持久化审批、SSE 等待与恢复、拒绝和超时终态 |
 | MCP | 官方 Go SDK、stdio Server、工具白名单、只读声明校验、环境变量最小透传 |
@@ -358,6 +361,10 @@ sequenceDiagram
 | `ZORA_DEFAULT_MODEL_ID` | 第一项 | 默认模型配置 ID |
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 单次 Agent 请求总超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | ReAct 最大迭代次数 |
+| `ZORA_REFLECTION_ENABLED` | `true` | 启用答案审查；不通过时最多重写一次 |
+| `ZORA_INPUT_GUARD_ENABLED` | `true` | 消息落库前执行安全与话题关联分析 |
+| `ZORA_TOPIC_RELEVANCE_THRESHOLD` | `0.08` | 话题偏移词项关联度阈值，范围 0–1 |
+| `ZORA_IMPLICIT_FEEDBACK_ENABLED` | `true` | 从明确纠错和重复提问中提取下一轮反馈 |
 | `ZORA_MULTI_AGENT_ENABLED` | `false` | 是否启用 Supervisor 与专业 Agent |
 | `ZORA_EMBEDDING_PROVIDER` | `hash` | `hash` 或 `openai` |
 | `ZORA_MEMORY_AUTO_CAPTURE` | `true` | 成功回答后自动提取长期记忆 |
@@ -405,6 +412,7 @@ make build-mcp-connectors
 | 运行信息与安全 | `GET /api/health`、`GET /api/ready`、`GET /api/info`、`GET /api/security/csrf` |
 | Prometheus | `GET /metrics`（仅启用指标时注册） |
 | 对话 | `/api/conversations`、`/api/conversations/{id}/messages` |
+| 答案反馈 | `PUT /api/messages/{id}/feedback`（`rating` 为 `1` 或 `-1`） |
 | Run | `/api/runs`、`/api/runs/{id}/events`、`/api/runs/{id}/metrics` |
 | 审批 | `/api/approvals`、`/api/approvals/{id}/decision` |
 | 知识库 | `/api/knowledge/documents`、`/api/knowledge/search` |
@@ -416,7 +424,9 @@ make build-mcp-connectors
 | 办公草稿 | `/api/office/drafts`、`/api/office/drafts/{id}/decision` |
 | 办公任务 | `/api/office/operations`、`/api/office/operations/{id}/execute` |
 
-消息接口通过 SSE 返回 `start`、`tool_call`、`tool_result`、`agent_handoff_*`、`delta`、`done` 和 `error` 等事件。完整契约见[项目技术文档](docs/technical-design.md)。
+消息接口通过 SSE 返回 `start`、`tool_call`、`tool_result`、`agent_handoff_*`、`answer_review_*`、`answer_revision_started`、`topic_shift`、`delta`、`done` 和 `error` 等事件。完整契约见[项目技术文档](docs/technical-design.md)。
+
+成本边界：开启反思后每轮固定增加一次 Reviewer 调用，只有评估不通过时再增加一次生成调用；该重写路径不会再次进入 Reviewer。真实模型下的输入治理另使用一次短结构化分类调用，Mock 模式只运行确定性规则。
 
 ## 项目目录结构设计
 

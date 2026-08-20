@@ -17,6 +17,7 @@ const state = {
   memoryRecall: false,
   multiAgent: false,
   humanApproval: false,
+  answerFeedback: false,
   editingMemoryID: null,
   busy: false,
   controller: null,
@@ -168,6 +169,7 @@ async function initialize() {
     configureModelSelector(info);
     state.multiAgent = Boolean(info.multi_agent);
     state.humanApproval = Boolean(info.human_approval);
+    state.answerFeedback = Boolean(info.answer_feedback);
     state.runtimeVersion = info.version || "";
     updateSelectedModelStatus();
     elements.toolBadge.innerHTML = `<i></i> ${Number(info.tool_count || 6)} 个受控工具${info.mcp_enabled ? " · MCP" : ""}`;
@@ -1357,6 +1359,43 @@ function handleAgentEvent(type, event) {
 	  }
 	  break;
 	}
+    case "answer_review_started":
+      state.draft.traces.push({
+        name: "答案反思",
+        key: "answer-review",
+        id: "answer-review",
+        arguments: "按相关性、正确性、完整性、安全性和清晰度评估初稿",
+        result: "评估中…",
+        done: false,
+      });
+      break;
+    case "answer_review_completed": {
+      const trace = [...state.draft.traces].reverse().find(item => item.key === "answer-review");
+      if (trace) {
+        const issues = event.review_issues || [];
+        trace.result = event.review_verdict === "pass"
+          ? "评估通过，无需重写。"
+          : `需要定向重写${issues.length ? `：${issues.join("；")}` : "。"}`;
+        trace.done = event.review_verdict === "pass";
+      }
+      break;
+    }
+    case "answer_revision_started": {
+      const trace = [...state.draft.traces].reverse().find(item => item.key === "answer-review");
+      if (trace) {
+        trace.result = `正在执行唯一一次定向重写${event.content ? `：${event.content}` : "…"}`;
+        trace.done = false;
+      }
+      break;
+    }
+    case "answer_review_failed": {
+      const trace = [...state.draft.traces].reverse().find(item => item.key === "answer-review");
+      if (trace) {
+        trace.result = "评估器暂时不可用，已保留原答案。";
+        trace.done = true;
+      }
+      break;
+    }
     case "approval_required":
       state.draft.approval = event.approval;
       break;
@@ -1366,6 +1405,13 @@ function handleAgentEvent(type, event) {
       if (event.approval) state.draft.approval = event.approval;
       break;
     case "done":
+      {
+        const reviewTrace = [...state.draft.traces].reverse().find(item => item.key === "answer-review" && !item.done);
+        if (reviewTrace) {
+          reviewTrace.result = `${reviewTrace.result}\n\n定向重写已完成。`;
+          reviewTrace.done = true;
+        }
+      }
       if (event.message) {
         const traces = state.draft.traces;
         Object.assign(state.draft, event.message, { traces, metrics: event.metrics, streaming: false });
@@ -1409,8 +1455,12 @@ function renderDraftMessage() {
     bubble.append(cursor);
   }
   article.querySelector(".message-metrics")?.remove();
+  article.querySelector(".message-feedback")?.remove();
   if (state.draft.metrics) {
     article.querySelector(".message-content").append(renderMessageMetrics(state.draft.metrics));
+  }
+  if (!state.draft.streaming && state.answerFeedback && state.draft.id && !state.draft.id.startsWith("draft-")) {
+    article.querySelector(".message-content").append(renderMessageFeedback(state.draft));
   }
 }
 
@@ -1600,6 +1650,9 @@ function renderMessages() {
     if (message.role !== "user" && message.metrics) {
       article.querySelector(".message-content").append(renderMessageMetrics(message.metrics));
     }
+    if (message.role !== "user" && !message.streaming && state.answerFeedback && message.id && !message.id.startsWith("draft-")) {
+      article.querySelector(".message-content").append(renderMessageFeedback(message));
+    }
     if (message === state.draft) state.draftArticle = article;
     elements.messageList.append(article);
   }
@@ -1620,6 +1673,52 @@ function renderMessageMetrics(metrics) {
     container.append(item);
   }
   return container;
+}
+
+function renderMessageFeedback(message) {
+  const container = document.createElement("div");
+  container.className = "message-feedback";
+  container.setAttribute("aria-label", "评价这条回答");
+  const rating = Number(message.feedback?.rating || 0);
+  for (const [value, label, symbol] of [[1, "有帮助", "赞"], [-1, "需要改进", "踩"]]) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = rating === value ? "active" : "";
+    button.setAttribute("aria-pressed", String(rating === value));
+    button.title = label;
+    button.textContent = symbol;
+    button.addEventListener("click", () => submitMessageFeedback(message, value, button));
+    container.append(button);
+  }
+  if (message.feedback?.reason) {
+    const reason = document.createElement("span");
+    reason.textContent = message.feedback.reason;
+    reason.title = message.feedback.reason;
+    container.append(reason);
+  }
+  return container;
+}
+
+async function submitMessageFeedback(message, rating, button) {
+  let reason = "";
+  if (rating < 0) {
+    const value = window.prompt("哪里需要改进？（可选，最多 500 字）", message.feedback?.rating === -1 ? (message.feedback.reason || "") : "");
+    if (value === null) return;
+    reason = value.trim();
+  }
+  const buttons = [...button.parentElement.querySelectorAll("button")];
+  buttons.forEach(item => { item.disabled = true; });
+  try {
+    message.feedback = await api(`/api/messages/${message.id}/feedback`, {
+      method: "PUT",
+      body: JSON.stringify({ rating, reason }),
+    });
+    renderMessages();
+    notify(rating > 0 ? "感谢反馈" : "已记录，下一轮会优先纠正");
+  } catch (error) {
+    buttons.forEach(item => { item.disabled = false; });
+    notify(error.message);
+  }
 }
 
 function renderApproval(container, approval) {

@@ -134,6 +134,9 @@ func New(chatService *chat.Service, knowledgeService *knowledge.Service, memoryS
 	mux.HandleFunc("PATCH /api/conversations/{conversationID}", server.renameConversation)
 	mux.HandleFunc("DELETE /api/conversations/{conversationID}", server.deleteConversation)
 	mux.HandleFunc("POST /api/conversations/{conversationID}/messages", server.sendMessage)
+	if server.chat.FeedbackEnabled() {
+		mux.HandleFunc("PUT /api/messages/{messageID}/feedback", server.submitAnswerFeedback)
+	}
 	mux.HandleFunc("GET /api/runs", server.listRunSummaries)
 	mux.HandleFunc("GET /api/runs/{runID}/metrics", server.getRunSummary)
 	mux.HandleFunc("GET /api/runs/{runID}/events", server.listRunEvents)
@@ -294,6 +297,15 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 	if s.chat.ApprovalEnabled() {
 		capabilities = append(capabilities, "human-approval")
 	}
+	if s.chat.ReflectionEnabled() {
+		capabilities = append(capabilities, "bounded-answer-reflection")
+	}
+	if s.chat.FeedbackEnabled() {
+		capabilities = append(capabilities, "answer-feedback", "implicit-feedback-adaptation")
+	}
+	if s.chat.InputGuardEnabled() {
+		capabilities = append(capabilities, "input-safety-guard", "topic-relevance-analysis", "vector-pollution-prevention")
+	}
 	if s.mcpEnabled {
 		capabilities = append(capabilities, "mcp-client", "mcp-readonly-tools")
 	}
@@ -313,6 +325,9 @@ func (s *Server) info(w http.ResponseWriter, _ *http.Request) {
 		"models": s.chat.ModelProfiles(), "default_model_id": s.chat.DefaultModelID(),
 		"agent_name": s.chat.AgentName(), "multi_agent": s.chat.MultiAgentEnabled(),
 		"human_approval":      s.chat.ApprovalEnabled(),
+		"reflection":          s.chat.ReflectionEnabled(),
+		"answer_feedback":     s.chat.FeedbackEnabled(),
+		"input_guard":         s.chat.InputGuardEnabled(),
 		"embedding_model":     s.knowledge.EmbeddingModel(),
 		"retrieval_backend":   s.knowledge.RetrievalBackend(),
 		"memory_auto_capture": s.memory.AutoCaptureEnabled(),
@@ -448,6 +463,23 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		s.logger.Error("Agent 执行失败", "错误", err, "会话ID", r.PathValue("conversationID"))
 	}
+}
+
+func (s *Server) submitAnswerFeedback(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Rating int    `json:"rating"`
+		Reason string `json:"reason"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		s.problem(w, err)
+		return
+	}
+	item, err := s.chat.SubmitFeedback(r.Context(), r.PathValue("messageID"), input.Rating, input.Reason)
+	if err != nil {
+		s.problem(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, item)
 }
 
 func (s *Server) listRunEvents(w http.ResponseWriter, r *http.Request) {

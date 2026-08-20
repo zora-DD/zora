@@ -1,0 +1,6 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# 服务器使用 UTC；19:20 UTC 对应北京时间次日 03:20，避开常用时段执行备份。
+20 19 * * * /home/zora-deploy/.zora/backup-postgres.sh >>/home/zora-deploy/.zora/backup-postgres.log 2>&1

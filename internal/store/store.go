@@ -25,6 +25,8 @@ type Store interface {
 	AddMessage(ctx context.Context, message domain.Message) (domain.Message, error)
 	GetMessage(ctx context.Context, id string) (domain.Message, error)
 	ListMessages(ctx context.Context, conversationID string, limit int) ([]domain.Message, error)
+	UpsertAnswerFeedback(ctx context.Context, item domain.AnswerFeedback) (domain.AnswerFeedback, error)
+	ListAnswerFeedback(ctx context.Context, conversationID string) ([]domain.AnswerFeedback, error)
 
 	CreateRun(ctx context.Context, run domain.AgentRun) error
 	GetRun(ctx context.Context, id string) (domain.AgentRun, error)

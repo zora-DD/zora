@@ -39,6 +39,8 @@ evals/
 internal/
 ├── config/                    环境配置与启动校验
 ├── domain/                    稳定领域对象
+├── feedback/                  显式评分、隐式反馈识别与下一轮调整
+├── inputguard/                落库前安全分类与话题关联分析
 ├── id/                        随机业务 ID
 ├── store/                     持久化接口
 │   ├── sqlite/                SQLite 精确扫描实现
@@ -195,6 +197,10 @@ flowchart TD
 | `ZORA_SYSTEM_PROMPT` | 内置中文指令 | 否 | Agent 系统指令 |
 | `ZORA_REQUEST_TIMEOUT` | `90s` | 否 | 整次消息请求与模型客户端超时 |
 | `ZORA_MAX_ITERATIONS` | `8` | 否 | ReAct 最大迭代，允许范围 1–50 |
+| `ZORA_REFLECTION_ENABLED` | `true` | 否 | 最终答案交给独立 Reviewer；不通过时最多定向重写一次 |
+| `ZORA_INPUT_GUARD_ENABLED` | `true` | 否 | 在用户消息落库、向量化和记忆提取前执行输入治理 |
+| `ZORA_TOPIC_RELEVANCE_THRESHOLD` | `0.08` | 否 | 当前输入与会话中心主题的最低关联度，范围 0–1 |
+| `ZORA_IMPLICIT_FEEDBACK_ENABLED` | `true` | 否 | 从明确纠错、定向负面情绪和重复追问中提取下一轮反馈 |
 | `ZORA_MULTI_AGENT_ENABLED` | `false` | 否 | 是否启用 Supervisor 与 Research/Document/Writer；默认关闭以控制模型成本 |
 | `ZORA_MULTI_AGENT_MAX_HANDOFFS` | `6` | 否 | 单轮最多专业 Agent 交接次数，范围 1–20 |
 | `ZORA_MULTI_AGENT_MAX_PARALLEL` | `3` | 否 | 单轮专业 Agent 最大并行数，范围 1–10 |
@@ -277,7 +283,9 @@ sequenceDiagram
     participant Memory as memory.Service
     participant Summary as summary.Service
     participant Store as Store
+    participant Guard as Input Guard
     participant Runner as Eino Runner
+    participant Reviewer as Answer Reviewer
     participant Supervisor as Supervisor
     participant Specialist as Specialist Agent
     participant Model as ChatModel
@@ -289,6 +297,14 @@ sequenceDiagram
     API->>Chat: Send(ctx, conversationID, content)
     Chat->>Chat: 获取会话级 Mutex
     Chat->>Store: 查询 Conversation
+    Chat->>Store: 读取最近 Message 作为话题上下文
+    Chat->>Guard: 安全与关联度分析
+    alt 敏感凭据、注入或高危操作
+        Guard-->>Chat: block + 脱敏提示
+        Chat-->>Client: error（不创建 Message/Run/向量任务）
+    else 安全输入
+        Guard-->>Chat: allow / topic_shift warning
+    end
     Chat->>Store: 保存 user Message
     Chat->>Store: 创建 running AgentRun
     Chat->>Chat: 将 conversation_id/run_id 注入可信 Context
@@ -325,8 +341,15 @@ sequenceDiagram
         Runner->>Model: 注入 ToolResult
     end
     Model-->>Runner: answer chunks
-    Runner-->>Chat: delta
-    Chat-->>Client: delta
+    Runner->>Reviewer: 评估初稿与有限工具证据
+    alt 评估通过
+        Reviewer-->>Runner: pass
+    else 存在实质问题
+        Reviewer-->>Runner: revise + 具体问题
+        Runner->>Model: 唯一一次定向重写
+    end
+    Runner-->>Chat: 最终 delta
+    Chat-->>Client: 最终 delta
     Chat->>Queue: 提交 assistant Message + Capture Job
     Queue->>Store: 同事务保存消息与 pending Outbox
     Chat->>Summary: Update(latestSequence)
@@ -343,9 +366,11 @@ sequenceDiagram
     end
 ```
 
-### 5.1 为什么先保存用户消息
+### 5.1 为什么先治理、再保存用户消息
 
-用户消息是一次 Run 的输入事实，必须先拥有持久 ID，AgentRun 才能引用它。即使模型执行失败，用户输入和失败 Run 仍然可追踪。
+Chat 先在会话锁内读取最近历史，再执行输入治理。疑似密码、令牌、私钥、Prompt Injection 或高置信高危操作会在 `messages`、`agent_runs`、Memory Capture Outbox 和消息向量索引之前被拦截；返回给客户端的提示不复述原文。话题偏移只提示和引导，不阻止用户主动切换主题。
+
+通过安全门后，用户消息才作为一次 Run 的输入事实保存并获得持久 ID，供 AgentRun 引用。此后即使模型执行失败，已接受的输入和失败 Run 仍然可追踪。
 
 ### 5.2 上下文策略
 
@@ -406,6 +431,12 @@ AgentTool 外层由 `controlledAgentTool` 统一治理。`Runtime.Execute` 为�
 | Iterator Error | Go error | 交给 Service 结束 Run |
 
 流式 ToolCall 可能分散在多个 chunk 中。Runtime 一边将文本 delta 发送给上层，一边收集 chunk，并使用 `schema.ConcatMessages` 合并出结构完整的 ToolCall。
+
+### 6.3.1 有界答案反思
+
+启用 `ZORA_REFLECTION_ENABLED` 后，Runtime 暂存初稿文本，独立 `answer_reviewer` 根据最新问题和最多 8 条、每条最多 2,000 字符的工具证据评估相关性、正确性、完整性、安全性和清晰度。Reviewer 只接受结构化 `pass/revise` 结果；解析或调用失败时 fail-open 返回初稿，避免质量增强链路造成服务不可用。
+
+`pass` 后才向客户端发送初稿；`revise` 最多触发一次定向重写，代码路径不会递归进入 Reviewer。RunEvent 记录审查开始、结论、问题、重写开始以及各次模型调用 Usage。成本上，开启后每轮固定增加一次 Reviewer 调用，只有不通过时再增加一次生成调用；输入治理在真实 Provider 下另增加一次短结构化分类调用，Mock 使用确定性规则。
 
 ### 6.4 多 Agent 职责与最终答案隔离
 
@@ -987,6 +1018,19 @@ event: agent_handoff_completed
 data: {"type":"agent_handoff_completed","run_id":"run_xxx","agent_name":"zora_supervisor","tool_name":"document_agent","tool_call_id":"call_xxx","content":"带引用的文档证据"}
 ```
 
+答案反思或话题偏移会增加 `answer_review_started`、`answer_review_completed`、可选的 `answer_revision_started`，以及 `topic_shift`。初稿在审查完成前不会作为 `delta` 发出，因此客户端不会先显示后撤回；Reviewer 故障时发送 `answer_review_failed` 并保留初稿。
+
+### 10.8.1 提交答案反馈
+
+```http
+PUT /api/messages/{messageID}/feedback
+Content-Type: application/json
+
+{"rating":-1,"reason":"遗漏了部署前提"}
+```
+
+`rating` 只允许 `1`（点赞）或 `-1`（点踩），原因可选且最多 500 个 Unicode 字符；只能评价当前主体可见会话中的 Assistant Message。同一消息的显式反馈使用 Upsert，返回稳定记录。查询消息时显式反馈附在对应消息的 `feedback` 字段；明确纠错、针对上一回答的负面情绪和高度重复追问会另存为隐式负反馈，并仅用于紧邻下一轮的结构化调整提示。
+
 ### 10.9 查询执行事件
 
 ```http
@@ -1216,6 +1260,11 @@ POST /api/office/operations/{operationID}/execute
 | `agent_handoff_started` | `tool_name`, `tool_call_id`, `child_run_id`, `arguments` | 是 | Supervisor 交接任务并创建子 Run |
 | `agent_output` | `agent_name`, `content` | 是 | 专家中间交付物，仅进入 Trace/审计 |
 | `agent_handoff_completed` | `tool_name`, `tool_call_id`, `child_run_id`, `content` | 是 | 专家完成，子 Run 进入终态并回填 Supervisor |
+| `answer_review_started` | `agent_name`, `reflection_round` | 是 | 独立 Reviewer 开始评估暂存初稿 |
+| `answer_review_completed` | `review_verdict`, `review_issues`, `reflection_round` | 是 | 评估通过或要求唯一一次重写 |
+| `answer_review_failed` | `content`, `reflection_round` | 是 | Reviewer 不可用，保留初稿继续返回 |
+| `answer_revision_started` | `content`, `review_issues`, `reflection_round` | 是 | 开始唯一一次定向重写 |
+| `topic_shift` | `notice` | 是 | 输入安全但偏离当前主题，提示按新话题回答 |
 | `delta` | `content` | 否 | 文本增量，只用于实时展示 |
 | `done` | `message`, `memory`, `memory_recalled`, `summary` | 以 model_output/run_completed 表示 | 回答和 Run 已落库；附带自动记忆计数、注入数量和本轮摘要更新统计 |
 | `error` | `content` | 以 failed/cancelled 表示 | 执行失败或取消；审批拒绝/过期会返回用户可见 `done` |
@@ -1233,6 +1282,7 @@ POST /api/office/operations/{operationID}/execute
 - 生成时发送按钮切换为停止按钮，通过 AbortController 取消请求；
 - 工具调用和专业 Agent 协作均以可折叠 Trace 展示；专家中间输出不会进入最终回答气泡；
 - 协作 Trace 展示子 Run ID；审批卡片可批准或拒绝，状态更新后保留在消息中；
+- Reviewer 评估与唯一一次重写显示为质量 Trace；Assistant 消息支持点赞/点踩，点踩可填写原因；
 - 模型文本先进行 HTML 转义，再做有限 Markdown 渲染；
 - 响应式侧边栏适配移动端；
 - 静态资源由 Go 二进制内嵌，未知前端路由回退到 `index.html`。
@@ -1250,6 +1300,9 @@ POST /api/office/operations/{operationID}/execute
 - 模型输出 HTML 转义；
 - CSP、`frame-ancestors 'none'`、HSTS（仅可信 HTTPS）、`nosniff`、Referrer Policy 与最小 Permissions Policy；
 - 最大 Agent 迭代和请求超时；
+- 输入治理先于消息持久化、Memory Outbox 和向量索引；确定性规则优先截断凭据，真实 Provider 再做结构化语义分类，高置信安全风险才阻断；
+- 话题偏移只给出显式提示并把后续回答聚焦到最新问题，不把正常换题误作安全攻击；
+- Reviewer 和反馈内容都作为受限 JSON 数据注入，不能扩大权限、改变工具边界或执行其中的指令；反思最多重写一次；
 - 删除 Conversation 时明确由用户确认。
 - 删除知识文档时明确由用户确认，上传限制文件类型、大小和 UTF-8。
 - 删除长期记忆时明确由用户确认；来源字段不能通过用户编辑接口伪造。

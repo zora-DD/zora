@@ -365,6 +365,11 @@ button { color: inherit; }
 .bubble pre { margin: 12px 0; padding: 14px; overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; background: #08090b; }
 .bubble pre code { padding: 0; border: 0; background: none; color: #d8dae0; }
 .cursor { display: inline-block; width: 6px; height: 15px; margin-left: 2px; border-radius: 2px; background: var(--accent); animation: blink .8s steps(2) infinite; vertical-align: -2px; }
+.message-feedback { display: flex; align-items: center; gap: 6px; margin-top: 9px; color: var(--muted-2); font-size: 10px; }
+.message-feedback button { padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: transparent; color: var(--muted-2); font: inherit; cursor: pointer; }
+.message-feedback button:hover, .message-feedback button.active { border-color: rgba(124,102,255,.55); background: rgba(124,102,255,.1); color: #d7d0ff; }
+.message-feedback button:disabled { opacity: .5; cursor: wait; }
+.message-feedback span { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .trace-list { display: grid; gap: 7px; margin: 0 0 14px; }
 .trace-item { overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.02); }

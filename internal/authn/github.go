@@ -156,6 +156,18 @@ func (m *Manager) login(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
+	// OAuth state Cookie 必须与回调使用同一主机。开发者可能通过 127.0.0.1
+	// 打开页面，而 GitHub 回调配置为 localhost；先切到配置中的标准主机，
+	// 避免浏览器因 Host 不同而丢弃回调所需的 Cookie。
+	redirectURL, _ := url.Parse(m.config.RedirectURL)
+	if redirectURL != nil && !strings.EqualFold(r.Host, redirectURL.Host) {
+		canonical := &url.URL{Scheme: redirectURL.Scheme, Host: redirectURL.Host, Path: "/api/auth/login"}
+		if rawReturnTo := strings.TrimSpace(r.URL.Query().Get("return_to")); rawReturnTo != "" {
+			canonical.RawQuery = url.Values{"return_to": {safeReturnTo(rawReturnTo)}}.Encode()
+		}
+		http.Redirect(w, r, canonical.String(), http.StatusFound)
+		return
+	}
 	state, err := randomToken(32)
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "无法创建登录请求")

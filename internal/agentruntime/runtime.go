@@ -17,6 +17,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/zhiruo/zora/internal/config"
+	"github.com/zhiruo/zora/internal/inputguard"
 )
 
 const AgentName = "zora-assistant"
@@ -30,8 +31,11 @@ type Event struct {
 	ToolCallID string
 	Arguments  string
 	// Usage 只承载模型供应商真实返回的统计；未返回时保持 nil，不能用字符数伪装 Token。
-	Usage        *ModelUsage
-	FinishReason string
+	Usage           *ModelUsage
+	FinishReason    string
+	ReviewVerdict   string
+	ReviewIssues    []string
+	ReflectionRound int
 }
 
 // ModelUsage 是与具体模型 SDK 解耦的单次调用 Token 统计。
@@ -51,6 +55,8 @@ type Runtime struct {
 	agentName   string
 	specialists map[string]struct{}
 	limits      ExecutionLimits
+	reviewer    *answerReviewer
+	inputGuard  inputguard.Analyzer
 }
 
 // NewChatModel 根据配置创建可复用的模型实例。主 Agent 与记忆提取器共享同一模型配置，
@@ -112,13 +118,19 @@ func NewWithModel(ctx context.Context, cfg config.Config, tools []tool.BaseTool,
 		return nil, fmt.Errorf("创建 Eino Agent 失败：%w", err)
 	}
 
-	return newRuntime(ctx, cfg, agent, nil), nil
+	runtime := newRuntime(ctx, cfg, agent, nil)
+	if err := runtime.configureEnhancements(cfg, chatModel); err != nil {
+		return nil, err
+	}
+	return runtime, nil
 }
 
 func (r *Runtime) Model() string           { return r.model }
 func (r *Runtime) Provider() string        { return r.provider }
 func (r *Runtime) AgentName() string       { return r.agentName }
 func (r *Runtime) MultiAgentEnabled() bool { return len(r.specialists) > 0 }
+func (r *Runtime) ReflectionEnabled() bool { return r.reviewer != nil }
+func (r *Runtime) InputGuardEnabled() bool { return r.inputGuard != nil }
 
 func newRuntime(ctx context.Context, cfg config.Config, rootAgent adk.Agent, specialistNames []string) *Runtime {
 	specialists := make(map[string]struct{}, len(specialistNames))
@@ -140,6 +152,13 @@ func newRuntime(ctx context.Context, cfg config.Config, rootAgent adk.Agent, spe
 
 // Execute 执行一次完整请求，并把模型增量、工具调用和工具结果实时向上层转发。
 func (r *Runtime) Execute(ctx context.Context, history []*schema.Message, emit func(Event) error) (string, error) {
+	if r.reviewer != nil {
+		return r.executeWithReflection(ctx, history, emit)
+	}
+	return r.executeOnce(ctx, history, emit)
+}
+
+func (r *Runtime) executeOnce(ctx context.Context, history []*schema.Message, emit func(Event) error) (string, error) {
 	if r.MultiAgentEnabled() {
 		ctx = withExecutionState(ctx, r.limits)
 	}

@@ -62,6 +62,9 @@ func TestLoadKnowledgeDefaults(t *testing.T) {
 	if cfg.MultiAgentApprovalMode != "risky" || cfg.MultiAgentApprovalTimeout != time.Minute {
 		t.Fatalf("unexpected multi-agent approval defaults: %+v", cfg)
 	}
+	if !cfg.ReflectionEnabled || !cfg.InputGuardEnabled || cfg.TopicRelevanceThreshold != 0.08 || !cfg.ImplicitFeedbackEnabled {
+		t.Fatalf("unexpected quality loop defaults: %+v", cfg)
+	}
 	if cfg.MCPEnabled || len(cfg.MCPServers) != 0 || cfg.MCPConnectTimeout != 10*time.Second || cfg.MCPCallTimeout != 20*time.Second || cfg.MCPMaxOutputRunes != 12000 {
 		t.Fatalf("unexpected MCP defaults: %+v", cfg)
 	}
@@ -380,6 +383,7 @@ func clearEnvironment(t *testing.T) {
 	for _, key := range []string{
 		"ZORA_ADDR", "ZORA_DATA_DIR", "ZORA_MODEL_PROVIDER", "ZORA_MODEL", "ZORA_API_KEY", "ZORA_API_KEY_FILE",
 		"ZORA_BASE_URL", "ZORA_MODELS_JSON", "ZORA_DEFAULT_MODEL_ID", "ZORA_AI_CONFIG_FILE", "ZORA_SYSTEM_PROMPT", "ZORA_REQUEST_TIMEOUT", "ZORA_MAX_ITERATIONS",
+		"ZORA_REFLECTION_ENABLED", "ZORA_INPUT_GUARD_ENABLED", "ZORA_TOPIC_RELEVANCE_THRESHOLD", "ZORA_IMPLICIT_FEEDBACK_ENABLED",
 		"ZORA_OTEL_ENABLED", "ZORA_PROMETHEUS_ENABLED", "ZORA_OTEL_ENVIRONMENT", "ZORA_OTEL_SAMPLE_RATIO",
 		"OTEL_SERVICE_NAME", "OTEL_EXPORTER_OTLP_ENDPOINT",
 		"ZORA_MULTI_AGENT_ENABLED", "ZORA_MULTI_AGENT_MAX_HANDOFFS", "ZORA_MULTI_AGENT_MAX_PARALLEL",

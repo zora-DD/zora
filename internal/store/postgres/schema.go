@@ -33,6 +33,21 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_sequence
     ON messages(conversation_id, sequence);
 
+CREATE TABLE IF NOT EXISTS answer_feedback (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    source TEXT NOT NULL CHECK (source IN ('explicit', 'implicit')),
+    rating INTEGER NOT NULL CHECK (rating IN (-1, 1)),
+    reason TEXT NOT NULL DEFAULT '',
+    signals JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    UNIQUE(message_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_answer_feedback_conversation_updated
+    ON answer_feedback(conversation_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS agent_runs (
     id TEXT PRIMARY KEY,
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,

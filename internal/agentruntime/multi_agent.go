@@ -110,9 +110,13 @@ func NewMultiAgentWithModel(ctx context.Context, cfg config.Config, tools Specia
 		return nil, fmt.Errorf("创建 Supervisor Agent 失败：%w", err)
 	}
 
-	return newRuntime(ctx, cfg, supervisor, []string{
+	runtime := newRuntime(ctx, cfg, supervisor, []string{
 		ResearchAgentName, DocumentAgentName, WriterAgentName,
-	}), nil
+	})
+	if err := runtime.configureEnhancements(cfg, chatModel); err != nil {
+		return nil, err
+	}
+	return runtime, nil
 }
 
 func newSpecialist(ctx context.Context, name, description, instruction string, chatModel model.BaseChatModel, tools []tool.BaseTool, maxIterations int) (adk.Agent, error) {

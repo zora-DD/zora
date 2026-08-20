@@ -3,6 +3,7 @@ package agentruntime
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +14,56 @@ import (
 	"github.com/zhiruo/zora/internal/agenttools"
 	"github.com/zhiruo/zora/internal/config"
 )
+
+func TestReflectionRewritesAtMostOnce(t *testing.T) {
+	t.Parallel()
+	chatModel := &reflectionTestModel{}
+	runtime, err := NewWithModel(context.Background(), config.Config{
+		Provider: "openai", Model: "reflection-test", Instruction: "请回答用户问题。",
+		RequestTimeout: time.Second, MaxIterations: 3, ReflectionEnabled: true,
+	}, nil, chatModel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []string
+	answer, err := runtime.Execute(context.Background(), []*schema.Message{schema.UserMessage("发布日期是什么？")}, func(event Event) error {
+		events = append(events, event.Type)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer != "修订后的完整答案" || chatModel.calls.Load() != 3 {
+		t.Fatalf("answer=%q calls=%d", answer, chatModel.calls.Load())
+	}
+	joined := strings.Join(events, ",")
+	if strings.Count(joined, "answer_review_started") != 1 || strings.Count(joined, "answer_revision_started") != 1 {
+		t.Fatalf("reflection events = %s", joined)
+	}
+}
+
+type reflectionTestModel struct{ calls atomic.Int32 }
+
+func (m *reflectionTestModel) Generate(_ context.Context, input []*schema.Message, _ ...model.Option) (*schema.Message, error) {
+	m.calls.Add(1)
+	for _, message := range input {
+		if message.Role == schema.System && strings.Contains(message.Content, "[ZORA_AGENT_ROLE:answer_reviewer]") {
+			return schema.AssistantMessage(`{"verdict":"revise","issues":["缺少关键日期"],"rewrite_instruction":"补全日期"}`, nil), nil
+		}
+		if message.Role == schema.System && strings.Contains(message.Content, "[ZORA_INTERNAL_REVISION]") {
+			return schema.AssistantMessage("修订后的完整答案", nil), nil
+		}
+	}
+	return schema.AssistantMessage("不完整初稿", nil), nil
+}
+
+func (m *reflectionTestModel) Stream(ctx context.Context, input []*schema.Message, options ...model.Option) (*schema.StreamReader[*schema.Message], error) {
+	message, err := m.Generate(ctx, input, options...)
+	if err != nil {
+		return nil, err
+	}
+	return schema.StreamReaderFromArray([]*schema.Message{message}), nil
+}
 
 func TestMockRuntimeExecutesToolThroughEino(t *testing.T) {
 	t.Parallel()

@@ -105,6 +105,32 @@ func TestGitHubOAuthCreatesServerSessionWithStableIdentity(t *testing.T) {
 	}
 }
 
+func TestGitHubOAuthLoginCanonicalizesCallbackHost(t *testing.T) {
+	store := &memorySessionStore{values: map[string][]byte{}}
+	manager, err := New(Config{
+		Enabled: true, ClientID: "client", ClientSecret: "secret",
+		RedirectURL: "http://localhost:8088/api/auth/callback",
+	}, store, slog.New(slog.NewTextHandler(io.Discard, nil)), identity.LocalPrincipal("local-user"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	manager.Register(mux)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"http://127.0.0.1:8088/api/auth/login?return_to=%2Fconversations%2F123", nil))
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("login status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if location := response.Header().Get("Location"); location != "http://localhost:8088/api/auth/login?return_to=%2Fconversations%2F123" {
+		t.Fatalf("canonical login location = %q", location)
+	}
+	if len(response.Result().Cookies()) != 0 || len(store.values) != 0 {
+		t.Fatal("切换到标准主机前不应创建 OAuth state 或 Cookie")
+	}
+}
+
 func TestSessionStoreOutageReturnsServiceUnavailable(t *testing.T) {
 	manager, err := New(Config{
 		Enabled: true, ClientID: "client", ClientSecret: "secret",

@@ -18,7 +18,9 @@ import (
 	"github.com/zhiruo/zora/internal/approval"
 	"github.com/zhiruo/zora/internal/background"
 	"github.com/zhiruo/zora/internal/domain"
+	"github.com/zhiruo/zora/internal/feedback"
 	"github.com/zhiruo/zora/internal/id"
+	"github.com/zhiruo/zora/internal/inputguard"
 	"github.com/zhiruo/zora/internal/memory"
 	"github.com/zhiruo/zora/internal/observability"
 	"github.com/zhiruo/zora/internal/semantic"
@@ -30,25 +32,29 @@ const defaultConversationTitle = "新对话"
 
 // StreamEvent 是应用层事件，不直接暴露 Eino 的内部类型。
 type StreamEvent struct {
-	Type           string                    `json:"type"`
-	RunID          string                    `json:"run_id,omitempty"`
-	ModelID        string                    `json:"model_id,omitempty"`
-	AgentName      string                    `json:"agent_name,omitempty"`
-	Content        string                    `json:"content,omitempty"`
-	ToolName       string                    `json:"tool_name,omitempty"`
-	ToolCallID     string                    `json:"tool_call_id,omitempty"`
-	ChildRunID     string                    `json:"child_run_id,omitempty"`
-	TraceID        string                    `json:"trace_id,omitempty"`
-	SpanID         string                    `json:"span_id,omitempty"`
-	Arguments      string                    `json:"arguments,omitempty"`
-	Message        *domain.Message           `json:"message,omitempty"`
-	Memory         *memory.CaptureResult     `json:"memory,omitempty"`
-	MemoryJob      *memory.CaptureJob        `json:"memory_job,omitempty"`
-	MemoryRecalled int                       `json:"memory_recalled,omitempty"`
-	Summary        *summary.UpdateResult     `json:"summary,omitempty"`
-	SummaryJob     *background.Job           `json:"summary_job,omitempty"`
-	Approval       *approval.Approval        `json:"approval,omitempty"`
-	Metrics        *observability.RunMetrics `json:"metrics,omitempty"`
+	Type            string                    `json:"type"`
+	RunID           string                    `json:"run_id,omitempty"`
+	ModelID         string                    `json:"model_id,omitempty"`
+	AgentName       string                    `json:"agent_name,omitempty"`
+	Content         string                    `json:"content,omitempty"`
+	ToolName        string                    `json:"tool_name,omitempty"`
+	ToolCallID      string                    `json:"tool_call_id,omitempty"`
+	ChildRunID      string                    `json:"child_run_id,omitempty"`
+	TraceID         string                    `json:"trace_id,omitempty"`
+	SpanID          string                    `json:"span_id,omitempty"`
+	Arguments       string                    `json:"arguments,omitempty"`
+	Message         *domain.Message           `json:"message,omitempty"`
+	Memory          *memory.CaptureResult     `json:"memory,omitempty"`
+	MemoryJob       *memory.CaptureJob        `json:"memory_job,omitempty"`
+	MemoryRecalled  int                       `json:"memory_recalled,omitempty"`
+	Summary         *summary.UpdateResult     `json:"summary,omitempty"`
+	SummaryJob      *background.Job           `json:"summary_job,omitempty"`
+	Approval        *approval.Approval        `json:"approval,omitempty"`
+	Metrics         *observability.RunMetrics `json:"metrics,omitempty"`
+	Notice          string                    `json:"notice,omitempty"`
+	ReviewVerdict   string                    `json:"review_verdict,omitempty"`
+	ReviewIssues    []string                  `json:"review_issues,omitempty"`
+	ReflectionRound int                       `json:"reflection_round,omitempty"`
 }
 
 // Service 是会话用例边界，负责执行顺序、状态落库和同会话并发控制。
@@ -69,6 +75,8 @@ type Service struct {
 	approval              *approval.Service
 	telemetry             *observability.Telemetry
 	conversationLocker    conversationLocker
+	feedback              *feedback.Service
+	implicitFeedback      bool
 	locksMu               sync.Mutex
 	locks                 map[string]*sync.Mutex
 }
@@ -163,6 +171,13 @@ func WithConversationLocker(locker conversationLocker) Option {
 	return func(service *Service) { service.conversationLocker = locker }
 }
 
+func WithFeedback(service *feedback.Service, implicitEnabled bool) Option {
+	return func(chatService *Service) {
+		chatService.feedback = service
+		chatService.implicitFeedback = implicitEnabled
+	}
+}
+
 func WithRuntimeProfiles(defaultModel string, profiles []RuntimeProfile) Option {
 	return func(service *Service) {
 		if len(profiles) == 0 {
@@ -207,6 +222,9 @@ func (s *Service) MemoryRecallEnabled() bool  { return s.memoryRecall != nil }
 func (s *Service) MessageRecallEnabled() bool { return s.messageRecall != nil }
 func (s *Service) SummaryEnabled() bool       { return s.summary != nil }
 func (s *Service) ApprovalEnabled() bool      { return s.approval != nil && s.approval.Enabled() }
+func (s *Service) FeedbackEnabled() bool      { return s.feedback != nil }
+func (s *Service) ReflectionEnabled() bool    { return s.runtime.ReflectionEnabled() }
+func (s *Service) InputGuardEnabled() bool    { return s.runtime.InputGuardEnabled() }
 
 func (s *Service) ModelProfiles() []ModelProfile {
 	return append([]ModelProfile(nil), s.models...)
@@ -256,7 +274,34 @@ func (s *Service) ListMessages(ctx context.Context, conversationID string) ([]do
 	if _, err := s.store.GetConversation(ctx, conversationID); err != nil {
 		return nil, err
 	}
-	return s.store.ListMessages(ctx, conversationID, 200)
+	messages, err := s.store.ListMessages(ctx, conversationID, 200)
+	if err != nil || s.feedback == nil {
+		return messages, err
+	}
+	items, err := s.feedback.List(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	explicit := make(map[string]domain.AnswerFeedback)
+	for _, item := range items {
+		if item.Source == domain.FeedbackSourceExplicit {
+			explicit[item.MessageID] = item
+		}
+	}
+	for index := range messages {
+		if item, ok := explicit[messages[index].ID]; ok {
+			copy := item
+			messages[index].Feedback = &copy
+		}
+	}
+	return messages, nil
+}
+
+func (s *Service) SubmitFeedback(ctx context.Context, messageID string, rating int, reason string) (domain.AnswerFeedback, error) {
+	if s.feedback == nil {
+		return domain.AnswerFeedback{}, fmt.Errorf("答案反馈功能未启用")
+	}
+	return s.feedback.Submit(ctx, feedback.SubmitInput{MessageID: messageID, Rating: rating, Reason: reason})
 }
 
 func (s *Service) ListRunEvents(ctx context.Context, runID string) ([]domain.RunEvent, error) {
@@ -343,6 +388,28 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 		return err
 	}
 
+	// 输入治理必须发生在消息持久化和 Memory/Embedding Outbox 之前。
+	historyLimit := 40
+	if s.summary != nil && s.summary.HistoryLimit() > historyLimit {
+		historyLimit = s.summary.HistoryLimit()
+	}
+	previousMessages, err := s.store.ListMessages(ctx, conversationID, historyLimit)
+	if err != nil {
+		return err
+	}
+	guardResult, guardErr := runtime.AnalyzeInput(ctx, inputguard.Input{
+		Content: content, TopicContext: conversationTopicContext(conversation, previousMessages), MessageCount: len(previousMessages),
+	})
+	if guardErr != nil {
+		// 分类器故障不应让所有聊天不可用；确定性敏感信息检查已经在分类器内部优先执行。
+		if guardResult.Action == "" {
+			guardResult = inputguard.Result{Action: inputguard.ActionAllow, Category: inputguard.CategorySafe, Indexable: true}
+		}
+	}
+	if guardResult.Action == inputguard.ActionBlock || !guardResult.Indexable {
+		return &inputguard.BlockedError{Category: guardResult.Category, Notice: guardResult.Notice}
+	}
+
 	now := time.Now().UTC()
 	userMessage, err := s.store.AddMessage(ctx, domain.Message{
 		ID: id.New("msg"), ConversationID: conversationID,
@@ -354,6 +421,22 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 	if conversation.Title == defaultConversationTitle && conversation.MessageCount == 0 {
 		// 只在首条消息后自动命名；用户主动修改过的标题不会被覆盖。
 		_ = s.store.RenameConversation(ctx, conversationID, titleFromMessage(content))
+	}
+
+	var feedbackContext *domain.AnswerFeedback
+	var feedbackErr error
+	if s.feedback != nil {
+		if s.implicitFeedback {
+			if signal := feedback.DetectImplicit(conversationID, content, previousMessages); signal != nil {
+				_, feedbackErr = s.feedback.RecordImplicit(ctx, *signal)
+			}
+		}
+		items, listErr := s.feedback.List(ctx, conversationID)
+		if listErr != nil {
+			feedbackErr = listErr
+		} else if previousAssistant := lastAssistantMessage(previousMessages); previousAssistant != nil {
+			feedbackContext = feedback.PreviousForNextAnswer(items, previousAssistant.ID)
+		}
 	}
 
 	// AgentRun 是一次请求的审计主记录，后续工具和模型事件都关联到该 ID。
@@ -399,6 +482,42 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 	if err := emit(StreamEvent{Type: "start", RunID: run.ID, ModelID: selectedModelID, TraceID: traceID, SpanID: spanID, Message: &userMessage}); err != nil {
 		return s.failRun(ctx, run.ID, err)
 	}
+	if guardErr != nil {
+		_ = s.appendEvent(ctx, run.ID, "input_guard_failed", runtime.AgentName(), "", map[string]any{"error": guardErr.Error()})
+	}
+	if guardResult.ModelCalled {
+		_ = s.appendEvent(ctx, run.ID, "model_call_completed", "input_guard", "", map[string]any{
+			"finish_reason": guardResult.FinishReason, "usage_reported": guardResult.UsageReported,
+			"prompt_tokens": guardResult.PromptTokens, "completion_tokens": guardResult.CompletionTokens,
+			"total_tokens": guardResult.TotalTokens, "cached_tokens": guardResult.CachedTokens,
+			"reasoning_tokens": guardResult.ReasoningTokens,
+		})
+	}
+	if feedbackErr != nil {
+		_ = s.appendEvent(ctx, run.ID, "feedback_signal_failed", runtime.AgentName(), "", map[string]any{"error": feedbackErr.Error()})
+	}
+	if feedbackContext != nil {
+		_ = s.appendEvent(ctx, run.ID, "feedback_applied", runtime.AgentName(), "", map[string]any{
+			"feedback_id": feedbackContext.ID, "source": feedbackContext.Source, "rating": feedbackContext.Rating,
+		})
+	}
+	topicPrefix := ""
+	if guardResult.Action == inputguard.ActionWarn {
+		topicPrefix = "> 话题提示：" + guardResult.Notice + "\n\n"
+		payload := map[string]any{
+			"category": guardResult.Category, "topic_relevance": guardResult.TopicRelevance,
+			"confidence": guardResult.Confidence, "notice": guardResult.Notice,
+		}
+		if err := s.appendEvent(ctx, run.ID, "topic_shift", runtime.AgentName(), "", payload); err != nil {
+			return s.failRun(ctx, run.ID, err)
+		}
+		if err := emit(StreamEvent{Type: "topic_shift", RunID: run.ID, Notice: guardResult.Notice}); err != nil {
+			return s.failRun(ctx, run.ID, err)
+		}
+		if err := emit(StreamEvent{Type: "delta", RunID: run.ID, Content: topicPrefix}); err != nil {
+			return s.failRun(ctx, run.ID, err)
+		}
+	}
 	if s.ApprovalEnabled() {
 		item, approvalErr := s.approval.Request(ctx, approval.RequestInput{
 			RunID: run.ID, ConversationID: conversationID,
@@ -443,15 +562,8 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 		}
 	}
 
-	// 摘要触发前至少读取完整阈值窗口，避免自定义阈值大于默认 40 条时漏掉未摘要历史。
-	historyLimit := 40
-	if s.summary != nil && s.summary.HistoryLimit() > historyLimit {
-		historyLimit = s.summary.HistoryLimit()
-	}
-	messages, err := s.store.ListMessages(ctx, conversationID, historyLimit)
-	if err != nil {
-		return s.failRun(ctx, run.ID, err)
-	}
+	// previousMessages 已在输入治理前读取；只追加本轮已通过安全门的用户消息。
+	messages := append(append([]domain.Message(nil), previousMessages...), userMessage)
 	var loadedSummary *summary.Summary
 	if s.summary != nil {
 		item, summaryErr := s.summary.Get(ctx, conversationID)
@@ -493,6 +605,12 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 			_ = s.appendEvent(ctx, run.ID, "memory_recall_completed", s.runtime.AgentName(), "", recallAuditPayload(injected))
 		}
 	}
+	if feedbackContext != nil {
+		history = feedback.PrependGuidance(history, *feedbackContext)
+	}
+	if guardResult.Action == inputguard.ActionWarn {
+		history = prependTopicShiftGuidance(history, guardResult)
+	}
 
 	childRuns := make(map[string]domain.AgentTaskRun)
 	finishedChildRuns := make(map[string]bool)
@@ -531,6 +649,15 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 				payload["cached_tokens"] = event.Usage.CachedTokens
 				payload["reasoning_tokens"] = event.Usage.ReasoningTokens
 			}
+		}
+		if event.ReviewVerdict != "" {
+			payload["verdict"] = event.ReviewVerdict
+		}
+		if len(event.ReviewIssues) > 0 {
+			payload["issues"] = event.ReviewIssues
+		}
+		if event.ReflectionRound > 0 {
+			payload["round"] = event.ReflectionRound
 		}
 		if event.Type == "agent_handoff_started" {
 			child := domain.AgentTaskRun{
@@ -580,12 +707,14 @@ func (s *Service) SendWithModel(ctx context.Context, conversationID, content, mo
 			Type: event.Type, RunID: run.ID, AgentName: event.AgentName,
 			Content: event.Content, ToolName: event.ToolName,
 			ToolCallID: event.ToolCallID, ChildRunID: childRunID, Arguments: event.Arguments,
+			ReviewVerdict: event.ReviewVerdict, ReviewIssues: event.ReviewIssues, ReflectionRound: event.ReflectionRound,
 		})
 	})
 	if err != nil {
 		s.finishActiveChildRuns(ctx, childRuns, finishedChildRuns, err)
 		return s.failRun(ctx, run.ID, err)
 	}
+	answer = topicPrefix + answer
 
 	assistantMessageInput := domain.Message{
 		ID: id.New("msg"), ConversationID: conversationID,
@@ -790,6 +919,41 @@ func truncateText(value string, limit int) string {
 		return value
 	}
 	return string(runes[:limit]) + "…"
+}
+
+func lastAssistantMessage(messages []domain.Message) *domain.Message {
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].Role == domain.RoleAssistant {
+			copy := messages[index]
+			return &copy
+		}
+	}
+	return nil
+}
+
+func conversationTopicContext(conversation domain.Conversation, messages []domain.Message) string {
+	parts := make([]string, 0, 7)
+	if title := strings.TrimSpace(conversation.Title); title != "" && title != defaultConversationTitle {
+		parts = append(parts, title)
+	}
+	start := max(0, len(messages)-6)
+	for _, message := range messages[start:] {
+		if message.Role != domain.RoleUser {
+			continue
+		}
+		parts = append(parts, truncateText(message.Content, 500))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func prependTopicShiftGuidance(history []*schema.Message, result inputguard.Result) []*schema.Message {
+	payload, _ := json.Marshal(map[string]any{
+		"category": result.Category, "topic_relevance": result.TopicRelevance,
+	})
+	message := schema.SystemMessage(`[ZORA_TOPIC_SHIFT]
+关联度分析判断最新用户输入可能开启了新话题。优先回答最新问题，不要强行套用旧主题；只有确有帮助时才引用前文。
+analysis=` + string(payload))
+	return append([]*schema.Message{message}, history...)
 }
 
 func (s *Service) failRun(ctx context.Context, runID string, cause error) error {

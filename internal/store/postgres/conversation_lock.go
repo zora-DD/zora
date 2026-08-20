@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -15,8 +17,8 @@ func (p *Postgres) LockConversation(ctx context.Context, key string) (func(), er
 	if err != nil {
 		return nil, fmt.Errorf("从连接池获取会话锁连接失败：%w", err)
 	}
-	lockKey := scope.TenantID + "\x00" + key
-	if _, err := connection.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 4927))`, lockKey); err != nil {
+	lockKey := conversationLockKey(scope.TenantID, key)
+	if _, err := connection.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockKey); err != nil {
 		connection.Release()
 		return nil, err
 	}
@@ -25,8 +27,13 @@ func (p *Postgres) LockConversation(ctx context.Context, key string) (func(), er
 		once.Do(func() {
 			unlockCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_, _ = connection.Exec(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1, 4927))`, lockKey)
+			_, _ = connection.Exec(unlockCtx, `SELECT pg_advisory_unlock($1)`, lockKey)
 			connection.Release()
 		})
 	}, nil
+}
+
+func conversationLockKey(tenantID, conversationID string) int64 {
+	digest := sha256.Sum256([]byte(tenantID + "\x00" + conversationID))
+	return int64(binary.BigEndian.Uint64(digest[:8]))
 }

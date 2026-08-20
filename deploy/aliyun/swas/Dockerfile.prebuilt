@@ -1,0 +1,24 @@
+# 面向低配服务器的预编译镜像：Go 二进制由 CI 或开发机交叉编译后再封装。
+FROM alpine:3.23
+
+RUN apk add --no-cache ca-certificates tzdata \
+    && addgroup -S -g 10001 zora \
+    && adduser -S -D -H -u 10001 -G zora zora \
+    && mkdir -p /app/data \
+    && chown -R zora:zora /app
+
+WORKDIR /app
+COPY zora /usr/local/bin/zora
+COPY zora-mcp-files /usr/local/bin/zora-mcp-files
+COPY zora-mcp-microsoft /usr/local/bin/zora-mcp-microsoft
+
+USER zora
+ENV ZORA_ADDR=:8088 \
+    ZORA_DATA_DIR=/app/data \
+    ZORA_MODEL_PROVIDER=mock
+VOLUME ["/app/data"]
+EXPOSE 8088
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -q -O /dev/null http://127.0.0.1:8088/api/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/zora"]

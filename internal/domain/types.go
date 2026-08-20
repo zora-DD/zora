@@ -29,14 +29,33 @@ type Conversation struct {
 
 // Message is a user-visible message in a conversation.
 type Message struct {
-	ID             string    `json:"id"`
-	ConversationID string    `json:"conversation_id"`
-	Role           string    `json:"role"`
-	Content        string    `json:"content"`
-	ToolName       string    `json:"tool_name,omitempty"`
-	ToolCallID     string    `json:"tool_call_id,omitempty"`
-	Sequence       int64     `json:"sequence"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             string          `json:"id"`
+	ConversationID string          `json:"conversation_id"`
+	Role           string          `json:"role"`
+	Content        string          `json:"content"`
+	ToolName       string          `json:"tool_name,omitempty"`
+	ToolCallID     string          `json:"tool_call_id,omitempty"`
+	Sequence       int64           `json:"sequence"`
+	CreatedAt      time.Time       `json:"created_at"`
+	Feedback       *AnswerFeedback `json:"feedback,omitempty"`
+}
+
+const (
+	FeedbackSourceExplicit = "explicit"
+	FeedbackSourceImplicit = "implicit"
+)
+
+// AnswerFeedback 关联到一条助手消息。显式反馈来自点赞/点踩，隐式反馈来自紧邻的纠错或重复追问。
+type AnswerFeedback struct {
+	ID             string         `json:"id"`
+	ConversationID string         `json:"conversation_id"`
+	MessageID      string         `json:"message_id"`
+	Source         string         `json:"source"`
+	Rating         int            `json:"rating"`
+	Reason         string         `json:"reason,omitempty"`
+	Signals        map[string]any `json:"signals,omitempty"`
+	CreatedAt      time.Time      `json:"created_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
 }
 
 // AgentRun records one user request and its execution outcome.

@@ -82,6 +82,41 @@ func TestMessageAndMemoryUseIndependentVectorIndexes(t *testing.T) {
 	}
 }
 
+func TestAnswerFeedbackUpsertIsScopedToAssistantMessage(t *testing.T) {
+	t.Parallel()
+	database, err := Open(filepath.Join(t.TempDir(), "feedback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := database.CreateConversation(ctx, domain.Conversation{ID: "conv_feedback", Title: "反馈", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	assistant, err := database.AddMessage(ctx, domain.Message{ID: "assistant_feedback", ConversationID: "conv_feedback", Role: domain.RoleAssistant, Content: "回答", CreatedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := database.UpsertAnswerFeedback(ctx, domain.AnswerFeedback{
+		ID: "feedback_1", ConversationID: "conv_feedback", MessageID: assistant.ID,
+		Source: domain.FeedbackSourceExplicit, Rating: -1, Reason: "缺少依据",
+		Signals: map[string]any{"explicit": true}, CreatedAt: now, UpdatedAt: now,
+	})
+	if err != nil || item.Rating != -1 {
+		t.Fatalf("feedback=%+v err=%v", item, err)
+	}
+	item.ID, item.Rating, item.Reason, item.UpdatedAt = "feedback_2", 1, "", now.Add(time.Second)
+	updated, err := database.UpsertAnswerFeedback(ctx, item)
+	if err != nil || updated.ID != "feedback_1" || updated.Rating != 1 {
+		t.Fatalf("updated=%+v err=%v", updated, err)
+	}
+	items, err := database.ListAnswerFeedback(ctx, "conv_feedback")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("items=%+v err=%v", items, err)
+	}
+}
+
 func TestOpenMigratesKnowledgeVersionAndACLColumns(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "legacy-knowledge.db")

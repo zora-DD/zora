@@ -23,6 +23,7 @@ import (
 	"github.com/zhiruo/zora/internal/chat"
 	"github.com/zhiruo/zora/internal/config"
 	"github.com/zhiruo/zora/internal/domain"
+	"github.com/zhiruo/zora/internal/feedback"
 	"github.com/zhiruo/zora/internal/httpapi"
 	"github.com/zhiruo/zora/internal/id"
 	"github.com/zhiruo/zora/internal/identity"
@@ -338,6 +339,11 @@ func run(logger *slog.Logger) error {
 		chat.WithRuntimeProfiles(cfg.DefaultModelID, runtimeProfiles),
 		chat.WithTelemetry(telemetry),
 	}
+	feedbackService, err := feedback.NewService(database)
+	if err != nil {
+		return err
+	}
+	chatOptions = append(chatOptions, chat.WithFeedback(feedbackService, cfg.ImplicitFeedbackEnabled))
 	if locker, ok := database.(interface {
 		LockConversation(context.Context, string) (func(), error)
 	}); ok {

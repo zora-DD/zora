@@ -40,6 +40,9 @@ func (m *mockModel) Generate(ctx context.Context, input []*schema.Message, opts 
 	last := input[len(input)-1]
 	query := latestUserContent(input)
 	lower := strings.ToLower(query)
+	if systemHasAgentRole(input, "answer_reviewer") {
+		return schema.AssistantMessage(`{"verdict":"pass","issues":[],"rewrite_instruction":""}`, nil), nil
+	}
 	// 新版 Eino 会通过调用级 Option 注入工具，不能只读取 WithTools 保存的字段。
 	availableTools := model.GetCommonOptions(&model.Options{Tools: m.tools}, opts...).Tools
 	if last.Role == schema.Tool {
